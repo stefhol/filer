@@ -555,6 +555,27 @@ a `sessions` array; each carries `path`, `exists`, `entries` (for the current br
 `modified` (unix seconds) and a `branches` array with per-branch `entries`/`depth`/`created`.
 `context clear` prints what it removed and is a no-op (exit `0`) when there was nothing.
 
+### Refreshing after an edit
+
+A stateful bundle is a **union** of every run, which is what a human picker wants and what an
+agent must *not* get after editing a file: the old entries would never leave. `--from-state`
+re-resolves the saved bundle's seeds (`reason = "seed"`) and rebuilds the rest of the closure
+from the current sources:
+
+```sh
+filer --root ~/code/demo bundle --state .filer/s1.toml --depth 2 'app/Service.java::Service.used'
+# ... edit Service.java: call another method, delete one ...
+filer --root ~/code/demo bundle --from-state --state .filer/s1.toml --depth 2
+```
+
+- Derived entries are recomputed, never merged in: a new call shows up as a new callee, a
+deleted method drops out.
+- Seeds are the only input, so no file arguments are needed (`--from-state` implies the
+default `.filer/bundle.toml` when `--state` is omitted). Extra files on the command line are
+added to the recovered seeds.
+- A seed that no longer exists is reported on stderr and dropped; if no seed survives, the
+run exits `4` and leaves the state file untouched instead of writing an empty bundle.
+- `--from-state` conflicts with `--reset`, which already means "start over".
 ## CLI
 
 ```sh
@@ -588,15 +609,18 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C
 # lines skipped, so long lists never hit the argv limit
 rg -l 'discount' | filer --root ~/code/demo bundle --seeds-from - --depth 1 > found.md
 filer --root ~/code/demo bundle --seeds-from @seeds.txt --depth 2 > seeds.md
+
+# after an edit: re-resolve the seeds instead of unioning (files are optional)
+filer --root ~/code/demo bundle --from-state --state ~/code/demo/.filer/s1.toml --depth 2
 ```
 
 `bundle` flags: `--depth N` (0 = only the given units), `--with-same-package`,
-`--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`,
-`--seeds-from -|@FILE` (repeatable), `--at-line N`,
-`--max-bytes N`, `--max-tokens N` (see [Order and budget](#order-and-budget)), `--skip UNIT`,
-`--only-new -|@FILE` (see [Deltas: only what is new](#deltas-only-what-is-new)),
-`--max-file-bytes N` (see [Config file](#config-file)). `show` takes the same budget and
-per-file flags. With `--seeds-from` the positional files become optional and both sources are
+`--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`, `--from-state`,
+`--seeds-from -|@FILE` (repeatable), `--at-line N`, `--max-bytes N`, `--max-tokens N`
+(see [Order and budget](#order-and-budget)), `--skip UNIT`, `--only-new -|@FILE`
+(see [Deltas: only what is new](#deltas-only-what-is-new)), `--max-file-bytes N`
+(see [Config file](#config-file)). `show` takes the same budget and per-file flags.
+With `--seeds-from` the positional files become optional and both sources are
 combined; reading that list is a plain file read — filer never runs `git`, so
 `git diff --name-only | filer bundle --seeds-from -` is your own pipeline.
 Default depth is 2. Global flags: `--json`, `--quiet`, `--include GLOB`, `--exclude GLOB`,
