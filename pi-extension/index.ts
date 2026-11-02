@@ -22,6 +22,12 @@ import {
   type RootResolver,
 } from "./src/cli";
 import { registerFilerTools } from "./src/tools";
+import { registerFilerCommands } from "./src/commands";
+import {
+  createSessionOverrides,
+  OVERRIDES_ENTRY,
+  type SessionOverrides,
+} from "./src/session";
 
 /** `--filer-bin <path>`: highest-precedence binary override. */
 export const FILER_BIN_FLAG = "filer-bin";
@@ -37,6 +43,8 @@ export interface FilerAdapterDeps {
   runner?: ProcessRunner;
   /** Injected git lookup (tests); defaults to `git rev-parse --show-toplevel`. */
   detectGitRoot?: (cwd: string, signal?: AbortSignal) => Promise<string | null>;
+  /** Session overrides restored by the `/filer` commands. */
+  session?: SessionOverrides;
 }
 
 export interface FilerResolutionInput {
@@ -48,6 +56,8 @@ export interface FilerResolutionInput {
   flagRoot?: string;
   /** `/filer bin`, persisted for the session by the commands follow-up. */
   sessionBin?: string;
+  /** `/filer root`, persisted for the session by the commands follow-up. */
+  sessionRoot?: string;
   signal?: AbortSignal;
 }
 
@@ -77,8 +87,12 @@ export function createFilerAdapter(deps: FilerAdapterDeps = {}): FilerAdapter {
   return {
     roots,
     async resolve(input: FilerResolutionInput): Promise<ResolvedFiler> {
+      const overrides = deps.session?.get() ?? {};
+      const sessionBin = input.sessionBin ?? overrides.bin;
+      const sessionRoot = input.sessionRoot ?? overrides.root;
       const root = await roots.resolve({
         ...(input.flagRoot === undefined ? {} : { flagRoot: input.flagRoot }),
+        ...(sessionRoot === undefined ? {} : { sessionRoot }),
         cwd: input.cwd,
         ...(input.signal === undefined ? {} : { signal: input.signal }),
       });
@@ -86,7 +100,7 @@ export function createFilerAdapter(deps: FilerAdapterDeps = {}): FilerAdapter {
         bin: binaryFrom({
           ...(input.flagBin === undefined ? {} : { flag: input.flagBin }),
           env,
-          ...(input.sessionBin === undefined ? {} : { session: input.sessionBin }),
+          ...(sessionBin === undefined ? {} : { session: sessionBin }),
         }),
         root,
         cwd: input.cwd,
@@ -123,7 +137,18 @@ export default function filerExtension(
   registerFilerFlags(pi);
   // Created eagerly but process-free; the tools resolve the binary and root
   // lazily on their first call (and once at session_start for --version).
-  const adapter = createFilerAdapter(deps);
+  const session = createSessionOverrides({
+    persist: (overrides) => pi.appendEntry(OVERRIDES_ENTRY, overrides),
+  });
+  const adapter = createFilerAdapter({ ...deps, session });
+  // Commands first: their `session_start` restores `/filer bin` and
+  // `/filer root` before the tools' version check resolves the adapter.
+  registerFilerCommands(pi, {
+    adapter,
+    session,
+    binFlag: FILER_BIN_FLAG,
+    rootFlag: FILER_ROOT_FLAG,
+  });
   registerFilerTools(pi, {
     adapter,
     binFlag: FILER_BIN_FLAG,

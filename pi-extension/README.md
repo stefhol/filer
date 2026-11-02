@@ -35,6 +35,8 @@ pi -e ./pi-extension
 | `src/cli.ts` | `execFile` runner, binary and root discovery, timeout, output buffer |
 | `src/args.ts` | pure argv builders, one per CLI command (`--root <root> --json --quiet <cmd> ...`) |
 | `src/operations.ts` | typed operations: run, classify the exit status, guard the version, return `{ data, text, warnings }` |
+| `src/commands.ts` | `/filer` subcommands, `M new` diff, why-chain text, status line |
+| `src/session.ts` | `filer-overrides` session state: save, restore, last branch entry wins |
 | `src/schema.ts` | `schema_version` 1 guard and the shared mismatch message |
 | `src/errors.ts` | exit codes and `{"error": ...}` payloads → `FilerToolError` with a hint |
 | `src/format.ts` | envelope → markdown (the README `jq` recipe) and the 32 KiB / 2000-line cap |

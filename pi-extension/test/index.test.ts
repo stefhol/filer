@@ -67,7 +67,7 @@ const failingRunner: ProcessRunner = {
 };
 
 describe("extension factory", () => {
-  test("registers the two flags, the eight tools and no commands", () => {
+  test("registers the two flags, the filer command and the eight tools", () => {
     const { api, flags, tools, commands, handlers } = fakePi();
     let gitLookups = 0;
     filerExtension(api, {
@@ -91,8 +91,10 @@ describe("extension factory", () => {
       "filer_refs",
       "filer_state",
     ]);
-    expect(commands).toEqual([]);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ name: "filer" });
     expect(handlers.has("session_start")).toBe(true);
+    expect(handlers.has("session_tree")).toBe(true);
     // Registration is process-free; the session-start check runs later.
     expect(gitLookups).toBe(0);
   });
