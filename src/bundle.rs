@@ -10,10 +10,18 @@ use crate::resolve::{Diagnostic, Reason};
 use crate::schema::SCHEMA_VERSION;
 use crate::state::Selection;
 
+/// Source bytes per token. `tokens` is `bytes / 4` for the unit span; the
+/// budget is metered in the same unit, so there is deliberately no tokenizer
+/// dependency and `--max-tokens N` is exactly `--max-bytes N * 4`.
+pub const BYTES_PER_TOKEN: usize = 4;
+
 pub struct BundleOptions {
     pub title: Option<String>,
     pub depth: u32,
     pub max_file_bytes: u64,
+    /// Total source-byte budget for the whole bundle. `None` = unlimited.
+    /// Truncation is a strict prefix of the canonical order (see [`describe`]).
+    pub max_bytes: Option<u64>,
     /// Machine-readable TOML listing the bundled files, appended to the bundle.
     pub appendix: Option<String>,
 }
@@ -24,6 +32,7 @@ impl Default for BundleOptions {
             title: None,
             depth: 2,
             max_file_bytes: 1024 * 1024,
+            max_bytes: None,
             appendix: None,
         }
     }
@@ -198,11 +207,18 @@ pub struct RenderedBundle {
     pub root: String,
     pub depth: u32,
     pub max_file_bytes: u64,
+    /// Total byte budget, `None` when the bundle is not budgeted.
+    pub max_bytes: Option<u64>,
+    /// [`Self::max_bytes`] expressed in tokens (`bytes / 4`).
+    pub max_tokens: Option<usize>,
     pub files: usize,
     pub excerpts: usize,
     pub methods: usize,
     pub appendix: Option<String>,
     pub entries: Vec<BundleEntry>,
+    /// Units the budget cut, in canonical order. They are not part of
+    /// `entries` or the markdown, and `omitted` reports them as `budget`.
+    pub dropped: Vec<BundleEntry>,
     pub markdown: String,
     /// What the traversal declined to include (empty for `show`, which does not
     /// resolve).
@@ -213,9 +229,9 @@ pub struct RenderedBundle {
 
 impl RenderedBundle {
     /// The versioned JSON envelope. `entries` always names the same units as
-    /// the markdown; `omitted` is the subset that was not rendered,
-    /// `diagnostics` is what the traversal declined, and `coverage` says how
-    /// complete the index behind it is.
+    /// the markdown; `omitted` is the subset that was not rendered (including
+    /// everything the budget cut), `diagnostics` is what the traversal
+    /// declined, and `coverage` says how complete the index behind it is.
     pub fn to_json(&self) -> serde_json::Value {
         let entries: Vec<serde_json::Value> = self
             .entries
@@ -240,7 +256,10 @@ impl RenderedBundle {
                 })
             })
             .collect();
-        let omitted: Vec<serde_json::Value> = self
+        // `omitted` is one list with two sources: units that were selected but
+        // could not be rendered, and units the budget cut from the tail of the
+        // canonical order. A dropped unit keeps its position only in this list.
+        let rendered_omitted = self
             .entries
             .iter()
             .filter(|entry| !entry.rendered)
@@ -251,8 +270,16 @@ impl RenderedBundle {
                     "symbol": entry.symbol,
                     "reason": entry.note.unwrap_or("unrendered"),
                 })
+            });
+        let budget_omitted = self.dropped.iter().map(|entry| {
+            serde_json::json!({
+                "path": entry.path,
+                "scope": entry.scope.as_str(),
+                "symbol": entry.symbol,
+                "reason": "budget",
             })
-            .collect();
+        });
+        let omitted: Vec<serde_json::Value> = rendered_omitted.chain(budget_omitted).collect();
         let used_bytes: usize = self
             .entries
             .iter()
@@ -262,10 +289,11 @@ impl RenderedBundle {
             })
             .sum();
         let used_tokens: usize = self.entries.iter().map(|entry| entry.tokens).sum();
-        let truncated = self
-            .entries
-            .iter()
-            .any(|entry| entry.note == Some("too_large"));
+        let truncated = !self.dropped.is_empty()
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.note == Some("too_large"));
         let diagnostics: Vec<serde_json::Value> =
             self.diagnostics.iter().map(Diagnostic::to_json).collect();
         serde_json::json!({
@@ -278,6 +306,8 @@ impl RenderedBundle {
             "methods": self.methods,
             "budget": {
                 "max_file_bytes": self.max_file_bytes,
+                "max_bytes": self.max_bytes,
+                "max_tokens": self.max_tokens,
                 "used_bytes": used_bytes,
                 "used_tokens": used_tokens,
                 "truncated": truncated,
@@ -320,13 +350,6 @@ impl Content<'_> {
                 entry.symbol.as_deref().unwrap_or(""),
                 members.iter().copied().collect::<Vec<_>>().join(", ")
             ),
-        }
-    }
-
-    fn methods_kept(&self) -> usize {
-        match self {
-            Content::Single(_) => 0,
-            Content::Class { members, .. } => members.len(),
         }
     }
 }
@@ -397,8 +420,182 @@ fn group<'a>(files: &'a [BundleFile]) -> Vec<Content<'a>> {
     contents
 }
 
+/// One unit after rendering, ready to be ordered and budgeted. Rendering comes
+/// first because the canonical order ends on the unit's span and the budget is
+/// metered in `tokens` of the rendered span, so neither is known before.
+struct Planned<'a> {
+    content: Content<'a>,
+    /// The `## Files` line, without the leading `- `.
+    label: String,
+    rendered: UnitRender,
+    /// Position in the caller's unit list, so seeds keep their seed order.
+    seed_order: usize,
+}
+
+impl Planned<'_> {
+    fn entry(&self) -> &BundleFile {
+        self.content.entry()
+    }
+
+    /// A seed is the only unit that keeps the caller's order. Everything else
+    /// is sorted, which is what makes the bundle reproducible.
+    fn is_seed(&self) -> bool {
+        let entry = self.entry();
+        entry.depth == 0 && entry.reason == Reason::Seed
+    }
+
+    fn bytes(&self) -> u64 {
+        span_bytes(self.rendered.span)
+    }
+
+    /// The canonical order of the bundle, which is also the truncation
+    /// priority: seeds in command-line order, then `file` > `symbol` >
+    /// `methods`, then ascending depth, then `reason` (`seed` before `call`
+    /// before the import reasons), then path, then span.
+    fn key(&self) -> (u8, usize, u8, u32, u8, &str, &str, usize) {
+        let entry = self.entry();
+        let seed = self.is_seed();
+        (
+            u8::from(!seed),
+            if seed { self.seed_order } else { 0 },
+            scope_rank(entry.scope),
+            entry.depth,
+            reason_rank(entry.reason),
+            entry.rel.as_str(),
+            entry.symbol.as_deref().unwrap_or(""),
+            self.rendered.span.map(|span| span.start_byte).unwrap_or(0),
+        )
+    }
+
+    /// The wire entry for this unit. The markdown section travels with it, so
+    /// `entries` and the rendered bundle cannot drift apart.
+    fn into_entry(self) -> BundleEntry {
+        let file = self.entry();
+        let path = file.rel.clone();
+        let scope = file.scope;
+        let symbol = file.symbol.clone();
+        let depth = file.depth;
+        let reason = file.reason;
+        let methods = match &self.content {
+            Content::Class { members, .. } => {
+                members.iter().map(|member| (*member).to_string()).collect()
+            }
+            Content::Single(_) => file.methods.iter().cloned().collect(),
+        };
+        let label = self.label;
+        let unit = self.rendered;
+        let (start_line, end_line, start_byte, end_byte) = span_fields(unit.span);
+        BundleEntry {
+            path,
+            scope,
+            symbol,
+            methods,
+            depth,
+            reason,
+            start_line,
+            end_line,
+            start_byte,
+            end_byte,
+            tokens: span_tokens(unit.span),
+            hash: unit.hash,
+            rendered: unit.rendered,
+            label,
+            markdown: unit.markdown,
+            note: unit.note,
+        }
+    }
+}
+
+/// `file` > `symbol` > `methods`: the truncation priority of #12. Shared with
+/// `bundle_cmd` so the state file is written in the same order.
+pub fn scope_rank(scope: Selection) -> u8 {
+    match scope {
+        Selection::File => 0,
+        Selection::Symbol => 1,
+        Selection::Methods => 2,
+    }
+}
+
+/// `seed` before `call` before the import and usage reasons, then the
+/// `--with-*` extras. This is the documented truncation priority.
+pub fn reason_rank(reason: Reason) -> u8 {
+    match reason {
+        Reason::Seed => 0,
+        Reason::Call => 1,
+        Reason::Import | Reason::StaticImport | Reason::WildcardImport | Reason::ModuleImport => 2,
+        Reason::SamePackage | Reason::Usage => 3,
+        Reason::Package => 4,
+        Reason::Config => 5,
+        Reason::External => 6,
+    }
+}
+
+/// Source bytes of a rendered unit; 0 for one that could not be rendered.
+fn span_bytes(span: Option<Span>) -> u64 {
+    span.map(|span| span.end_byte.saturating_sub(span.start_byte) as u64)
+        .unwrap_or(0)
+}
+
+/// `tokens` of a rendered unit: `bytes / 4`, rounded down.
+fn span_tokens(span: Option<Span>) -> usize {
+    span.map(|span| span.end_byte.saturating_sub(span.start_byte) / BYTES_PER_TOKEN)
+        .unwrap_or(0)
+}
+
+fn span_fields(span: Option<Span>) -> (Option<usize>, Option<usize>, Option<usize>, Option<usize>) {
+    match span {
+        Some(span) => (
+            Some(span.start_line),
+            Some(span.end_line),
+            Some(span.start_byte),
+            Some(span.end_byte),
+        ),
+        None => (None, None, None, None),
+    }
+}
+
+/// Splits the canonical order into the prefix that fits the budget and the tail
+/// that does not. The cut is strict: the first unit that would overflow takes
+/// every later unit with it, so a smaller budget only ever removes entries from
+/// the tail and never reorders the rest.
+fn split_by_budget(
+    planned: Vec<Planned<'_>>,
+    max_bytes: Option<u64>,
+) -> (Vec<Planned<'_>>, Vec<Planned<'_>>) {
+    let Some(max_bytes) = max_bytes else {
+        return (planned, Vec::new());
+    };
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    let mut used = 0u64;
+    for planned in planned {
+        let fits = dropped.is_empty() && used.saturating_add(planned.bytes()) <= max_bytes;
+        if fits {
+            used += planned.bytes();
+            kept.push(planned);
+        } else {
+            dropped.push(planned);
+        }
+    }
+    (kept, dropped)
+}
+
+/// The `## Files` line for one unit, with its depth and reason.
+fn label_with_detail(content: &Content<'_>) -> String {
+    let file = content.entry();
+    let detail = match (file.depth, file.reason) {
+        (0, Reason::Seed) => String::new(),
+        (0, reason) => format!(" ({})", reason.as_str()),
+        (depth, reason) => format!(" (depth {depth}, {})", reason.as_str()),
+    };
+    format!("{}{detail}", content.label())
+}
+
 /// Renders the bundle and keeps both surfaces: the markdown text and the units
 /// it was built from. The JSON envelope is serialized from the same entries.
+///
+/// Units come out in canonical order, the budget then cuts a suffix of it, and
+/// the markdown and the JSON envelope are both built from what is left.
 pub fn describe(index: &Index, files: &[BundleFile], options: &BundleOptions) -> RenderedBundle {
     let name = index
         .root
@@ -406,21 +603,48 @@ pub fn describe(index: &Index, files: &[BundleFile], options: &BundleOptions) ->
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
 
-    let mut markdown = String::new();
     let title = options.title.clone().unwrap_or(name);
     let root = index.root.to_string_lossy().to_string();
-    let contents = group(files);
-    let distinct: HashSet<&str> = contents
-        .iter()
-        .map(|content| content.entry().rel.as_str())
-        .collect();
-    let file_count = distinct.len();
-    let excerpts = contents
-        .iter()
-        .filter(|content| content.entry().scope != Selection::File)
-        .count();
-    let methods_kept: usize = contents.iter().map(Content::methods_kept).sum();
+    let max_tokens = options
+        .max_bytes
+        .map(|bytes| usize::try_from(bytes / BYTES_PER_TOKEN as u64).unwrap_or(usize::MAX));
 
+    let mut planned: Vec<Planned> = group(files)
+        .into_iter()
+        .enumerate()
+        .map(|(seed_order, content)| {
+            let rendered = match &content {
+                Content::Single(file) => render_unit(index, file, options),
+                Content::Class { entry, members } => {
+                    render_member_group(index, entry, members, options)
+                }
+            };
+            Planned {
+                label: label_with_detail(&content),
+                content,
+                rendered,
+                seed_order,
+            }
+        })
+        .collect();
+    planned.sort_by(|left, right| left.key().cmp(&right.key()));
+    let (kept, budget_dropped) = split_by_budget(planned, options.max_bytes);
+
+    let entries: Vec<BundleEntry> = kept.into_iter().map(Planned::into_entry).collect();
+    let dropped: Vec<BundleEntry> = budget_dropped
+        .into_iter()
+        .map(Planned::into_entry)
+        .collect();
+
+    let distinct: HashSet<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    let file_count = distinct.len();
+    let excerpts = entries
+        .iter()
+        .filter(|entry| entry.scope != Selection::File)
+        .count();
+    let methods_kept: usize = entries.iter().map(|entry| entry.methods.len()).sum();
+
+    let mut markdown = String::new();
     markdown.push_str(&format!("# Code bundle: {title}\n\n"));
     markdown.push_str(&format!("- root: `{root}`\n"));
     markdown.push_str(&format!("- files: {file_count}\n"));
@@ -433,68 +657,12 @@ pub fn describe(index: &Index, files: &[BundleFile], options: &BundleOptions) ->
     markdown.push_str(&format!("- import depth: {}\n\n", options.depth));
 
     markdown.push_str("## Files\n\n");
-    let mut labels = Vec::with_capacity(contents.len());
-    for content in &contents {
-        let file = content.entry();
-        let detail = match (file.depth, file.reason) {
-            (0, Reason::Seed) => String::new(),
-            (0, reason) => format!(" ({})", reason.as_str()),
-            (depth, reason) => format!(" (depth {depth}, {})", reason.as_str()),
-        };
-        let label = format!("{}{detail}", content.label());
-        markdown.push_str(&format!("- {label}\n"));
-        labels.push(label);
+    for entry in &entries {
+        markdown.push_str(&format!("- {}\n", entry.label));
     }
     markdown.push_str("\n## Contents\n");
-
-    let mut entries = Vec::with_capacity(contents.len());
-    for (content, label) in contents.iter().zip(labels) {
-        let unit = match content {
-            Content::Single(file) => render_unit(index, file, options),
-            Content::Class { entry, members } => {
-                render_member_group(index, entry, members, options)
-            }
-        };
-        let file = content.entry();
-        let methods = match content {
-            Content::Class { members, .. } => {
-                members.iter().map(|member| member.to_string()).collect()
-            }
-            Content::Single(_) => file.methods.iter().cloned().collect(),
-        };
-        let span = unit.span;
-        let hash = unit.hash;
-        let (start_line, end_line, start_byte, end_byte) = match span {
-            Some(span) => (
-                Some(span.start_line),
-                Some(span.end_line),
-                Some(span.start_byte),
-                Some(span.end_byte),
-            ),
-            None => (None, None, None, None),
-        };
-        let tokens = span
-            .map(|span| span.end_byte.saturating_sub(span.start_byte) / 4)
-            .unwrap_or(0);
-        markdown.push_str(&unit.markdown);
-        entries.push(BundleEntry {
-            path: file.rel.clone(),
-            scope: file.scope,
-            symbol: file.symbol.clone(),
-            methods,
-            depth: file.depth,
-            reason: file.reason,
-            start_line,
-            end_line,
-            start_byte,
-            end_byte,
-            tokens,
-            hash,
-            rendered: unit.rendered,
-            label,
-            markdown: unit.markdown,
-            note: unit.note,
-        });
+    for entry in &entries {
+        markdown.push_str(&entry.markdown);
     }
 
     if let Some(appendix) = &options.appendix {
@@ -509,11 +677,14 @@ pub fn describe(index: &Index, files: &[BundleFile], options: &BundleOptions) ->
         root,
         depth: options.depth,
         max_file_bytes: options.max_file_bytes,
+        max_bytes: options.max_bytes,
+        max_tokens,
         files: file_count,
         excerpts,
         methods: methods_kept,
         appendix: options.appendix.clone(),
         entries,
+        dropped,
         markdown,
         diagnostics: Vec::new(),
         coverage: Coverage::default(),
@@ -1089,5 +1260,235 @@ mod tests {
         assert_eq!(fence_for("plain"), "```");
         assert_eq!(fence_for("a ``` b"), "````");
         assert_eq!(fence_for("a ```` b"), "`````");
+    }
+
+    /// One class per file, so a test can point a [`BundleFile`] at any of them
+    /// and `describe` has real spans to order on.
+    fn ordering_project(name: &str) -> (std::path::PathBuf, Index) {
+        let root =
+            std::env::temp_dir().join(format!("filer-bundle-order-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for (file, class) in [
+            ("Service.java", "Service"),
+            ("Repo.java", "Repo"),
+            ("Alpha.java", "Alpha"),
+            ("Beta.java", "Beta"),
+            ("Gamma.java", "Gamma"),
+        ] {
+            fs::write(
+                root.join(file),
+                format!(
+                    "package app;\n\npublic class {class} {{\n    int used() {{ return 0; }}\n    int other() {{ return 1; }}\n}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let index = Index::build(&root);
+        (root, index)
+    }
+
+    /// The rendered source span of every entry, in the envelope's order.
+    fn spans(rendered: &RenderedBundle) -> Vec<u64> {
+        rendered
+            .entries
+            .iter()
+            .map(|entry| match (entry.start_byte, entry.end_byte) {
+                (Some(start), Some(end)) => (end.saturating_sub(start)) as u64,
+                _ => 0,
+            })
+            .collect()
+    }
+
+    fn paths(rendered: &RenderedBundle) -> Vec<String> {
+        rendered
+            .entries
+            .iter()
+            .map(|entry| format!("{} {}", entry.scope.as_str(), entry.path))
+            .collect()
+    }
+
+    #[test]
+    fn the_canonical_order_is_scope_then_depth_then_reason() {
+        let (root, index) = ordering_project("canonical");
+        let files = vec![
+            BundleFile::members(
+                "Service.java".to_string(),
+                root.join("Service.java"),
+                0,
+                Reason::Seed,
+                "Service".to_string(),
+                BTreeSet::from(["used".to_string()]),
+            ),
+            BundleFile::excerpt(
+                "Beta.java".to_string(),
+                root.join("Beta.java"),
+                1,
+                Reason::Call,
+                "Beta".to_string(),
+            ),
+            BundleFile::whole(
+                "Alpha.java".to_string(),
+                root.join("Alpha.java"),
+                2,
+                Reason::Import,
+            ),
+            BundleFile::whole(
+                "Repo.java".to_string(),
+                root.join("Repo.java"),
+                1,
+                Reason::Call,
+            ),
+            BundleFile::members(
+                "Gamma.java".to_string(),
+                root.join("Gamma.java"),
+                1,
+                Reason::Call,
+                "Gamma".to_string(),
+                BTreeSet::from(["used".to_string()]),
+            ),
+        ];
+        let rendered = describe(&index, &files, &BundleOptions::default());
+        assert_eq!(
+            paths(&rendered),
+            [
+                "methods Service.java",
+                "file Repo.java",
+                "file Alpha.java",
+                "symbol Beta.java",
+                "methods Gamma.java",
+            ]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn seeds_keep_the_order_they_were_given() {
+        let (root, index) = ordering_project("seeds");
+        let files = vec![
+            BundleFile::whole(
+                "Repo.java".to_string(),
+                root.join("Repo.java"),
+                0,
+                Reason::Seed,
+            ),
+            BundleFile::whole(
+                "Alpha.java".to_string(),
+                root.join("Alpha.java"),
+                0,
+                Reason::Seed,
+            ),
+        ];
+        let rendered = describe(&index, &files, &BundleOptions::default());
+        assert_eq!(paths(&rendered), ["file Repo.java", "file Alpha.java"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_budget_cuts_the_tail_and_lists_what_it_dropped() {
+        let (root, index) = ordering_project("budget");
+        let files = vec![
+            BundleFile::whole(
+                "Repo.java".to_string(),
+                root.join("Repo.java"),
+                0,
+                Reason::Seed,
+            ),
+            BundleFile::excerpt(
+                "Alpha.java".to_string(),
+                root.join("Alpha.java"),
+                1,
+                Reason::Call,
+                "Alpha".to_string(),
+            ),
+            BundleFile::excerpt(
+                "Beta.java".to_string(),
+                root.join("Beta.java"),
+                1,
+                Reason::Call,
+                "Beta".to_string(),
+            ),
+            BundleFile::excerpt(
+                "Gamma.java".to_string(),
+                root.join("Gamma.java"),
+                1,
+                Reason::Call,
+                "Gamma".to_string(),
+            ),
+        ];
+        let full = describe(&index, &files, &BundleOptions::default());
+        assert_eq!(full.entries.len(), 4);
+        assert!(full.dropped.is_empty());
+
+        // Room for the seed and the first excerpt, but not for the second.
+        let budget = spans(&full)[0] + spans(&full)[1];
+        let options = BundleOptions {
+            max_bytes: Some(budget),
+            ..Default::default()
+        };
+        let cut = describe(&index, &files, &options);
+        assert_eq!(paths(&cut), ["file Repo.java", "symbol Alpha.java"]);
+        assert_eq!(cut.dropped.len(), 2);
+        assert!(!cut.markdown.contains("Beta.java"), "{}", cut.markdown);
+
+        let json = cut.to_json();
+        assert_eq!(
+            json["budget"]["max_tokens"],
+            serde_json::json!(budget as usize / BYTES_PER_TOKEN)
+        );
+        assert_eq!(json["budget"]["truncated"], serde_json::json!(true));
+        let used: usize = cut.entries.iter().map(|entry| entry.tokens).sum();
+        assert_eq!(json["budget"]["used_tokens"], serde_json::json!(used));
+        let omitted = json["omitted"].as_array().expect("omitted");
+        assert_eq!(omitted.len(), 2);
+        assert_eq!(omitted[0]["path"], serde_json::json!("Beta.java"));
+        assert_eq!(omitted[1]["path"], serde_json::json!("Gamma.java"));
+        assert!(omitted.iter().all(|row| row["reason"] == "budget"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shrinking_the_budget_only_removes_entries_from_the_tail() {
+        let (root, index) = ordering_project("shrink");
+        let files = vec![
+            BundleFile::whole(
+                "Repo.java".to_string(),
+                root.join("Repo.java"),
+                0,
+                Reason::Seed,
+            ),
+            BundleFile::excerpt(
+                "Alpha.java".to_string(),
+                root.join("Alpha.java"),
+                1,
+                Reason::Call,
+                "Alpha".to_string(),
+            ),
+            BundleFile::excerpt(
+                "Beta.java".to_string(),
+                root.join("Beta.java"),
+                1,
+                Reason::Call,
+                "Beta".to_string(),
+            ),
+        ];
+        let full = describe(&index, &files, &BundleOptions::default());
+        let baseline = paths(&full);
+        let total: u64 = spans(&full).iter().sum();
+        for budget in 0..=total {
+            let options = BundleOptions {
+                max_bytes: Some(budget),
+                ..Default::default()
+            };
+            let cut = describe(&index, &files, &options);
+            let kept = paths(&cut);
+            assert_eq!(kept, baseline[..kept.len()], "budget of {budget} bytes");
+            assert_eq!(kept.len() + cut.dropped.len(), baseline.len());
+            assert_eq!(
+                cut.to_json()["budget"]["truncated"],
+                !cut.dropped.is_empty()
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }
