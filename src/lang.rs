@@ -13,6 +13,7 @@ use crate::fe::FeParser;
 use crate::groovy::GroovyParser;
 use crate::java::JavaParser;
 use crate::kotlin::KotlinParser;
+use crate::python::PythonParser;
 use crate::rust::RustParser;
 use crate::scala::ScalaParser;
 use crate::web::WebParser;
@@ -31,6 +32,8 @@ pub enum Language {
     Fe,
     /// Rust (`.rs`).
     Rust,
+    /// Python (`.py`, `.pyi`).
+    Python,
 }
 
 /// How finely a language can be bundled and picked.
@@ -79,11 +82,14 @@ pub enum Family {
     Fe,
     /// Cargo module paths (`crate::`, `self::`, `super::`, `mod`).
     Rust,
+    /// Dotted module paths resolved against the package directory
+    /// (`import a.b`, `from . import x`).
+    Python,
 }
 
 impl Language {
     /// Every language the index understands, for stats and docs.
-    pub const ALL: [Language; 10] = [
+    pub const ALL: [Language; 11] = [
         Language::Java,
         Language::Scala,
         Language::Kotlin,
@@ -94,6 +100,7 @@ impl Language {
         Language::Vue,
         Language::Fe,
         Language::Rust,
+        Language::Python,
     ];
 
     /// Language for a source file, or `None` when the extension is not indexed.
@@ -112,6 +119,7 @@ impl Language {
             "vue" => Some(Language::Vue),
             "fe" => Some(Language::Fe),
             "rs" => Some(Language::Rust),
+            "py" | "pyi" => Some(Language::Python),
             _ => None,
         }
     }
@@ -125,7 +133,9 @@ impl Language {
             | Language::Groovy
             | Language::CSharp
             | Language::Scala => Granularity::Member,
-            Language::TypeScript | Language::JavaScript | Language::Rust => Granularity::Member,
+            Language::TypeScript | Language::JavaScript | Language::Rust | Language::Python => {
+                Granularity::Member
+            }
             Language::Vue => Granularity::File,
         }
     }
@@ -136,6 +146,7 @@ impl Language {
             Language::TypeScript | Language::JavaScript | Language::Vue => Family::Web,
             Language::Fe => Family::Fe,
             Language::Rust => Family::Rust,
+            Language::Python => Family::Python,
             _ => Family::Jvm,
         }
     }
@@ -153,6 +164,7 @@ impl Language {
             Language::Vue => "vue",
             Language::Fe => "fe",
             Language::Rust => "rust",
+            Language::Python => "python",
         }
     }
 
@@ -178,6 +190,7 @@ impl Language {
             Language::Vue => "vue",
             Language::Fe => "fe",
             Language::Rust => "rust",
+            Language::Python => "python",
         }
     }
 }
@@ -310,7 +323,7 @@ pub struct Symbol {
     #[serde(default)]
     pub uses: Vec<String>,
     /// Call sites recorded at symbol level, for languages whose calls do not
-    /// live in members: Formula Engine functions and Rust free functions.
+    /// live in members: Formula Engine functions, Rust and Python functions.
     #[serde(default)]
     pub calls: Vec<Call>,
     /// Prunable members (Java methods/constructors) for call-path pruning.
@@ -322,6 +335,13 @@ pub struct Symbol {
     /// Simple names from `extends` / `implements`.
     #[serde(default)]
     pub supertypes: Vec<String>,
+    /// Parameter name -> simple type name, for symbols whose calls live on the
+    /// symbol rather than in members (Python module functions).
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
+    /// Local variable name -> simple type name, likewise.
+    #[serde(default)]
+    pub locals: Vec<(String, String)>,
 }
 
 impl Symbol {
@@ -398,6 +418,8 @@ pub fn symbol_from_node(
         members: Vec::new(),
         fields: Vec::new(),
         supertypes: Vec::new(),
+        params: Vec::new(),
+        locals: Vec::new(),
     }
 }
 
@@ -462,6 +484,7 @@ pub struct SourceParser {
     web: WebParser,
     fe: FeParser,
     rust: RustParser,
+    python: PythonParser,
 }
 
 impl SourceParser {
@@ -475,13 +498,15 @@ impl SourceParser {
             web: WebParser::new(),
             fe: FeParser::new(),
             rust: RustParser::new(),
+            python: PythonParser::new(),
         }
     }
 
     /// Returns `None` only when the parser bails out (invalid encoding or
     /// cancelled parse). Files with syntax errors still yield whatever
-    /// declarations tree-sitter could recover.
-    pub fn parse(&mut self, language: Language, src: &str) -> Option<Source> {
+    /// declarations tree-sitter could recover. `rel` is the file's path
+    /// relative to the project root: Python derives its module name from it.
+    pub fn parse(&mut self, language: Language, src: &str, rel: &str) -> Option<Source> {
         match language {
             Language::Java => self.java.parse(src),
             Language::Scala => self.scala.parse(src),
@@ -490,6 +515,7 @@ impl SourceParser {
             Language::CSharp => self.csharp.parse(src),
             Language::Fe => self.fe.parse(src),
             Language::Rust => self.rust.parse(src),
+            Language::Python => self.python.parse(rel, src),
             Language::TypeScript | Language::JavaScript | Language::Vue => {
                 self.web.parse(language, src)
             }
@@ -526,6 +552,8 @@ mod tests {
             ("App.vue", Some(Language::Vue)),
             ("Risk.fe", Some(Language::Fe)),
             ("lib.rs", Some(Language::Rust)),
+            ("app.py", Some(Language::Python)),
+            ("app.pyi", Some(Language::Python)),
             ("README.md", None),
             ("Makefile", None),
         ];
@@ -550,6 +578,7 @@ mod tests {
         assert_eq!(Language::TypeScript.granularity(), Granularity::Member);
         assert_eq!(Language::JavaScript.granularity(), Granularity::Member);
         assert_eq!(Language::Rust.granularity(), Granularity::Member);
+        assert_eq!(Language::Python.granularity(), Granularity::Member);
         assert!(!Language::Fe.granularity().file_row());
         assert!(Language::Fe.granularity().symbol_rows());
         assert!(Language::Java.granularity().symbol_rows());
@@ -564,6 +593,7 @@ mod tests {
         assert_eq!(Language::Vue.family(), Family::Web);
         assert_eq!(Language::Fe.family(), Family::Fe);
         assert_eq!(Language::Rust.family(), Family::Rust);
+        assert_eq!(Language::Python.family(), Family::Python);
     }
 
     #[test]
@@ -574,6 +604,8 @@ mod tests {
         assert_eq!(Language::fence_for(Path::new("A.cjs")), "javascript");
         assert_eq!(Language::fence_for(Path::new("A.cs")), "csharp");
         assert_eq!(Language::fence_for(Path::new("A.rs")), "rust");
+        assert_eq!(Language::fence_for(Path::new("A.py")), "python");
+        assert_eq!(Language::fence_for(Path::new("A.pyi")), "python");
     }
 
     #[test]
@@ -589,9 +621,10 @@ mod tests {
             (Language::JavaScript, "export class G {}"),
             (Language::Fe, "function g() { return 1; }"),
             (Language::Rust, "pub struct R;"),
+            (Language::Python, "class P:\n    pass\n"),
         ];
         for (language, source) in cases {
-            let parsed = parser.parse(language, source).expect("parsed");
+            let parsed = parser.parse(language, source, "test").expect("parsed");
             assert!(!parsed.types.is_empty(), "{language:?}: {parsed:?}");
         }
     }
@@ -629,6 +662,11 @@ mod tests {
             Language::Rust,
             "struct A;\nimpl A {\n    fn run(&self) {\n        self.repo.size();\n        self.repo.size();\n    }\n}\n",
             "self.repo.size();",
+        ),
+        (
+            Language::Python,
+            "class A:\n    def run(self):\n        repo.size()\n        repo.size()\n",
+            "repo.size()",
         ),
         (
             Language::TypeScript,
@@ -704,7 +742,7 @@ mod tests {
     fn call_sites_carry_their_own_line() {
         let mut parser = SourceParser::new();
         for (language, source, needle) in TWO_CALLS {
-            let parsed = parser.parse(*language, source).expect("parsed");
+            let parsed = parser.parse(*language, source, "test").expect("parsed");
             assert_span_lines(&parsed, &format!("{language:?}"));
             let expected: Vec<usize> = source
                 .lines()
@@ -764,10 +802,14 @@ mod tests {
                 Language::Fe,
                 "// Risk model.\nfunction risk(size) {\n    local dict x = size;\n    return x;\n}\n",
             ),
+            (
+                Language::Python,
+                "class R:\n    def __init__(self, count: int) -> None:\n        self.count = count\n\n    def size(self) -> int:\n        return self.count + self.helper()\n\n    def helper(self) -> int:\n        return 1\n",
+            ),
         ];
         let mut parser = SourceParser::new();
         for (language, source) in corpus {
-            let parsed = parser.parse(*language, source).expect("parsed");
+            let parsed = parser.parse(*language, source, "test").expect("parsed");
             assert!(!parsed.symbols.is_empty(), "{language:?}: no symbols");
             assert_span_lines(&parsed, &format!("{language:?}"));
             for symbol in &parsed.symbols {

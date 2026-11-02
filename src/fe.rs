@@ -274,6 +274,8 @@ fn parse_visibility_or_declaration<'a>(
         members: Vec::new(),
         fields: Vec::new(),
         supertypes: Vec::new(),
+        params: Vec::new(),
+        locals: Vec::new(),
     };
     Some((symbol, cursor))
 }
@@ -327,6 +329,8 @@ fn parse_function<'a>(
         members: Vec::new(),
         fields: Vec::new(),
         supertypes: Vec::new(),
+        params: Vec::new(),
+        locals: Vec::new(),
     };
     Some((symbol, body_end + 1))
 }

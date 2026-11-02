@@ -141,6 +141,10 @@ fn package_files(index: &Index, package: &str, family: Option<Family>) -> Vec<us
 pub fn resolve_import(index: &Index, file: &FileEntry, import: &Import) -> Vec<usize> {
     let family = family_of(file);
 
+    if family == Some(Family::Python) {
+        return resolve_python_import(index, file, import);
+    }
+
     if import.kind == ImportKind::Module {
         return resolve_module(index, &file.rel, &import.path, family);
     }
@@ -327,13 +331,26 @@ fn resolve_rust_import(index: &Index, file: &FileEntry, import: &Import) -> Vec<
     if import.is_wildcard() || direct.is_empty() {
         return direct;
     }
-
     // `use crate::app::Service` where `app.rs` only re-exports `Service` from
     // another module: follow re-exports whose leaf matches, so the file that
     // actually declares the symbol is the import target.
     let Some(leaf) = import.path.rsplit('.').next() else {
         return direct;
     };
+    follow_reexports(index, direct, leaf, |target, reexport| {
+        rust_direct_import(index, &target.rel, &reexport.path)
+    })
+}
+
+/// Follows one-hop re-exports: when an import names a declaration that `direct`
+/// only re-exports (Rust `pub use`, Python `from .model import User` in an
+/// `__init__.py`), keep walking until the file that declares the name is found.
+fn follow_reexports(
+    index: &Index,
+    direct: Vec<usize>,
+    leaf: &str,
+    direct_of: impl Fn(&FileEntry, &Import) -> Vec<usize>,
+) -> Vec<usize> {
     let mut queue: VecDeque<usize> = direct.iter().copied().collect();
     let mut seen = HashSet::new();
     while let Some(position) = queue.pop_front() {
@@ -355,7 +372,7 @@ fn resolve_rust_import(index: &Index, file: &FileEntry, import: &Import) -> Vec<
             if reexport.path.rsplit('.').next() != Some(leaf) {
                 continue;
             }
-            queue.extend(rust_direct_import(index, &target.rel, &reexport.path));
+            queue.extend(direct_of(target, reexport));
         }
     }
     direct
@@ -511,9 +528,128 @@ fn rust_module_candidates(base: &str, root: &str, segments: &[String]) -> Vec<St
     }
 }
 
-/// Unique free function by name, for Rust calls that do not go through a
-/// receiver (`helper()`, `Self::new()` after the type lookup failed, ...).
-fn rust_function_units(
+/// Resolves a Python import. `import a.b` names a module, `from a.b import C`
+/// names a binding whose `C` is a class/function of `a.b` or the submodule
+/// `a/b/C.py`, and relative imports walk up from the importing file's package.
+fn resolve_python_import(index: &Index, file: &FileEntry, import: &Import) -> Vec<usize> {
+    let direct = python_direct_import(index, &file.rel, import);
+    if import.is_wildcard() || import.kind != ImportKind::Type {
+        return direct;
+    }
+    // `from app import models` where `app/__init__.py` re-exports `models` from
+    // another module: follow the binding to the file that declares it.
+    let Some(leaf) = import
+        .path
+        .rsplit('.')
+        .next()
+        .filter(|leaf| !leaf.is_empty())
+    else {
+        return direct;
+    };
+    follow_reexports(index, direct, leaf, |target, reexport| {
+        python_direct_import(index, &target.rel, reexport)
+    })
+}
+
+/// Splits a Python import path into its relative depth and its module
+/// segments. `.` is the current package, `..a.b` two levels up into `a.b`.
+fn python_import_split(path: &str) -> (usize, Vec<&str>) {
+    let level = path
+        .chars()
+        .take_while(|character| *character == '.')
+        .count();
+    let segments = path[level..]
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    (level, segments)
+}
+
+/// Directory a Python import resolves against: the project root for an
+/// absolute import, otherwise the importing file's package directory (`from .`
+/// stays in it, every extra dot walks up). `None` when the import escapes the
+/// root.
+fn python_base_dir(rel: &str, level: usize) -> Option<String> {
+    if level == 0 {
+        return Some(String::new());
+    }
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop(); // the importing file itself
+    for _ in 1..level {
+        parts.pop()?;
+    }
+    Some(parts.join("/"))
+}
+
+/// Module file for a dotted module path: `a/b.py`, its `.pyi` stub, or the
+/// package's `a/b/__init__.py`. An empty module is the `base` package itself.
+fn python_module_file(index: &Index, base: &str, module: &str) -> Option<usize> {
+    let path = match (base.is_empty(), module.is_empty()) {
+        (true, true) => return None,
+        (true, false) => module.to_string(),
+        (false, true) => format!("{base}/__init__"),
+        (false, false) => format!("{base}/{module}"),
+    };
+    for candidate in [
+        format!("{path}.py"),
+        format!("{path}.pyi"),
+        format!("{path}/__init__.py"),
+        format!("{path}/__init__.pyi"),
+    ] {
+        if let Some(&position) = index.by_rel.get(&candidate) {
+            return Some(position);
+        }
+    }
+    None
+}
+
+/// Whether a file declares `name` as a top-level class or function.
+fn declares(index: &Index, position: usize, name: &str) -> bool {
+    index.files.get(position).is_some_and(|file| {
+        file.types.iter().any(|ty| ty == name)
+            || file.symbols.iter().any(|symbol| symbol.name == name)
+    })
+}
+
+/// Resolves a Python import without following re-exports. `from a.b import C`
+/// prefers the file that declares `C` and falls back to the `a/b/C.py`
+/// submodule, so both `from app.models import User` and `from app import
+/// models` work.
+fn python_direct_import(index: &Index, rel: &str, import: &Import) -> Vec<usize> {
+    let (level, segments) = python_import_split(&import.path);
+    let Some(base) = python_base_dir(rel, level) else {
+        return Vec::new();
+    };
+
+    if import.kind == ImportKind::Type && !segments.is_empty() {
+        let (leaf, parent) = segments.split_last().expect("segments is not empty");
+        let parent_module = parent.join("/");
+        let mut resolved = Vec::new();
+        let declared = python_module_file(index, &base, &parent_module)
+            .filter(|position| declares(index, *position, leaf));
+        if let Some(position) = declared {
+            resolved.push(position);
+        }
+        let submodule = python_module_file(index, &base, &format!("{parent_module}/{leaf}"));
+        if let Some(position) = submodule {
+            if !resolved.contains(&position) {
+                resolved.push(position);
+            }
+        }
+        if resolved.is_empty() {
+            resolved.extend(python_module_file(index, &base, &parent_module));
+        }
+        return resolved;
+    }
+
+    python_module_file(index, &base, &segments.join("/"))
+        .into_iter()
+        .collect()
+}
+
+/// Unique free function by name, for Rust and Python calls that do not go
+/// through a receiver (`helper()`, `Self::new()` after the type lookup failed).
+fn free_function_units(
     index: &Index,
     name: &str,
     family: Option<Family>,
@@ -563,6 +699,37 @@ fn rust_function_units(
         })
         .into_iter()
         .collect()
+}
+
+/// Python functions imported by name (`from utils import helper`) or through a
+/// star import. Aliases (`from x import helper as h`) and module imports
+/// (`import x; x.helper()`) are not tracked: the latter falls through to the
+/// unique-name lookup in [`free_function_units`].
+fn imported_function_units(index: &Index, file: &FileEntry, name: &str) -> Vec<Unit> {
+    let mut out = Vec::new();
+    for import in &file.imports {
+        let names_it = import.kind == ImportKind::Type
+            && !import.is_wildcard()
+            && import.path.rsplit('.').next() == Some(name);
+        if !names_it && !import.is_wildcard() {
+            continue;
+        }
+        for position in resolve_import(index, file, import) {
+            let Some(target) = index.files.get(position) else {
+                continue;
+            };
+            if !target.symbols.iter().any(|symbol| symbol.name == name) {
+                continue;
+            }
+            out.push(Unit::Symbol {
+                file: position,
+                symbol: name.to_string(),
+            });
+        }
+    }
+    out.sort_by_key(Unit::file);
+    out.dedup();
+    out
 }
 
 /// Resolves type names *used* in the file. Java needs no import for types in
@@ -1434,7 +1601,8 @@ fn member_neighbours(index: &Index, unit: &Unit, diagnostics: &mut Vec<Diagnosti
             *file_position,
             file,
             class,
-            member,
+            &member.params,
+            &member.locals,
             call,
             family,
             diagnostics,
@@ -1454,13 +1622,14 @@ fn call_edges(units: Vec<Unit>, line: u32) -> Vec<Edge> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)] // file, class, member, call, diagnostics
+#[allow(clippy::too_many_arguments)] // file, class, params, locals, call, diagnostics
 fn resolve_call(
     index: &Index,
     file_position: usize,
     file: &FileEntry,
     class: &Symbol,
-    member: &Member,
+    params: &[(String, String)],
+    locals: &[(String, String)],
     call: &crate::lang::Call,
     family: Option<Family>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -1482,10 +1651,18 @@ fn resolve_call(
             if found.is_empty() && call.receiver == Receiver::Bare {
                 found = static_import_methods(index, file, &call.name);
             }
-            if found.is_empty() && family == Some(Family::Rust) {
-                found = rust_function_units(index, &call.name, family, Some(file_position));
+            if found.is_empty() && call.receiver == Receiver::Bare && family == Some(Family::Python)
+            {
+                found = imported_function_units(index, file, &call.name);
+            }
+            if found.is_empty() && matches!(family, Some(Family::Rust) | Some(Family::Python)) {
+                found = free_function_units(index, &call.name, family, Some(file_position));
             }
             if found.is_empty() {
+                // `print()`, `len()`, `super()`: no indexed file defines them.
+                if family == Some(Family::Python) && crate::python::is_builtin(&call.name) {
+                    return Vec::new();
+                }
                 diagnostics.push(Diagnostic {
                     kind: DiagnosticKind::UnresolvedCall,
                     path,
@@ -1508,10 +1685,9 @@ fn resolve_call(
             call_edges(found, line)
         }
         Receiver::Name(name) => {
-            let type_name = member
-                .params
+            let typed = params
                 .iter()
-                .chain(member.locals.iter())
+                .chain(locals.iter())
                 .find(|(local, _)| local == name)
                 .map(|(_, ty)| ty.clone())
                 .or_else(|| {
@@ -1520,8 +1696,8 @@ fn resolve_call(
                         .iter()
                         .find(|(field, _)| field == name)
                         .map(|(_, ty)| ty.clone())
-                })
-                .unwrap_or_else(|| name.clone());
+                });
+            let type_name = typed.clone().unwrap_or_else(|| name.clone());
 
             if type_name == class.name {
                 let mut visited = HashSet::new();
@@ -1547,13 +1723,35 @@ fn resolve_call(
             let Some((target_file, target_index)) = resolve_class(index, file, &type_name, family)
             else {
                 if family == Some(Family::Rust) {
-                    let found = rust_function_units(index, &call.name, family, Some(file_position));
+                    let found = free_function_units(index, &call.name, family, Some(file_position));
                     if found.is_empty() {
                         diagnostics.push(Diagnostic {
                             kind: DiagnosticKind::UnresolvedCall,
                             path,
                             line,
                             name: type_name.clone(),
+                        });
+                    }
+                    return call_edges(found, line);
+                }
+                if family == Some(Family::Python) {
+                    // `utils.helper()` or a receiver whose class is not indexed:
+                    // a module receiver is not a type, so try the imported and
+                    // the project-wide functions before giving up on the call.
+                    let mut found = imported_function_units(index, file, &call.name);
+                    if found.is_empty() {
+                        found = free_function_units(index, &call.name, family, Some(file_position));
+                    }
+                    if found.is_empty() && typed.is_none() && crate::python::is_builtin(&call.name)
+                    {
+                        return Vec::new();
+                    }
+                    if found.is_empty() {
+                        diagnostics.push(Diagnostic {
+                            kind: DiagnosticKind::UnknownReceiver,
+                            path,
+                            line,
+                            name: call.name.clone(),
                         });
                     }
                     return call_edges(found, line);
@@ -1960,7 +2158,25 @@ fn class_calls(
                 position,
                 file,
                 class,
-                member,
+                &member.params,
+                &member.locals,
+                call,
+                family,
+                diagnostics,
+            ));
+        }
+    }
+    // Python module functions keep their calls on the symbol; their annotated
+    // parameters and locals type receivers exactly like a method's do.
+    if family == Some(Family::Python) {
+        for call in &class.calls {
+            out.extend(resolve_call(
+                index,
+                position,
+                file,
+                class,
+                &class.params,
+                &class.locals,
                 call,
                 family,
                 diagnostics,
@@ -1971,7 +2187,7 @@ fn class_calls(
     // are recorded by name, so resolve them directly.
     if family == Some(Family::Rust) {
         for call in &class.calls {
-            let found = rust_function_units(index, &call.name, family, Some(position));
+            let found = free_function_units(index, &call.name, family, Some(position));
             if found.is_empty() {
                 diagnostics.push(Diagnostic {
                     kind: DiagnosticKind::UnresolvedCall,
@@ -2256,6 +2472,8 @@ mod tests {
             members: Vec::new(),
             fields: Vec::new(),
             supertypes: Vec::new(),
+            params: Vec::new(),
+            locals: Vec::new(),
         }
     }
 
@@ -2329,6 +2547,8 @@ mod tests {
                 .map(|(name, ty)| (name.to_string(), ty.to_string()))
                 .collect(),
             supertypes: supertypes.iter().map(|name| name.to_string()).collect(),
+            params: Vec::new(),
+            locals: Vec::new(),
         }
     }
 
@@ -2756,6 +2976,143 @@ mod tests {
         assert!(order.iter().any(|(unit, _, _)| {
             unit.symbol() == Some("Repo") && unit.member() == Some("size")
         }));
+        assert!(!order
+            .iter()
+            .any(|(unit, _, _)| unit.member() == Some("unused")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn python_imports_and_method_call_graph() {
+        let root = index_from_disk(
+            "python",
+            &[
+                (
+                    "app/service.py",
+                    "from app.repo import Repo\nfrom .helper import Helper\nimport app.constants\nfrom app.models import User\n\n\nclass Service(Base):\n    def __init__(self, repo: Repo) -> None:\n        self.repo = repo\n\n    def used(self, helper: Helper) -> int:\n        repo = Repo()\n        return repo.size() + helper.pong() + self.internal()\n\n    def omitted(self) -> int:\n        return 1\n\n    def internal(self) -> int:\n        return 2\n\n\ndef run(helper: Helper) -> int:\n    repo = Repo()\n    return repo.size() + helper.pong() + free_helper()\n",
+                ),
+                (
+                    "app/repo.py",
+                    "class Repo:\n    def size(self) -> int:\n        return 0\n\n    def unused(self) -> int:\n        return 1\n",
+                ),
+                (
+                    "app/helper.py",
+                    "class Helper:\n    def pong(self) -> None:\n        ...\n\n    def quiet(self) -> None:\n        ...\n\n\ndef free_helper() -> None:\n    ...\n",
+                ),
+                ("app/base.py", "class Base:\n    def parent(self) -> None:\n        ...\n"),
+                ("app/constants.py", "LIMIT = 1\n"),
+                (
+                    "app/models/__init__.py",
+                    "from .user import User\n",
+                ),
+                ("app/models/user.py", "class User:\n    pass\n"),
+            ],
+        );
+        let index = Index::build(&root);
+        let service = index.by_rel["app/service.py"];
+        let file = &index.files[service];
+
+        // `from app.repo import Repo` resolves to the file that declares it.
+        assert_eq!(
+            resolve_import(&index, file, &import("app.repo.Repo", ImportKind::Type)),
+            vec![index.by_rel["app/repo.py"]]
+        );
+        // `from .helper import Helper` is relative to the importing package.
+        assert_eq!(
+            resolve_import(&index, file, &import(".helper.Helper", ImportKind::Type)),
+            vec![index.by_rel["app/helper.py"]]
+        );
+        // `import app.constants` names a module, not a declaration.
+        assert_eq!(
+            resolve_import(&index, file, &import("app.constants", ImportKind::Module)),
+            vec![index.by_rel["app/constants.py"]]
+        );
+        // `from app.models import User`: the package only re-exports it.
+        assert_eq!(
+            resolve_import(&index, file, &import("app.models.User", ImportKind::Type)),
+            vec![index.by_rel["app/models/user.py"]]
+        );
+        // Stdlib and site-packages stay external.
+        assert!(resolve_import(&index, file, &import("os.path", ImportKind::Module)).is_empty());
+        assert!(
+            resolve_import(&index, file, &import("requests.Session", ImportKind::Type)).is_empty()
+        );
+
+        let order = closure_units(
+            &index,
+            &[member_seed(service, "Service", "used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let members = member_names(&order);
+        for expected in [
+            ("Service", "internal"),
+            ("Repo", "size"),
+            ("Helper", "pong"),
+        ] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(class, member)| class == expected.0 && member == expected.1),
+                "missing {expected:?} in {members:?}"
+            );
+        }
+        for unexpected in [
+            ("Service", "omitted"),
+            ("Repo", "unused"),
+            ("Helper", "quiet"),
+        ] {
+            assert!(
+                !members
+                    .iter()
+                    .any(|(class, member)| class == unexpected.0 && member == unexpected.1),
+                "unexpected {unexpected:?} in {members:?}"
+            );
+        }
+
+        // A module-level function is a symbol unit; its annotated parameters
+        // and `X()` locals type the receivers it calls.
+        let order = closure_units(
+            &index,
+            &[Unit::Symbol {
+                file: service,
+                symbol: "run".to_string(),
+            }],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        for expected in [("Repo", "size"), ("Helper", "pong")] {
+            assert!(
+                order.iter().any(|(unit, _, _)| {
+                    unit.symbol() == Some(expected.0) && unit.member() == Some(expected.1)
+                }),
+                "missing {expected:?}: {order:?}"
+            );
+        }
+        assert!(order
+            .iter()
+            .any(|(unit, _, _)| unit.symbol() == Some("free_helper")));
+
+        // A whole-file seed follows the same calls.
+        let order = closure_units(
+            &index,
+            &[Unit::File(service)],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(order
+            .iter()
+            .any(|(unit, _, _)| unit.symbol() == Some("Repo") && unit.member() == Some("size")));
         assert!(!order
             .iter()
             .any(|(unit, _, _)| unit.member() == Some("unused")));
