@@ -158,7 +158,10 @@ struct BundleArgs {
     /// Files to bundle, as paths relative to the root (or absolute paths).
     /// Add `::Symbol` for one declaration and `::Class.method` for a method
     /// scope, e.g. `app/Service.java::Service.used`.
-    #[arg(required_unless_present = "seeds_from", value_name = "FILE")]
+    #[arg(
+        required_unless_present_any = ["seeds_from", "from_state"],
+        value_name = "FILE"
+    )]
     files: Vec<String>,
     /// Read seed paths from `-` (stdin) or `@FILE`, one per line. Repeatable,
     /// so `rg -l ... | filer bundle --seeds-from -` works and long seed lists
@@ -191,6 +194,11 @@ struct BundleArgs {
     /// Start from an empty bundle instead of the saved state.
     #[arg(long)]
     reset: bool,
+    /// Re-resolve the saved bundle's seed entries instead of carrying the
+    /// previous bundle over: agents refresh a bundle after an edit without
+    /// repeating the seeds and without keeping stale entries.
+    #[arg(long, conflicts_with = "reset")]
+    from_state: bool,
     /// Bundle the symbol under this 1-based line instead of the whole file,
     /// in any indexed language (used by `:FilerHere`).
     #[arg(long, value_name = "LINE")]
@@ -1013,22 +1021,43 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
     // Flag > `.filer/config.toml` > built-in.
     let depth = args.depth.unwrap_or(context.depth);
     let max_file_bytes = args.max_file_bytes.unwrap_or(context.max_file_bytes);
-    // `--state` wins; then `--session` (or `$FILER_SESSION`).
+    // `--state` wins; then `--session` (or `$FILER_SESSION`); then, for
+    // `--from-state`, the default state file a plain `filer bundle` wrote.
     let state_path = args.state.clone().or_else(|| {
         context
             .session
             .as_deref()
             .map(|id| state::session_path(&root, id))
+            .or_else(|| args.from_state.then(|| state::default_path(&root)))
     });
 
     let branch = state::current_branch(&root);
     let doc = state_path.as_ref().and_then(|path| state::load(path));
+    let saved = doc.as_ref().and_then(|doc| doc.bundle(&branch));
+
+    if args.from_state && saved.is_none() {
+        return Err(FilerError::new(
+            error::Code::StateNotFound,
+            format!(
+                "no bundle for branch {} at {}",
+                state::branch_label(&branch),
+                state_path.as_ref().map_or_else(
+                    || state::default_path(&root).display().to_string(),
+                    |path| path.display().to_string()
+                )
+            ),
+        )
+        .with_hint("bundle something first, or pass the files to seed from"));
+    }
 
     // Units carried over from this branch's previous bundle, validated against
     // the current index. One `methods` entry expands to one unit per method.
+    // `--from-state` deliberately skips this: re-resolving the seeds has to be
+    // the only source of units, or stale entries survive an edit and the depth
+    // semantics silently change.
     let mut previous: HashMap<Unit, (u32, Reason)> = HashMap::new();
-    if !args.reset {
-        if let Some(bundle) = doc.as_ref().and_then(|doc| doc.bundle(&branch)) {
+    if !args.reset && !args.from_state {
+        if let Some(bundle) = saved {
             for file in &bundle.files {
                 let Some(&position) = index.by_rel.get(&file.path) else {
                     continue;
@@ -1101,7 +1130,9 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
     for source in &args.seeds_from {
         inputs.extend(read_seeds(source)?);
     }
-    if inputs.is_empty() {
+    // `--from-state` recovers its seeds from the saved bundle, so empty inputs
+    // are fine there; the state file's seed entries are checked below.
+    if inputs.is_empty() && !args.from_state {
         return Err(
             FilerError::empty_result("no seed paths to bundle").with_hint(
                 "write one path per line to --seeds-from, or pass the files on the command line",
@@ -1125,6 +1156,14 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
     }
 
     let mut seeds: Vec<Unit> = Vec::new();
+    if args.from_state {
+        // Existence is checked above; a bundle without seed entries cannot be
+        // refreshed, and rebuilding it from nothing would look like "now empty".
+        if let Some(bundle) = saved {
+            seeds = recovered_seeds(&index, bundle, context);
+        }
+    }
+
     let mut extras: Vec<BundleFile> = Vec::new();
     let mut at_line_used = false;
 
@@ -1162,9 +1201,16 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
             }
             None => Unit::File(position),
         };
-        if !seeds.contains(&unit) {
-            seeds.push(unit);
-        }
+        push_unique(&mut seeds, unit);
+    }
+
+    // A state file with no seed entries (hand-edited, or version 1/2) cannot be
+    // refreshed; say so instead of emitting an empty bundle.
+    if args.from_state && seeds.is_empty() {
+        return Err(
+            FilerError::empty_result("the saved bundle records no seed entries")
+                .with_hint("bundle something explicitly first, or pass the files to seed from"),
+        );
     }
 
     let graph = build_graph(
@@ -1626,6 +1672,89 @@ fn read_seeds(source: &str) -> Result<Vec<String>, FilerError> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_string)
         .collect())
+}
+
+/// The seed units recorded in a saved bundle: entries with `reason = "seed"` are
+/// exactly the units the caller named. Everything else was derived by the
+/// resolver from them, so `--from-state` re-resolves these and lets the rest be
+/// recomputed — that is how an edit that adds a call picks up the new callee and
+/// an edit that deletes a method drops the entry.
+fn recovered_seeds(index: &Index, bundle: &BranchBundle, context: &Context) -> Vec<Unit> {
+    let mut seeds: Vec<Unit> = Vec::new();
+    for file in &bundle.files {
+        if Reason::from_str(&file.reason) != Reason::Seed {
+            continue;
+        }
+        let Some(&position) = index.by_rel.get(&file.path) else {
+            context.warn(format!(
+                "dropping seed {}: no longer in the index",
+                file.path
+            ));
+            continue;
+        };
+        let entry = &index.files[position];
+        match file.scope {
+            Selection::File => push_unique(&mut seeds, Unit::File(position)),
+            Selection::Symbol => {
+                let Some(symbol) = &file.symbol else {
+                    continue;
+                };
+                if entry.symbol(symbol).is_some() {
+                    push_unique(
+                        &mut seeds,
+                        Unit::Symbol {
+                            file: position,
+                            symbol: symbol.clone(),
+                        },
+                    );
+                } else {
+                    context.warn(format!(
+                        "dropping seed {}::{symbol}: no longer in the file",
+                        file.path
+                    ));
+                }
+            }
+            Selection::Methods => {
+                let Some(symbol) = &file.symbol else {
+                    continue;
+                };
+                let Some(class) = entry.symbol(symbol) else {
+                    context.warn(format!(
+                        "dropping seed {}::{symbol}: no longer in the file",
+                        file.path
+                    ));
+                    continue;
+                };
+                for member in &file.methods {
+                    let exists = class.members.iter().any(|candidate| {
+                        candidate.kind == MemberKind::Method && candidate.name == *member
+                    });
+                    if exists {
+                        push_unique(
+                            &mut seeds,
+                            Unit::Member {
+                                file: position,
+                                class: symbol.clone(),
+                                member: member.clone(),
+                            },
+                        );
+                    } else {
+                        context.warn(format!(
+                            "dropping seed {}::{symbol}.{member}: no longer in the file",
+                            file.path
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    seeds
+}
+
+fn push_unique(seeds: &mut Vec<Unit>, unit: Unit) {
+    if !seeds.contains(&unit) {
+        seeds.push(unit);
+    }
 }
 
 /// `path::symbol` (Windows drive letters do not contain `::`).
