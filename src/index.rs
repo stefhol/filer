@@ -33,7 +33,7 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 13;
+const CACHE_VERSION: u32 = 14;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -83,9 +83,13 @@ impl FileEntry {
         self.symbols.iter().find(|symbol| symbol.name == name)
     }
 
-    /// Symbol whose span contains `offset` (used by `--at-line`).
+    /// Symbol whose span contains `offset` (used by `--at-line`), preferring
+    /// the most specific span when Rust `impl` blocks make symbols overlap.
     pub fn symbol_at(&self, offset: usize) -> Option<&Symbol> {
-        self.symbols.iter().find(|symbol| symbol.contains(offset))
+        self.symbols
+            .iter()
+            .filter(|symbol| symbol.contains(offset))
+            .min_by_key(|symbol| symbol.end - symbol.start)
     }
 
     /// Member (method) whose span contains `offset`, with its enclosing symbol.
@@ -438,6 +442,7 @@ mod tests {
                 "<script setup lang=\"ts\">import X from \"./x\"</script>",
             ),
             ("I.fe", "function i() { return 1; }"),
+            ("J.rs", "pub struct J;"),
         ];
         for (name, source) in files {
             fs::write(root.join(name), source).unwrap();

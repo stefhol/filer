@@ -1,6 +1,6 @@
 # filer
 
-Select Java, Scala, Kotlin, Groovy, C#, TypeScript, JavaScript, Vue or Asset Control
+Select Java, Scala, Kotlin, Groovy, C#, Rust, TypeScript, JavaScript, Vue or Asset Control
 Formula Engine (`.fe`) code in Neovim, get one pastable markdown blob for your chat LLM —
 with the files your selection imports, and the files those import, already included.
 
@@ -34,24 +34,30 @@ whole picture instead of a fragment.
 ## What it does
 
 - Indexes `.java`, `.scala` / `.sbt` / `.sc`, `.kt` / `.kts`, `.groovy` / `.gradle`, `.cs`,
-  `.ts` / `.tsx`, `.js` / `.jsx` / `.mjs` / `.cjs`, `.vue` and `.fe` files under the project
-  root (tree-sitter based except `.fe`, which has a small hand-written parser; no LSP, no
-  classpath, no compiler).
+  `.rs`, `.ts` / `.tsx`, `.js` / `.jsx` / `.mjs` / `.cjs`, `.vue` and `.fe` files under the
+  project root (tree-sitter based except `.fe`, which has a small hand-written parser; no LSP,
+  no classpath, no compiler).
 - Resolves package-style imports against the files that actually exist in your repo:
   Java `import a.b.C;` / `import static ...` / `import a.b.*;`, Scala 2 and 3 (selector
   lists, renames, `given`, comma-separated imports, nested or braced packages, package
   objects), Kotlin wildcards and aliases, Groovy wildcards, static imports and aliases, and
   C# `using` namespaces, `using static` and aliases.
+- Resolves Rust module paths: `use crate::...`, `self::...`, `super::...`, grouped imports
+  (`use crate::app::{Service, model::User}`), wildcards and aliases, plus `mod foo;`
+  declarations. Rust modules resolve by Cargo directory layout (`foo.rs` or `foo/mod.rs`),
+  not by package name.
 - Resolves TypeScript/JavaScript/Vue module specifiers: relative imports and re-exports
   (`./x`, `../y.js`), extensionless imports, directory `index` files, `.js` specifiers that
   point at a `.ts` source, dynamic `import()` and CommonJS `require()`. Vue `<script>` and
   `<script setup>` blocks are extracted and parsed as TypeScript/JavaScript.
 - Follows type *usages* too, so a class that references a sibling in its own package — which
   Java, Scala, Kotlin, Groovy or C# needs no import for, e.g. `indexOps(DemoDocument.class)`,
-  `DemoDocument.create()` or `new DemoDocument()` — still pulls that file in. Module
-  languages rely on their explicit imports instead of repo-wide name guessing.
-- Extracts **symbols** (top-level functions, classes, objects, global declarations, Java
-  methods) with their byte spans, so a bundle can carry one function out of a huge file.
+  `DemoDocument.create()` or `new DemoDocument()` — still pulls that file in. Rust type
+  positions and `Type::method()` receivers work the same way. Module languages rely on
+  their explicit imports instead of repo-wide name guessing.
+- Extracts **symbols** (top-level functions, classes, objects, global declarations, Rust
+  structs/enums/traits/functions, Java methods) with their byte spans, so a bundle can carry
+  one function out of a huge file.
   `.fe` functions are the primary use case: they call each other across a project-wide
   namespace, exactly like the language's IntelliJ plugin resolves them. Class methods add a second one: class shell for context, call-path bodies for content.
 - Every entry has an explicit **scope** — `file`, `symbol` or `methods` — so the picker,
@@ -67,11 +73,11 @@ whole picture instead of a fragment.
   every keystroke.
 
 Things it deliberately does not do: compile your project, read `pom.xml` / `build.sbt` /
-`*.csproj` / `package.json` dependencies, or pretend to resolve libraries. JDK, Scala stdlib,
-npm packages, NuGet packages and other third-party imports are simply reported as unresolved
-(`tsconfig` path aliases are not read). Imports only resolve within the same language family
-(JVM-ish languages with each other, TS/JS/Vue with each other, FE with itself), never
-across.
+`*.csproj` / `Cargo.toml` / `package.json` dependencies, or pretend to resolve libraries. JDK,
+Scala stdlib, npm packages, NuGet packages, Rust crates and other third-party imports are
+simply reported as unresolved (`tsconfig` path aliases are not read). Imports only resolve
+within the same language family (JVM-ish languages with each other, TS/JS/Vue with each
+other, Rust with itself, FE with itself), never across.
 
 ## Build
 
@@ -179,7 +185,7 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 | Command | Effect |
 | --- | --- |
 | `:FilerSearch` | Telescope picker of bundle scopes: `[file]` for every file, `[class]`/`[method]` for class-based languages, `[type]`/`[function]` elsewhere. `<Tab>` multi-selects, `<CR>` bundles. |
-| `:FilerHere` | Bundles the current buffer with its closure. In a `.fe` file the function under the cursor is the seed; in Java, the method under the cursor (or its class); elsewhere the whole file. |
+| `:FilerHere` | Bundles the current buffer with its closure. In a `.fe` file the function under the cursor is the seed; in Java, Kotlin, Scala, Groovy, C#, Rust and TS/JS, the method under the cursor (or its class); elsewhere the whole file. |
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute) or excerpts (`path::Symbol`). |
 | `:FilerShow [branch]` | Re-renders the saved bundle (current file contents) without re-resolving. |
 | `:FilerReset` | Forgets this branch's bundle; the next bundle starts empty. |
@@ -190,8 +196,9 @@ disk. Bundling again — picker or `:FilerHere` — refills that same window and
 of opening another split; `q` closes it, and the next bundle opens a fresh one.
 
 Root detection uses `vim.fs.root` with markers `.git`, `pom.xml`, `build.gradle(.kts)`,
-`settings.gradle(.kts)`, `build.sbt`, `gradlew`, `mvnw`, `tsconfig.json`, `jsconfig.json`,
-`package.json`, `*.csproj`, `*.sln`. Override with `opts.root` (string or function).
+`settings.gradle(.kts)`, `build.sbt`, `Cargo.toml`, `gradlew`, `mvnw`, `tsconfig.json`,
+`jsconfig.json`, `package.json`, `*.csproj`, `*.sln`. Override with `opts.root` (string or
+function).
 
 ## Bundle scopes: file, class, method
 
@@ -200,9 +207,9 @@ each language exposes only the ones it has.
 
 | Scope | Languages | Rendered | Closure |
 | --- | --- | --- | --- |
-| `file` | all but `.fe` | the whole file | Java: the calls of every method in the file; others: the import/type closure |
-| `symbol` | all parsed languages (Vue stays whole-file) | one top-level declaration plus the file header | class: the calls of its methods; other symbols: the symbol closure |
-| `methods` | Java, Kotlin, Groovy, C#, Scala, TS/JS | class shell plus the listed methods; the rest as signature stubs | the seed method(s) and their calls |
+| `file` | all but `.fe` | the whole file | Java/Rust: the calls of every method or function in the file; others: the import/type closure |
+| `symbol` | all parsed languages (Vue stays whole-file) | one top-level declaration plus the file header | class/type: the calls of its methods; other symbols: the symbol closure |
+| `methods` | Java, Kotlin, Groovy, C#, Scala, Rust, TS/JS | class/type shell plus the listed methods; the rest as signature stubs | the seed method(s) and their calls |
 
 Picker rows map 1:1 to scopes, and the CLI accepts the same targets:
 
@@ -228,7 +235,7 @@ a `[file]` row, so the whole file is always selectable explicitly.
 ### Member scopes: class shell + call path
 
 A method seed (`app.Service.used`, `filer bundle 'app/Service.java::Service.used'`, or
-`:FilerHere` inside a method) renders, in every language with classes:
+`:FilerHere` inside a method) renders, in every language with classes or Rust `impl` blocks:
 
 - the seeded class as a **shell** — package, imports, fields, constructors, annotations —
   with only the methods on the call path in full,
@@ -263,8 +270,9 @@ Calls are resolved through:
 - bare `helper()` — the class, then superclasses/interfaces, then `import static` targets
 - `this.helper()` / `super.helper()`
 - `local.helper()`, `param.helper()`, `field.helper()` — using the declared type of the receiver
-- `Type.helper()` — static calls
+- `Type.helper()` — static calls (including Rust `Self::helper()` and `Type::helper()`)
 - `new Type().helper()`
+- Rust bare `helper()` / `crate::module::helper()` — unique free functions in the repo
 
 Everything the resolver cannot type (`a.b().c()`, interface dispatch, third-party types) adds
 no edge. If the receiver's class is known but the method is not found, the **whole class** is
@@ -274,7 +282,7 @@ still give the reader the name. Nested classes are rendered inside their enclosi
 
 `--depth` counts method hops for method scopes, and unit hops for file/class seeds. A
 `[file]` or `[class]` seed uses the **same call graph** for Java, Kotlin, Groovy, C#, Scala,
-TS/JS — not the import/type closure:
+Rust, TS/JS — not the import/type closure:
 you get the files that are actually called, nothing else. `--with-same-package` is a
 whole-class expansion and is not applied to that minimal path. A Java file without parsed
 symbols (and every other language) keeps the import/type closure.
@@ -291,6 +299,11 @@ symbols (and every other language) keeps the import/type closure.
 - TypeScript/JavaScript classes get the same `[class]`/`[method]` tiers. Type annotations on
   fields, parameters and locals type the receivers, and module imports (`./Repo`) resolve the
   classes. JavaScript has no annotations, so only `this.x()` and bare calls create edges.
+- Rust structs/enums/traits get the same `[class]`/`[method]` tiers. Methods from every
+  `impl Type` block in a file are attached to the type; `self`, `self.field`, parameter and
+  local types resolve receivers, `Self::`/`Type::` resolve associated calls, and free
+  functions resolve by unique name across the crate. `use crate/self/super` paths and
+  `mod` declarations follow the Cargo module layout.
 - Vue stays whole-file: its script offsets are relative to the extracted `<script>` block, so
   `.vue` is never sliced.
 
@@ -415,18 +428,20 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C
 
 `bundle` flags: `--depth N` (0 = only the given units), `--with-same-package`,
 `--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`, `--at-line N`.
-Default depth is 2. Add `::Symbol` for one declaration and `::Class.method` for a Java
-method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
-`filer --root ~/code/demo bundle 'app/Service.java::Service.used'`.
+Default depth is 2. Add `::Symbol` for one declaration and `::Class.method` for a Java or
+Rust method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
+`filer --root ~/code/demo bundle 'app/Service.java::Service.used'`,
+`filer --root ~/code/demo bundle 'src/app/service.rs::Service.used'`.
 `--with-config` adds, when they exist: `pom.xml`, the Gradle files, `build.sbt` /
-`project/*.sbt`, `tsconfig.json` / `jsconfig.json` / `package.json`, `Directory.Build.props`
-and root-level `*.csproj` / `*.sln`.
+`project/*.sbt`, `Cargo.toml`, `tsconfig.json` / `jsconfig.json` / `package.json`,
+`Directory.Build.props` and root-level `*.csproj` / `*.sln`.
 
 Every indexed language works the same:
 
 ```sh
 filer --root ~/code/demo bundle --depth 2 src/main/scala/com/example/app/Application.scala
 filer --root ~/code/demo bundle --depth 2 src/main/kotlin/com/example/App.kt
+filer --root ~/code/demo bundle --depth 2 src/app/service.rs
 filer --root ~/code/demo bundle --depth 2 src/web/app.ts
 ```
 
@@ -445,28 +460,35 @@ the ones that do.
    the TypeScript grammar on its `<script>` blocks). Java types are
    classes/interfaces/enums/records/annotations; Scala adds objects, traits and top-level
    type aliases; Kotlin adds objects and type aliases; Groovy adds traits; C# adds structs,
-   records and delegates; TS/JS add interfaces, type aliases and enums. Sequential and braced
-   package/namespace clauses compose; `package object foo` counts as package `a.foo`;
-   C# file-scoped namespaces apply to the rest of the file.
+   records and delegates; Rust adds structs, enums, unions, traits, type aliases and free
+   functions, with `impl` methods attached to their type; TS/JS add interfaces, type aliases
+   and enums. Sequential and braced package/namespace clauses compose; `package object foo`
+   counts as package `a.foo`; C# file-scoped namespaces apply to the rest of the file.
 3. Build `fqn -> files`, `package -> files`, simple-name and `symbol -> (file, index)` maps.
    A name can exist in several languages, so lookups are filtered by language family:
    JVM-ish (Java, Scala, Kotlin, Groovy, C#) only resolve against each other, TS/JS/Vue only
-   against each other, and Asset Control Formula Engine is its own family with a single
-   global namespace: calls and top-level declarations resolve by unique name across `.fe`
-   files (the IDE plugin's stub indexes do the same, and index a top-level declaration
-   whether it says `local` or `global`).
+   against each other, Rust only against Rust, and Asset Control Formula Engine is its own
+   family with a single global namespace: calls and top-level declarations resolve by unique
+   name across `.fe` files (the IDE plugin's stub indexes do the same, and index a top-level
+   declaration whether it says `local` or `global`).
 4. For a package-style import, try the full name, then trim trailing segments one at a time
    (`a.b.C.member` → `a.b.C`), which also covers nested types like `a.b.C.Inner` and Scala
    selectors / `given` imports. Wildcards expand to the package, or to the object/type they
    name (`import a.b.C._`); C# `using Some.Namespace;` is a package wildcard. Anything
    unresolved is JDK, stdlib, npm, NuGet or another third party.
-5. For a module import, join the specifier onto the importing file's directory, reject paths
-   that escape the root, then probe in order: the exact path, TS extensions (`.ts`, `.tsx`,
-   then JS `.js`, `.jsx`, `.mjs`, `.cjs`, then `.vue`), and `<dir>/index.*`. A `.js`
-   specifier prefers the matching `.ts`/`.tsx` source. Bare specifiers (`react`) are treated
-   as third-party.
+5. For a TypeScript/JavaScript module import, join the specifier onto the importing file's
+   directory, reject paths that escape the root, then probe in order: the exact path, TS
+   extensions (`.ts`, `.tsx`, then JS `.js`, `.jsx`, `.mjs`, `.cjs`, then `.vue`), and
+   `<dir>/index.*`. A `.js` specifier prefers the matching `.ts`/`.tsx` source. Bare
+   specifiers (`react`) are treated as third-party.
+   For a Rust import, expand the `use` tree, then resolve the longest module prefix against
+   the Cargo layout: `crate::` starts at the nearest `src` directory, `self::` at the current
+   module directory, `super::` one level up, and `mod foo;` uses the same relative lookup.
+   Each module is `foo.rs` or `foo/mod.rs`; `lib.rs`/`main.rs`/`mod.rs` are the module root.
+   Unresolved prefixed paths (`std::...`, third-party crates) stay external.
 6. For every type name used in the file (Java/Scala type positions, Kotlin user types,
-   Groovy/C# type positions, object receivers like `DemoDocument.create`) look the name up in
+   Groovy/C# type positions, Rust type positions and `Type::method` paths, object receivers
+   like `DemoDocument.create`) look the name up in
    the index. Names that are explicitly imported are left to step 4; a same-package match
    wins; otherwise the name is only used when it is unique in the repo. Ambiguous names are
    dropped rather than guessed.
@@ -482,12 +504,12 @@ the ones that do.
 `imports` with an `ImportKind`, `uses`, `symbols` with byte spans, `preamble_end`), the
 `Language` -> extension map and the `Language::family` grouping that keeps resolution
 between compatible languages only. The per-language modules (`java`, `scala`, `kotlin`,
-`groovy`, `csharp`, `web`, `fe`) only translate their grammar into that struct. To add
+`groovy`, `csharp`, `rust`, `web`, `fe`) only translate their grammar into that struct. To add
 another package+import language: add a parser module returning `Source`, add an arm to
 `Language::from_path` and `SourceParser::parse`, and pick a fence string. Indexing, closure,
 state and rendering need no changes. A language with a different import model (like TS/JS
-module paths) needs its own resolver branch in `src/resolve.rs` — that is where
-`ImportKind::Module` is handled.
+module paths or Rust's `crate`/`self`/`super` paths) needs its own resolver branch in
+`src/resolve.rs` — that is where `ImportKind::Module` and `Family::Rust` are handled.
 
 Populating `symbols` is optional: use `symbol_from_node` for a tree-sitter declaration (it
 extends the span over the doc comment and records the line) and `finish_symbols` to assign
@@ -505,6 +527,7 @@ src/scala.rs    tree-sitter-scala parsing, import normalization + tests
 src/kotlin.rs   tree-sitter-kotlin parsing + tests
 src/groovy.rs   tree-sitter-groovy parsing + tests
 src/csharp.rs   tree-sitter-c-sharp parsing (namespaces, usings) + tests
+src/rust.rs     tree-sitter-rust parsing (use/mod, items, impl methods) + tests
 src/web.rs      TypeScript/JavaScript parsing, Vue SFC extraction + tests
 src/fe.rs       Asset Control Formula Engine lexer/parser + tests
 src/index.rs    tree walk, parallelism, disk cache
@@ -517,8 +540,9 @@ examples/lazyvim.lua  copy-paste LazyVim spec with the defaults above
 ```
 
 `cargo test` covers parsing for every language (packages/namespaces, Scala import forms,
-Kotlin/Groovy/C# imports, TS/JS module specifiers, Vue scripts, FE functions/declarations),
-static/wildcard/module resolution, family isolation, name inference without imports, closure
+Kotlin/Groovy/C# imports, Rust use/mod and impl methods, TS/JS module specifiers, Vue
+scripts, FE functions/declarations), static/wildcard/module resolution, family isolation,
+name inference without imports, closure
 depth, same-package expansion, symbol extraction and symbol closure (including depth bounds
 and whole-file supersession), preamble brace balancing, fence selection, TOML round-trips
 with `symbol` entries, and branch staleness.

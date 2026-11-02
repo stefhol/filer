@@ -13,6 +13,7 @@ use crate::fe::FeParser;
 use crate::groovy::GroovyParser;
 use crate::java::JavaParser;
 use crate::kotlin::KotlinParser;
+use crate::rust::RustParser;
 use crate::scala::ScalaParser;
 use crate::web::WebParser;
 
@@ -28,6 +29,8 @@ pub enum Language {
     Vue,
     /// Asset Control Formula Engine code (`.fe`).
     Fe,
+    /// Rust (`.rs`).
+    Rust,
 }
 
 /// How finely a language can be bundled and picked.
@@ -66,11 +69,13 @@ pub enum Family {
     Web,
     /// One global namespace, no imports at all (Asset Control Formula Engine).
     Fe,
+    /// Cargo module paths (`crate::`, `self::`, `super::`, `mod`).
+    Rust,
 }
 
 impl Language {
     /// Every language the index understands, for stats and docs.
-    pub const ALL: [Language; 9] = [
+    pub const ALL: [Language; 10] = [
         Language::Java,
         Language::Scala,
         Language::Kotlin,
@@ -80,6 +85,7 @@ impl Language {
         Language::JavaScript,
         Language::Vue,
         Language::Fe,
+        Language::Rust,
     ];
 
     /// Language for a source file, or `None` when the extension is not indexed.
@@ -97,6 +103,7 @@ impl Language {
             "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
             "vue" => Some(Language::Vue),
             "fe" => Some(Language::Fe),
+            "rs" => Some(Language::Rust),
             _ => None,
         }
     }
@@ -110,7 +117,7 @@ impl Language {
             | Language::Groovy
             | Language::CSharp
             | Language::Scala => Granularity::Member,
-            Language::TypeScript | Language::JavaScript => Granularity::Member,
+            Language::TypeScript | Language::JavaScript | Language::Rust => Granularity::Member,
             Language::Vue => Granularity::File,
         }
     }
@@ -120,6 +127,7 @@ impl Language {
         match self {
             Language::TypeScript | Language::JavaScript | Language::Vue => Family::Web,
             Language::Fe => Family::Fe,
+            Language::Rust => Family::Rust,
             _ => Family::Jvm,
         }
     }
@@ -136,6 +144,7 @@ impl Language {
             Language::JavaScript => "javascript",
             Language::Vue => "vue",
             Language::Fe => "fe",
+            Language::Rust => "rust",
         }
     }
 
@@ -160,6 +169,7 @@ impl Language {
             Language::JavaScript => "javascript",
             Language::Vue => "vue",
             Language::Fe => "fe",
+            Language::Rust => "rust",
         }
     }
 }
@@ -324,11 +334,19 @@ pub struct Source {
 }
 
 /// Assigns each `(name, byte offset)` use to the symbol that contains it.
-/// Uses outside every symbol (imports, package clause) are dropped.
+/// Uses outside every symbol (imports, package clause) are dropped. When
+/// spans overlap (a Rust type and its `impl` blocks can span an unrelated
+/// item), the most specific symbol wins.
 pub fn attribute_uses(uses: &[(String, usize)], symbols: &[Symbol]) -> Vec<Vec<String>> {
     let mut buckets = vec![Vec::new(); symbols.len()];
     for (name, offset) in uses {
-        if let Some(index) = symbols.iter().position(|symbol| symbol.contains(*offset)) {
+        let owner = symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| symbol.contains(*offset))
+            .min_by_key(|(_, symbol)| symbol.end - symbol.start)
+            .map(|(index, _)| index);
+        if let Some(index) = owner {
             buckets[index].push(name.clone());
         }
     }
@@ -415,6 +433,7 @@ pub struct SourceParser {
     csharp: CSharpParser,
     web: WebParser,
     fe: FeParser,
+    rust: RustParser,
 }
 
 impl SourceParser {
@@ -427,6 +446,7 @@ impl SourceParser {
             csharp: CSharpParser::new(),
             web: WebParser::new(),
             fe: FeParser::new(),
+            rust: RustParser::new(),
         }
     }
 
@@ -441,6 +461,7 @@ impl SourceParser {
             Language::Groovy => self.groovy.parse(src),
             Language::CSharp => self.csharp.parse(src),
             Language::Fe => self.fe.parse(src),
+            Language::Rust => self.rust.parse(src),
             Language::TypeScript | Language::JavaScript | Language::Vue => {
                 self.web.parse(language, src)
             }
@@ -476,6 +497,7 @@ mod tests {
             ("App.jsx", Some(Language::JavaScript)),
             ("App.vue", Some(Language::Vue)),
             ("Risk.fe", Some(Language::Fe)),
+            ("lib.rs", Some(Language::Rust)),
             ("README.md", None),
             ("Makefile", None),
         ];
@@ -499,6 +521,7 @@ mod tests {
         assert_eq!(Language::Scala.granularity(), Granularity::Member);
         assert_eq!(Language::TypeScript.granularity(), Granularity::Member);
         assert_eq!(Language::JavaScript.granularity(), Granularity::Member);
+        assert_eq!(Language::Rust.granularity(), Granularity::Member);
         assert!(!Language::Fe.granularity().file_row());
         assert!(Language::Fe.granularity().symbol_rows());
         assert!(Language::Java.granularity().symbol_rows());
@@ -512,6 +535,7 @@ mod tests {
         assert_eq!(Language::TypeScript.family(), Family::Web);
         assert_eq!(Language::Vue.family(), Family::Web);
         assert_eq!(Language::Fe.family(), Family::Fe);
+        assert_eq!(Language::Rust.family(), Family::Rust);
     }
 
     #[test]
@@ -521,6 +545,7 @@ mod tests {
         assert_eq!(Language::fence_for(Path::new("A.jsx")), "jsx");
         assert_eq!(Language::fence_for(Path::new("A.cjs")), "javascript");
         assert_eq!(Language::fence_for(Path::new("A.cs")), "csharp");
+        assert_eq!(Language::fence_for(Path::new("A.rs")), "rust");
     }
 
     #[test]
@@ -535,6 +560,7 @@ mod tests {
             (Language::TypeScript, "export class F {}"),
             (Language::JavaScript, "export class G {}"),
             (Language::Fe, "function g() { return 1; }"),
+            (Language::Rust, "pub struct R;"),
         ];
         for (language, source) in cases {
             let parsed = parser.parse(language, source).expect("parsed");

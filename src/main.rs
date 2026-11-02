@@ -9,6 +9,7 @@ mod java;
 mod kotlin;
 mod lang;
 mod resolve;
+mod rust;
 mod scala;
 mod state;
 mod web;
@@ -85,7 +86,7 @@ struct BundleArgs {
     /// Also include files that share a package with a bundled file.
     #[arg(long)]
     with_same_package: bool,
-    /// Also include build files (pom.xml, build.gradle, build.sbt, *.csproj, ...).
+    /// Also include build files (pom.xml, build.gradle, build.sbt, Cargo.toml, *.csproj, ...).
     #[arg(long)]
     with_config: bool,
     /// Bundle title shown in the header.
@@ -1281,6 +1282,7 @@ fn config_files(root: &Path) -> Vec<BundleFile> {
         "jsconfig.json",
         "package.json",
         "Directory.Build.props",
+        "Cargo.toml",
     ];
     let mut files: Vec<BundleFile> = CANDIDATES
         .iter()

@@ -144,6 +144,10 @@ pub fn resolve_import(index: &Index, file: &FileEntry, import: &Import) -> Vec<u
 
     let family = family_of(file);
 
+    if family == Some(Family::Rust) {
+        return resolve_rust_import(index, file, import);
+    }
+
     if import.is_wildcard() {
         // `a.b._` is usually a package, but Scala also lets you import the
         // members of an object (`a.b.C._`, `a.b.C.given`) and Java has static
@@ -277,6 +281,253 @@ fn normalize_module(from_rel: &str, specifier: &str) -> Option<String> {
         }
     }
     Some(parts.join("/"))
+}
+
+/// Resolves a Rust `use` path or `mod` declaration against the filesystem
+/// layout of a Cargo project. Imports are stored with `.` separators
+/// (`crate.app.Service`), and the longest module prefix wins:
+/// `crate.app.Service` -> `src/app.rs` (or `src/app/mod.rs`).
+fn resolve_rust_import(index: &Index, file: &FileEntry, import: &Import) -> Vec<usize> {
+    let direct = rust_direct_import(index, &file.rel, &import.path);
+    if import.is_wildcard() || direct.is_empty() {
+        return direct;
+    }
+
+    // `use crate::app::Service` where `app.rs` only re-exports `Service` from
+    // another module: follow re-exports whose leaf matches, so the file that
+    // actually declares the symbol is the import target.
+    let Some(leaf) = import.path.rsplit('.').next() else {
+        return direct;
+    };
+    let mut queue: VecDeque<usize> = direct.iter().copied().collect();
+    let mut seen = HashSet::new();
+    while let Some(position) = queue.pop_front() {
+        if !seen.insert(position) {
+            continue;
+        }
+        let Some(target) = index.files.get(position) else {
+            continue;
+        };
+        if target.types.iter().any(|ty| ty == leaf)
+            || target.symbols.iter().any(|symbol| symbol.name == leaf)
+        {
+            return vec![position];
+        }
+        for reexport in &target.imports {
+            if reexport.is_wildcard() || reexport.kind == ImportKind::Module {
+                continue;
+            }
+            if reexport.path.rsplit('.').next() != Some(leaf) {
+                continue;
+            }
+            queue.extend(rust_direct_import(index, &target.rel, &reexport.path));
+        }
+    }
+    direct
+}
+
+/// Resolves the module file named by a Rust path, without following
+/// re-exports. The longest module prefix wins: `crate.app.Service` first tries
+/// `src/app/Service.rs`, then `src/app.rs` / `src/app/mod.rs`.
+fn rust_direct_import(index: &Index, rel: &str, path: &str) -> Vec<usize> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let segments: Vec<String> = path.split('.').map(str::to_string).collect();
+    let (root, current) = rust_module_roots(rel);
+    let mut resolved = Vec::new();
+
+    match segments.first().map(String::as_str) {
+        Some("crate") => {
+            if let Some(position) = rust_find_module(index, &root, &root, &segments[1..], true) {
+                resolved.push(position);
+            }
+        }
+        Some("self") => {
+            if let Some(position) = rust_find_module(index, &current, &root, &segments[1..], true) {
+                resolved.push(position);
+            }
+        }
+        Some("super") => {
+            let mut base = current.clone();
+            let mut index_of = 0;
+            while segments.get(index_of).map(String::as_str) == Some("super") {
+                base = parent_module(&base);
+                index_of += 1;
+            }
+            if let Some(position) =
+                rust_find_module(index, &base, &root, &segments[index_of..], true)
+            {
+                resolved.push(position);
+            }
+        }
+        // A 2018+ path that does not start with crate/self/super is usually an
+        // external crate. Try it as a local module anyway, but never fall back
+        // to the crate root: `use std::fmt::Debug` must stay unresolved.
+        _ => {
+            if let Some(position) = rust_find_module(index, &root, &root, &segments, false)
+                .or_else(|| rust_find_module(index, &current, &root, &segments, false))
+            {
+                resolved.push(position);
+            }
+        }
+    }
+
+    // The module file is the import target; symbol-level resolution picks the
+    // imported item out of it via the import's last path segment.
+    resolved
+}
+
+/// Crate root directory and current module directory for a source file.
+/// `src/app/service.rs` has root `src` and module directory `src/app/service`;
+/// `src/app/mod.rs` has module directory `src/app`.
+fn rust_module_roots(rel: &str) -> (String, String) {
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    let filename = parts.last().copied().unwrap_or("");
+    // `lib.rs`/`main.rs` are crate roots; a binary under `src/bin/<name>/`
+    // is its own crate root, otherwise the nearest `src` directory is.
+    let root = if filename == "lib.rs" || filename == "main.rs" {
+        parts
+            .get(..parts.len().saturating_sub(1))
+            .map(|parts| parts.join("/"))
+            .unwrap_or_default()
+    } else if let Some(src) = parts.iter().rposition(|part| *part == "src") {
+        if parts.get(src + 1) == Some(&"bin") {
+            if parts.len() > src + 3 {
+                parts[..src + 3].join("/")
+            } else {
+                parts[..=src + 1].join("/")
+            }
+        } else {
+            parts[..=src].join("/")
+        }
+    } else {
+        String::new()
+    };
+    let current = if filename == "mod.rs" {
+        parts.pop();
+        parts.join("/")
+    } else if filename == "lib.rs" || filename == "main.rs" {
+        root.clone()
+    } else {
+        // `src/app/service.rs` is module `crate::app::service`, so `mod x;`
+        // and `self::x` look under `src/app/service/`.
+        rel.strip_suffix(".rs").unwrap_or(rel).to_string()
+    };
+    (root, current)
+}
+
+fn parent_module(base: &str) -> String {
+    base.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
+}
+
+/// Longest-prefix module lookup. `allow_root` enables the degenerate case
+/// (`use crate::Thing` where `Thing` lives in `lib.rs`/`main.rs`/`mod.rs`).
+fn rust_find_module(
+    index: &Index,
+    base: &str,
+    root: &str,
+    segments: &[String],
+    allow_root: bool,
+) -> Option<usize> {
+    for end in (0..=segments.len()).rev() {
+        if end == 0 && !allow_root {
+            continue;
+        }
+        let candidates = rust_module_candidates(base, root, &segments[..end]);
+        for candidate in candidates {
+            if let Some(&position) = index.by_rel.get(&candidate) {
+                return Some(position);
+            }
+        }
+    }
+    None
+}
+
+fn rust_module_candidates(base: &str, root: &str, segments: &[String]) -> Vec<String> {
+    let path = if segments.is_empty() {
+        base.to_string()
+    } else if base.is_empty() {
+        segments.join("/")
+    } else {
+        format!("{base}/{}", segments.join("/"))
+    };
+
+    if segments.is_empty() {
+        if path.is_empty() || path == root {
+            let mut out = Vec::new();
+            if path.is_empty() {
+                out.push("lib.rs".to_string());
+                out.push("main.rs".to_string());
+                out.push("mod.rs".to_string());
+            } else {
+                out.push(format!("{path}/lib.rs"));
+                out.push(format!("{path}/main.rs"));
+                out.push(format!("{path}/mod.rs"));
+            }
+            out
+        } else {
+            vec![format!("{path}.rs"), format!("{path}/mod.rs")]
+        }
+    } else {
+        vec![format!("{path}.rs"), format!("{path}/mod.rs")]
+    }
+}
+
+/// Unique free function by name, for Rust calls that do not go through a
+/// receiver (`helper()`, `Self::new()` after the type lookup failed, ...).
+fn rust_function_units(
+    index: &Index,
+    name: &str,
+    family: Option<Family>,
+    prefer: Option<usize>,
+) -> Vec<Unit> {
+    let Some(candidates) = index.by_symbol.get(name) else {
+        return Vec::new();
+    };
+    let mut matching: Vec<(usize, usize)> = candidates
+        .iter()
+        .copied()
+        .filter(|(position, _symbol_index)| compatible(index, *position, family))
+        .filter(|(position, symbol_index)| {
+            index
+                .files
+                .get(*position)
+                .and_then(|file| file.symbols.get(*symbol_index))
+                .is_some_and(|symbol| symbol.kind == crate::lang::SymbolKind::Function)
+        })
+        .collect();
+    if let Some(preferred) = prefer {
+        let local: Vec<(usize, usize)> = matching
+            .iter()
+            .copied()
+            .filter(|(position, _)| *position == preferred)
+            .collect();
+        if !local.is_empty() {
+            matching = local;
+        }
+    }
+    let mut files: Vec<usize> = matching.iter().map(|(position, _)| *position).collect();
+    files.sort_unstable();
+    files.dedup();
+    if files.len() != 1 {
+        return Vec::new();
+    }
+    matching
+        .first()
+        .and_then(|(position, symbol_index)| {
+            index.files[*position]
+                .symbols
+                .get(*symbol_index)
+                .map(|symbol| Unit::Symbol {
+                    file: *position,
+                    symbol: symbol.name.clone(),
+                })
+        })
+        .into_iter()
+        .collect()
 }
 
 /// Resolves type names *used* in the file. Java needs no import for types in
@@ -623,6 +874,9 @@ fn resolve_call(
             if found.is_empty() && call.receiver == Receiver::Bare {
                 found = static_import_methods(index, file, &call.name);
             }
+            if found.is_empty() && family == Some(Family::Rust) {
+                found = rust_function_units(index, &call.name, family, Some(file_position));
+            }
             found
         }
         Receiver::Super => super_methods(index, file_position, class, &call.name, family),
@@ -655,6 +909,9 @@ fn resolve_call(
             }
             let Some((target_file, target_index)) = resolve_class(index, file, &type_name, family)
             else {
+                if family == Some(Family::Rust) {
+                    return rust_function_units(index, &call.name, family, Some(file_position));
+                }
                 return Vec::new();
             };
             let target = &index.files[target_file].symbols[target_index];
@@ -952,6 +1209,15 @@ fn class_calls(
     {
         for call in &member.calls {
             for unit in resolve_call(index, position, file, class, member, call, family) {
+                out.push((unit, Reason::Call));
+            }
+        }
+    }
+    // Rust free functions are top-level symbols with no members. Their calls
+    // are recorded by name, so resolve them directly.
+    if family == Some(Family::Rust) {
+        for name in &class.calls {
+            for unit in rust_function_units(index, name, family, Some(position)) {
                 out.push((unit, Reason::Call));
             }
         }
@@ -1513,6 +1779,145 @@ mod tests {
         assert!(!order
             .iter()
             .any(|(unit, _, _)| unit.member() == Some("Unused")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rust_module_paths_and_method_call_graph() {
+        let root = index_from_disk(
+            "rust",
+            &[
+                (
+                    "src/lib.rs",
+                    "pub mod app;\npub use crate::app::Service;\n",
+                ),
+                (
+                    "src/app.rs",
+                    "pub mod service;\npub mod repo;\npub use service::Service;\n",
+                ),
+                (
+                    "src/app/service.rs",
+                    "mod sub;\n\nuse crate::app::repo::Repo;\nuse super::helper::Helper;\n\npub struct Service {\n    repo: Repo,\n}\n\nimpl Service {\n    pub fn used(&self, helper: Helper) -> i32 {\n        helper.pong();\n        self.repo.size();\n        internal();\n        free_helper();\n        sub_helper();\n        1\n    }\n\n    pub fn omitted(&self) -> i32 { 1 }\n\n    fn internal(&self) -> i32 { 2 }\n}\n",
+                ),
+                (
+                    "src/app/service/sub.rs",
+                    "pub fn sub_helper() {}\n",
+                ),
+                (
+                    "src/app/repo.rs",
+                    "use super::helper::Helper;\n\npub struct Repo;\n\nimpl Repo {\n    pub fn size(&self, helper: Helper) -> i32 { 0 }\n    pub fn unused(&self) -> i32 { 1 }\n}\n",
+                ),
+                (
+                    "src/app/helper.rs",
+                    "pub struct Helper;\n\nimpl Helper {\n    pub fn pong(&self) {}\n    pub fn quiet(&self) {}\n}\n\npub fn free_helper() {}\n",
+                ),
+            ],
+        );
+        let index = Index::build(&root);
+        let service = index.by_rel["src/app/service.rs"];
+
+        // `crate::`, `super::`, `self::` and `mod x;` all resolve by module
+        // directory, including the app.rs (not app/mod.rs) parent module.
+        assert_eq!(
+            resolve_import(
+                &index,
+                &index.files[service],
+                &import("crate.app.repo.Repo", ImportKind::Type)
+            ),
+            vec![index.by_rel["src/app/repo.rs"]]
+        );
+        // app.rs only re-exports Service, so follow the `pub use` to the file
+        // that declares it.
+        assert_eq!(
+            resolve_import(
+                &index,
+                &index.files[service],
+                &import("crate.app.Service", ImportKind::Type)
+            ),
+            vec![service]
+        );
+        assert_eq!(
+            resolve_import(
+                &index,
+                &index.files[service],
+                &import("super.helper.Helper", ImportKind::Type)
+            ),
+            vec![index.by_rel["src/app/helper.rs"]]
+        );
+        assert_eq!(
+            resolve_import(
+                &index,
+                &index.files[service],
+                &import("self.sub.sub_helper", ImportKind::Type)
+            ),
+            vec![index.by_rel["src/app/service/sub.rs"]]
+        );
+        // Unknown external crates never fall back to the crate root.
+        assert!(resolve_import(
+            &index,
+            &index.files[service],
+            &import("std.fmt.Debug", ImportKind::Type)
+        )
+        .is_empty());
+
+        let order = closure_units(
+            &index,
+            &[member_seed(service, "Service", "used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let members = member_names(&order);
+        for expected in [
+            ("Service", "internal"),
+            ("Helper", "pong"),
+            ("Repo", "size"),
+        ] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(class, member)| class == expected.0 && member == expected.1),
+                "missing {expected:?} in {members:?}"
+            );
+        }
+        for unexpected in [
+            ("Service", "omitted"),
+            ("Repo", "unused"),
+            ("Helper", "quiet"),
+        ] {
+            assert!(
+                !members
+                    .iter()
+                    .any(|(class, member)| class == unexpected.0 && member == unexpected.1),
+                "unexpected {unexpected:?} in {members:?}"
+            );
+        }
+        assert!(order
+            .iter()
+            .any(|(unit, _, _)| unit.symbol() == Some("free_helper")));
+        assert!(order
+            .iter()
+            .any(|(unit, _, _)| unit.symbol() == Some("sub_helper")));
+
+        // A whole-file seed follows the same calls and stubs unkept methods.
+        let order = closure_units(
+            &index,
+            &[Unit::File(service)],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(order.iter().any(|(unit, _, _)| {
+            unit.symbol() == Some("Repo") && unit.member() == Some("size")
+        }));
+        assert!(!order
+            .iter()
+            .any(|(unit, _, _)| unit.member() == Some("unused")));
 
         let _ = std::fs::remove_dir_all(&root);
     }

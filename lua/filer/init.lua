@@ -59,6 +59,7 @@ function M.root()
     "tsconfig.json",
     "jsconfig.json",
     "package.json",
+    "Cargo.toml",
     "gradlew",
     "mvnw",
     dotnet_project,
@@ -316,10 +317,27 @@ function M.here(opts)
     return
   end
   -- `.fe` files are usually tens of thousands of lines: seed the function under
-  -- the cursor. Java seeds the method under the cursor (or the class when the
-  -- cursor is not in a method). Other languages keep whole-file `:FilerHere`.
+  -- the cursor. Java, Kotlin, Scala, Groovy, C#, Rust and TS/JS seed the method
+  -- under the cursor (or the class when the cursor is not in a method). Other
+  -- languages keep whole-file `:FilerHere`.
   local options = opts
-  if options.at_line == nil and (name:match("%.fe$") or name:match("%.java$")) then
+  if
+    options.at_line == nil
+    and (
+      name:match("%.fe$")
+      or name:match("%.java$")
+      or name:match("%.kt$")
+      or name:match("%.kts$")
+      or name:match("%.scala$")
+      or name:match("%.groovy$")
+      or name:match("%.cs$")
+      or name:match("%.rs$")
+      or name:match("%.ts$")
+      or name:match("%.tsx$")
+      or name:match("%.js$")
+      or name:match("%.jsx$")
+    )
+  then
     options = vim.tbl_extend("force", { at_line = vim.api.nvim_win_get_cursor(0)[1] }, opts)
   end
   M.bundle({ name }, options)
