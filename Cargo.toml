@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Bundle Java sources and their import closure into chat-ready markdown"
 license = "MIT"
+repository = "https://github.com/stefhol/filer"
+homepage = "https://github.com/stefhol/filer"
 
 [[bin]]
 name = "filer"
@@ -23,3 +25,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
