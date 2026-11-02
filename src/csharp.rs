@@ -3,7 +3,12 @@
 
 use tree_sitter::{Node, Parser};
 
-use crate::lang::{finish_symbols, symbol_from_node, Import, ImportKind, Source, SymbolKind};
+use crate::lang::{
+    finish_symbols, leading_comment_start, line_of, symbol_from_node, Call, Import, ImportKind,
+    Member, MemberKind, Receiver, Source, Symbol, SymbolKind,
+};
+
+const COMMENTS: &[&str] = &["comment"];
 
 pub struct CSharpParser {
     parser: Parser,
@@ -72,13 +77,10 @@ fn walk_scope(node: Node<'_>, src: &str, prefix: &mut Vec<String>, out: &mut Sou
                 if let Some(name) = child.child_by_field_name("name") {
                     let text = text_of(name, src);
                     if !text.is_empty() {
-                        out.symbols.push(symbol_from_node(
-                            child,
-                            &text,
-                            SymbolKind::Type,
-                            &["comment"],
-                            src,
-                        ));
+                        let mut symbol =
+                            symbol_from_node(child, &text, SymbolKind::Type, COMMENTS, src);
+                        collect_members(child, src, &mut symbol);
+                        out.symbols.push(symbol);
                         out.types.push(text);
                     }
                 }
@@ -101,6 +103,333 @@ fn push_package(prefix: &mut Vec<String>, node: Node<'_>, src: &str) {
             .filter(|segment| !segment.is_empty())
             .map(str::to_string),
     );
+}
+
+/// Methods, constructors, fields and supertypes of one type, with the calls
+/// each member makes and the receiver types the resolver needs.
+fn collect_members(class: Node<'_>, src: &str, symbol: &mut Symbol) {
+    symbol.supertypes = supertypes(class, src);
+
+    // Positional record parameters become init properties.
+    let mut cursor = class.walk();
+    for child in class.named_children(&mut cursor) {
+        if child.kind() == "parameter_list" {
+            for (name, ty) in parameter_names(Some(child), src) {
+                symbol.fields.push((name, ty));
+            }
+        }
+    }
+
+    let Some(body) = class.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        match member.kind() {
+            "method_declaration" => {
+                let Some(name) = member.child_by_field_name("name") else {
+                    continue;
+                };
+                let name = text_of(name, src);
+                if name.is_empty() {
+                    continue;
+                }
+                let start = leading_comment_start(member, COMMENTS);
+                let body_start = member
+                    .child_by_field_name("body")
+                    .map(|body| body.start_byte());
+                symbol.members.push(Member {
+                    name,
+                    kind: MemberKind::Method,
+                    start,
+                    end: member.end_byte(),
+                    line: line_of(src, start),
+                    body_start,
+                    params: parameter_names(member.child_by_field_name("parameters"), src),
+                    locals: local_names(member, src),
+                    calls: calls_in(member, src),
+                });
+            }
+            "constructor_declaration" => {
+                let start = leading_comment_start(member, COMMENTS);
+                let body_start = member
+                    .child_by_field_name("body")
+                    .map(|body| body.start_byte());
+                let name = member
+                    .child_by_field_name("name")
+                    .map(|name| text_of(name, src))
+                    .unwrap_or_else(|| symbol.name.clone());
+                symbol.members.push(Member {
+                    name,
+                    kind: MemberKind::Constructor,
+                    start,
+                    end: member.end_byte(),
+                    line: line_of(src, start),
+                    body_start,
+                    params: parameter_names(member.child_by_field_name("parameters"), src),
+                    locals: Vec::new(),
+                    calls: calls_in(member, src),
+                });
+            }
+            "field_declaration" => {
+                symbol.fields.extend(field_names(member, src));
+            }
+            // Auto-properties and expression-bodied properties type receivers
+            // but are not methods; their bodies are not part of a call path.
+            "property_declaration" => {
+                if let (Some(ty), Some(name)) = (
+                    member
+                        .child_by_field_name("type")
+                        .and_then(|ty| type_name(ty, src)),
+                    member.child_by_field_name("name"),
+                ) {
+                    symbol.fields.push((text_of(name, src), ty));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn field_names(node: Node<'_>, src: &str) -> Vec<(String, String)> {
+    let mut cursor = node.walk();
+    let declaration = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "variable_declaration");
+    let Some(declaration) = declaration else {
+        return Vec::new();
+    };
+    let Some(ty) = declaration
+        .child_by_field_name("type")
+        .and_then(|ty| type_name(ty, src))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut inner = declaration.walk();
+    for declarator in declaration.named_children(&mut inner) {
+        if declarator.kind() == "variable_declarator" {
+            if let Some(name) = declarator.child_by_field_name("name") {
+                out.push((text_of(name, src), ty.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn parameter_names(parameters: Option<Node<'_>>, src: &str) -> Vec<(String, String)> {
+    let Some(parameters) = parameters else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "parameter" {
+            continue;
+        }
+        if let (Some(ty), Some(name)) = (
+            parameter
+                .child_by_field_name("type")
+                .and_then(|ty| type_name(ty, src)),
+            parameter.child_by_field_name("name"),
+        ) {
+            out.push((text_of(name, src), ty));
+        }
+    }
+    out
+}
+
+fn local_names(member: Node<'_>, src: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![member];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "local_declaration_statement" => {
+                let mut cursor = node.walk();
+                let declaration = node
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "variable_declaration");
+                if let Some(declaration) = declaration {
+                    if let Some(ty) = declaration
+                        .child_by_field_name("type")
+                        .and_then(|ty| type_name(ty, src))
+                    {
+                        let mut inner = declaration.walk();
+                        for declarator in declaration.named_children(&mut inner) {
+                            if declarator.kind() == "variable_declarator" {
+                                if let Some(name) = declarator.child_by_field_name("name") {
+                                    out.push((text_of(name, src), ty.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "foreach_statement" => {
+                if let (Some(ty), Some(name)) = (
+                    node.child_by_field_name("type")
+                        .and_then(|ty| type_name(ty, src)),
+                    node.child_by_field_name("left")
+                        .filter(|left| left.kind() == "identifier"),
+                ) {
+                    out.push((text_of(name, src), ty));
+                }
+            }
+            "catch_declaration" => {
+                if let (Some(ty), Some(name)) = (
+                    node.child_by_field_name("type")
+                        .and_then(|ty| type_name(ty, src)),
+                    node.child_by_field_name("name"),
+                ) {
+                    out.push((text_of(name, src), ty));
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+/// Simple name of a type: `Repo`, `List` for `List<Repo>`, `Repo` for
+/// `com.example.Repo`, `Repo?` and `Repo[]`.
+fn type_name(node: Node<'_>, src: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "predefined_type" => {
+            let text = text_of(node, src);
+            (!text.is_empty()).then_some(text)
+        }
+        "generic_name" => {
+            let mut cursor = node.walk();
+            let name = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+                .map(|child| text_of(child, src));
+            name
+        }
+        "qualified_name" | "alias_qualified_name" => node
+            .child_by_field_name("name")
+            .and_then(|name| type_name(name, src)),
+        "nullable_type" | "array_type" | "pointer_type" | "ref_type" => node
+            .child_by_field_name("type")
+            .and_then(|ty| type_name(ty, src)),
+        _ => None,
+    }
+}
+
+fn supertypes(class: Node<'_>, src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = class.walk();
+    for child in class.named_children(&mut cursor) {
+        if child.kind() != "base_list" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for ty in child.named_children(&mut inner) {
+            if let Some(name) = type_name(ty, src) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+fn calls_in(member: Node<'_>, src: &str) -> Vec<Call> {
+    let mut out = Vec::new();
+    let mut stack = vec![member];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "invocation_expression" {
+            if let Some(function) = node.child_by_field_name("function") {
+                if let Some(call) = call_of(function, src) {
+                    out.push(call);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+fn call_of(function: Node<'_>, src: &str) -> Option<Call> {
+    match function.kind() {
+        "identifier" => {
+            let name = text_of(function, src);
+            (!name.is_empty()).then_some(Call {
+                name,
+                receiver: Receiver::Bare,
+            })
+        }
+        "generic_name" => {
+            let mut cursor = function.walk();
+            let name = function
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+                .map(|child| text_of(child, src))?;
+            (!name.is_empty()).then_some(Call {
+                name,
+                receiver: Receiver::Bare,
+            })
+        }
+        "member_access_expression" => {
+            let name = function
+                .child_by_field_name("name")
+                .and_then(|name| simple_name(name, src))?;
+            let receiver = function
+                .child_by_field_name("expression")
+                .map(|expression| receiver_of(expression, src))
+                .unwrap_or(Receiver::Unknown);
+            (!name.is_empty()).then_some(Call { name, receiver })
+        }
+        _ => None,
+    }
+}
+
+/// Name of a member (`Foo` for `Foo` and `Foo<T>`).
+fn simple_name(node: Node<'_>, src: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(text_of(node, src)),
+        "generic_name" => {
+            let mut cursor = node.walk();
+            let name = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+                .map(|child| text_of(child, src));
+            name
+        }
+        _ => None,
+    }
+}
+
+fn receiver_of(node: Node<'_>, src: &str) -> Receiver {
+    match node.kind() {
+        "this" => Receiver::This,
+        "base" => Receiver::Super,
+        "identifier" => {
+            let text = text_of(node, src);
+            match text.as_str() {
+                "this" => Receiver::This,
+                "base" => Receiver::Super,
+                _ => Receiver::Name(text),
+            }
+        }
+        "member_access_expression" => node
+            .child_by_field_name("name")
+            .and_then(|name| simple_name(name, src))
+            .map(Receiver::Name)
+            .unwrap_or(Receiver::Unknown),
+        "object_creation_expression" => node
+            .child_by_field_name("type")
+            .and_then(|ty| type_name(ty, src))
+            .map(Receiver::Name)
+            .unwrap_or(Receiver::Unknown),
+        _ => Receiver::Unknown,
+    }
 }
 
 /// `using` directives can appear at any scope, so scan the whole tree.
@@ -303,6 +632,101 @@ mod tests {
                 source.uses
             );
         }
+    }
+
+    #[test]
+    fn extracts_members_fields_supertypes_and_calls() {
+        let source = parse(
+            r#"
+            namespace app;
+
+            public class Service : Base, Api {
+                private readonly Repo repo;
+                public Helper Helper { get; set; }
+                private int count;
+
+                public Service(Repo repo) { this.repo = repo; }
+
+                public int Used(Local local, Helper h) {
+                    Local temp = new Local();
+                    temp.Ping();
+                    h.Pong();
+                    repo.Find();
+                    Helper.StaticCall();
+                    this.Self();
+                    base.Parent();
+                    return count;
+                }
+
+                public int Omitted() => 1;
+                public void Self() {}
+                public abstract void Nothing();
+            }
+            "#,
+        );
+        let service = &source.symbols[0];
+        assert_eq!(service.name, "Service");
+        assert_eq!(service.supertypes, vec!["Base", "Api"]);
+        for expected in [("repo", "Repo"), ("Helper", "Helper"), ("count", "int")] {
+            assert!(
+                service
+                    .fields
+                    .iter()
+                    .any(|(name, ty)| name == expected.0 && ty == expected.1),
+                "missing {expected:?} in {:?}",
+                service.fields
+            );
+        }
+
+        let used = service
+            .members
+            .iter()
+            .find(|member| member.name == "Used")
+            .expect("Used");
+        assert_eq!(used.kind, MemberKind::Method);
+        assert_eq!(
+            used.params,
+            vec![
+                ("local".to_string(), "Local".to_string()),
+                ("h".to_string(), "Helper".to_string()),
+            ]
+        );
+        assert_eq!(used.locals, vec![("temp".to_string(), "Local".to_string())]);
+        let receivers: Vec<(&str, &Receiver)> = used
+            .calls
+            .iter()
+            .map(|call| (call.name.as_str(), &call.receiver))
+            .collect();
+        for (name, receiver) in [
+            ("Ping", Receiver::Name("temp".to_string())),
+            ("Pong", Receiver::Name("h".to_string())),
+            ("Find", Receiver::Name("repo".to_string())),
+            ("StaticCall", Receiver::Name("Helper".to_string())),
+            ("Self", Receiver::This),
+            ("Parent", Receiver::Super),
+        ] {
+            assert!(
+                receivers
+                    .iter()
+                    .any(|(call_name, call_receiver)| *call_name == name
+                        && **call_receiver == receiver),
+                "missing {name}: {receivers:?}"
+            );
+        }
+        assert!(used.body_start.is_some());
+
+        let omitted = service
+            .members
+            .iter()
+            .find(|member| member.name == "Omitted")
+            .expect("Omitted");
+        assert!(omitted.body_start.is_some());
+        let nothing = service
+            .members
+            .iter()
+            .find(|member| member.name == "Nothing")
+            .expect("Nothing");
+        assert_eq!(nothing.body_start, None);
     }
 
     #[test]

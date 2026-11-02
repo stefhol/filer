@@ -1298,6 +1298,73 @@ mod tests {
     }
 
     #[test]
+    fn csharp_method_and_file_seeds_use_the_call_graph() {
+        let root = index_from_disk(
+            "csharp",
+            &[
+                (
+                    "app/Service.cs",
+                    "namespace app;\n\npublic class Service : Base {\n    private Repo repo;\n\n    public int Used(Helper helper) {\n        helper.Pong();\n        return repo.Size();\n    }\n\n    public int Omitted() { return 1; }\n}\n",
+                ),
+                (
+                    "app/Repo.cs",
+                    "namespace app;\n\npublic class Repo {\n    public int Size() { return 0; }\n    public int Unused() { return 1; }\n}\n",
+                ),
+                (
+                    "app/Helper.cs",
+                    "namespace app;\n\npublic class Helper {\n    public void Pong() {}\n    public void Quiet() {}\n}\n",
+                ),
+                (
+                    "app/Base.cs",
+                    "namespace app;\n\npublic class Base {\n    public void Parent() {}\n}\n",
+                ),
+            ],
+        );
+        let index = Index::build(&root);
+        let service = index.by_rel["app/Service.cs"];
+
+        let order = closure_units(
+            &index,
+            &[member_seed(service, "Service", "Used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let members = member_names(&order);
+        for expected in [("Helper", "Pong"), ("Repo", "Size")] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(class, member)| class == expected.0 && member == expected.1),
+                "missing {expected:?} in {members:?}"
+            );
+        }
+        assert!(!members
+            .iter()
+            .any(|(class, member)| class == "Repo" && member == "Unused"));
+
+        let order = closure_units(
+            &index,
+            &[Unit::File(service)],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(order.iter().any(|(unit, _, _)| {
+            unit.symbol() == Some("Repo") && unit.member() == Some("Size")
+        }));
+        assert!(!order
+            .iter()
+            .any(|(unit, _, _)| unit.member() == Some("Unused")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn groovy_method_and_file_seeds_use_the_call_graph() {
         let root = index_from_disk(
             "groovy",
