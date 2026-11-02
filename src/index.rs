@@ -27,7 +27,7 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -38,6 +38,9 @@ pub struct FileEntry {
     /// Top-level type declarations (classes, interfaces, enums, records).
     pub types: Vec<String>,
     pub imports: Vec<Import>,
+    /// Type names referenced in the file (import-free same-package references
+    /// included), sorted and deduplicated.
+    pub uses: Vec<String>,
 }
 
 impl FileEntry {
@@ -73,6 +76,8 @@ pub struct Index {
     pub root: PathBuf,
     pub files: Vec<FileEntry>,
     pub by_fqn: HashMap<String, usize>,
+    /// Simple type name -> files declaring it.
+    pub by_simple: HashMap<String, Vec<usize>>,
     pub by_package: HashMap<String, Vec<usize>>,
     pub by_rel: HashMap<String, usize>,
     /// Number of files re-parsed on this run (for `filer index` stats).
@@ -115,6 +120,13 @@ impl Index {
             }
             for fqn in file.fqns() {
                 index.by_fqn.entry(fqn).or_insert(position);
+            }
+            for ty in &file.types {
+                index
+                    .by_simple
+                    .entry(ty.clone())
+                    .or_default()
+                    .push(position);
             }
         }
 
@@ -220,6 +232,7 @@ fn load_one(
                     package: cached.package.clone(),
                     types: cached.types.clone(),
                     imports: cached.imports.clone(),
+                    uses: cached.uses.clone(),
                 },
             ));
         }
@@ -236,6 +249,7 @@ fn load_one(
             package: parsed.package,
             types: parsed.types,
             imports: parsed.imports,
+            uses: parsed.uses,
         },
     ))
 }
@@ -272,6 +286,8 @@ struct CacheEntry {
     package: Option<String>,
     types: Vec<String>,
     imports: Vec<Import>,
+    #[serde(default)]
+    uses: Vec<String>,
 }
 
 impl Cache {
@@ -312,6 +328,7 @@ impl Cache {
                     package: file.package.clone(),
                     types: file.types.clone(),
                     imports: file.imports.clone(),
+                    uses: file.uses.clone(),
                 })
             })
             .collect();

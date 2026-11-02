@@ -27,7 +27,10 @@ whole picture instead of a fragment.
 
 - Indexes every `.java` file under the project root (tree-sitter based, no LSP, no classpath).
 - Resolves `import a.b.C;`, `import a.b.C.member;` (static) and `import a.b.*;` against the
-  files that actually exist in your repo, then walks the import graph to a configurable depth.
+  files that actually exist in your repo.
+- Follows type *usages* too, so a class that references a sibling in its own package — which
+  Java needs no import for, e.g. `indexOps(DemoDocument.class)` — still pulls that file in.
+- Walks the resulting graph to a configurable depth.
 - Renders the selection as markdown: header, file list with import depths, then one fenced
   block per file. Fences grow automatically if a file already contains backticks.
 - Caches the index in `~/.cache/filer/`, keyed by root path and invalidated per file by
@@ -122,7 +125,11 @@ filer --root ~/code/demo index                         # cache stats
 4. For an import, try the full name, then trim trailing segments one at a time
    (`a.b.C.member` → `a.b.C`), which also covers nested types like `a.b.C.Inner`.
    Wildcard imports expand to the whole package. Anything unresolved is JDK/third-party.
-5. Breadth-first walk from the seeds up to `--depth`, preserving discovery order so the
+5. For every `type_identifier` in the file (class literals, field types, generics, casts,
+   `new`) look the name up in the index. Names that are explicitly imported are left to
+   step 4; a same-package match wins; otherwise the name is only used when it is unique in
+   the repo. Ambiguous names are dropped rather than guessed.
+6. Breadth-first walk from the seeds up to `--depth`, preserving discovery order so the
    bundle reads top-down from your entry point.
 
 ## Adding another language
@@ -145,5 +152,5 @@ plugin/filer.lua user commands
 examples/lazyvim.lua  copy-paste LazyVim spec with the defaults above
 ```
 
-`cargo test` covers parsing, static/wildcard imports, closure depth, same-package expansion
-and fence selection.
+`cargo test` covers parsing, static/wildcard imports, name inference without imports,
+closure depth, same-package expansion and fence selection.

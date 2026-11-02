@@ -1,8 +1,8 @@
 //! Import resolution and transitive closure.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::index::Index;
+use crate::index::{FileEntry, Index};
 use crate::java::Import;
 #[cfg(test)]
 use crate::java::ImportKind;
@@ -71,7 +71,44 @@ pub fn resolve_import(index: &Index, import: &Import) -> Vec<usize> {
     Vec::new()
 }
 
-/// Breadth-first closure over imports. Returns `(file index, depth)` pairs in
+/// Resolves type names *used* in the file. Java needs no import for types in
+/// the same package, so a class that only references `DemoDocument.class`
+/// still depends on `DemoDocument.java`.
+///
+/// Explicitly imported names are skipped (the import resolution handles those),
+/// and ambiguous simple names are left out rather than guessed wrong.
+pub fn resolve_uses(index: &Index, file: &FileEntry) -> Vec<usize> {
+    let imported: HashSet<&str> = file
+        .imports
+        .iter()
+        .filter(|import| !import.is_wildcard())
+        .filter_map(|import| import.path.rsplit('.').next())
+        .collect();
+
+    let mut resolved = Vec::new();
+    for name in &file.uses {
+        if imported.contains(name.as_str()) {
+            continue;
+        }
+        let Some(candidates) = index.by_simple.get(name) else {
+            continue;
+        };
+        let same_package: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&position| index.files[position].package == file.package)
+            .collect();
+        match same_package.len() {
+            1 => resolved.push(same_package[0]),
+            0 if candidates.len() == 1 => resolved.push(candidates[0]),
+            _ => {}
+        }
+    }
+    resolved
+}
+
+/// Breadth-first closure over imports and type usages. Returns
+/// `(file index, depth)` pairs in
 /// discovery order, seeds first (depth 0), duplicates removed.
 pub fn closure(index: &Index, seeds: &[usize], options: ResolveOptions) -> Vec<(usize, u32)> {
     let mut depth_of: HashMap<usize, u32> = HashMap::new();
@@ -98,6 +135,7 @@ pub fn closure(index: &Index, seeds: &[usize], options: ResolveOptions) -> Vec<(
             .imports
             .iter()
             .flat_map(|import| resolve_import(index, import))
+            .chain(resolve_uses(index, file))
             .collect();
 
         if options.same_package {
@@ -148,6 +186,7 @@ mod tests {
             package: Some(package.to_string()),
             types: types.iter().map(|t| t.to_string()).collect(),
             imports,
+            uses: Vec::new(),
         }
     }
 
@@ -206,6 +245,13 @@ mod tests {
             for fqn in file.fqns() {
                 index.by_fqn.entry(fqn).or_insert(position);
             }
+            for ty in &file.types {
+                index
+                    .by_simple
+                    .entry(ty.clone())
+                    .or_default()
+                    .push(position);
+            }
         }
         index
     }
@@ -233,6 +279,44 @@ mod tests {
                 ("src/main/java/app/model/User.java", 1),
             ]
         );
+    }
+
+    #[test]
+    fn resolves_same_package_references_without_imports() {
+        let mut index = fixture();
+        // RunService references Unused (same package) with no import at all.
+        index.files.push(FileEntry {
+            rel: "src/main/java/app/RunService.java".to_string(),
+            abs: PathBuf::from("/repo/src/main/java/app/RunService.java"),
+            package: Some("app".to_string()),
+            types: vec!["RunService".to_string()],
+            imports: vec![],
+            uses: vec!["Unused".to_string(), "String".to_string()],
+        });
+        let position = index.files.len() - 1;
+
+        let resolved = resolve_uses(&index, &index.files[position]);
+        assert_eq!(
+            resolved,
+            vec![3],
+            "Unused is found by name, String is not in the repo"
+        );
+        assert_eq!(index.files[3].rel, "src/main/java/app/model/Unused.java");
+    }
+
+    #[test]
+    fn explicit_imports_win_over_name_guessing() {
+        let mut index = fixture();
+        // `Service` refers to its own type and to two explicitly imported ones.
+        index.files[0].uses = vec![
+            "Service".to_string(),
+            "User".to_string(),
+            "UserRepository".to_string(),
+        ];
+        let resolved = resolve_uses(&index, &index.files[0]);
+        // Imported names are left to resolve_import; only the self reference is
+        // inferred here (and deduplicated by the closure).
+        assert_eq!(resolved, vec![0]);
     }
 
     #[test]

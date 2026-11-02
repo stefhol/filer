@@ -32,6 +32,10 @@ pub struct JavaSource {
     pub package: Option<String>,
     pub types: Vec<String>,
     pub imports: Vec<Import>,
+    /// Type names referenced anywhere in the file (`DemoDocument.class`,
+    /// generic arguments, field types, ...). Catches same-package references,
+    /// which Java needs no import for.
+    pub uses: Vec<String>,
 }
 
 pub struct JavaParser {
@@ -82,6 +86,11 @@ impl JavaParser {
                 _ => {}
             }
         }
+        let mut uses = Vec::new();
+        collect_type_uses(root, src, &mut uses);
+        uses.sort();
+        uses.dedup();
+        out.uses = uses;
         Some(out)
     }
 }
@@ -133,6 +142,24 @@ fn parse_import(node: Node<'_>, src: &str) -> Option<Import> {
         ImportKind::Type
     };
     Some(Import { path, kind })
+}
+
+/// Walks the whole tree collecting every `type_identifier` (class names in
+/// type positions, class literals, generics, casts, `new` expressions).
+fn collect_type_uses(root: Node<'_>, src: &str, out: &mut Vec<String>) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_identifier" {
+            let text = text_of(node, src);
+            if !text.is_empty() {
+                out.push(text);
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
 }
 
 fn text_of<'a>(node: Node<'a>, src: &str) -> String {
