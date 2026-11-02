@@ -56,7 +56,7 @@ Requires a C compiler for the tree-sitter grammar (`gcc`/`clang`).
 ## Install
 
 Prebuilt binaries live on the [releases page](https://github.com/stefhol/filer/releases).
-Linux and macOS:
+Linux (x86_64, aarch64):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -70,7 +70,7 @@ irm https://github.com/stefhol/filer/releases/latest/download/filer-installer.ps
 ```
 
 Targets built per release: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-`x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`.
+`x86_64-pc-windows-msvc`. macOS is not built yet — use `cargo install --path .` there.
 
 ## Releases
 
