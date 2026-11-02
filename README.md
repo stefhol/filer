@@ -17,8 +17,9 @@ whole picture instead of a fragment.
 ```
 ┌─ Telescope: filer: symbols (demo) ───────────────────┐
 │ > user                                               │
-│   com.example.repo.UserRepository        <Tab>       │
-│   com.example.model.User                 <Tab>       │
+│   [file]   com/example/model/User.java   <Tab>       │
+│   [class]  com.example.model.User        <Tab>       │
+│   [method] com.example.model.User.name   <Tab>       │
 └──────────────────────────────────────────────────────┘
                         ↓  <CR>
 ┌─ filer://bundle-1 ───────────────────────────────────┐
@@ -54,6 +55,8 @@ whole picture instead of a fragment.
   `.fe` functions are the primary use case: they call each other across a project-wide
   namespace, exactly like the language's IntelliJ plugin resolves them. Java methods add a
   second one: class shell for context, call-path bodies for content.
+- Every entry has an explicit **scope** — `file`, `symbol` or `methods` — so the picker,
+  the state file and the renderer agree on what was included and why.
 - Walks the resulting graph to a configurable depth.
 - Remembers what is already bundled in a TOML state file, marks those entries with `✓` in
   the picker, and grows the bundle instead of replacing it. Switching git branch kills the
@@ -176,8 +179,8 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 
 | Command | Effect |
 | --- | --- |
-| `:FilerSearch` | Telescope picker of symbols: `.fe` functions, Java classes **and methods**, types elsewhere. `<Tab>` multi-selects, `<CR>` bundles. |
-| `:FilerHere` | Bundles the current buffer with its imports. In a `.fe` file the function under the cursor is the seed; in Java, the method under the cursor (or its class). |
+| `:FilerSearch` | Telescope picker of bundle scopes: `[file]` for every file, `[class]`/`[method]` for Java, `[type]`/`[function]` elsewhere. `<Tab>` multi-selects, `<CR>` bundles. |
+| `:FilerHere` | Bundles the current buffer with its closure. In a `.fe` file the function under the cursor is the seed; in Java, the method under the cursor (or its class); elsewhere the whole file. |
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute) or excerpts (`path::Symbol`). |
 | `:FilerShow [branch]` | Re-renders the saved bundle (current file contents) without re-resolving. |
 | `:FilerReset` | Forgets this branch's bundle; the next bundle starts empty. |
@@ -191,62 +194,68 @@ Root detection uses `vim.fs.root` with markers `.git`, `pom.xml`, `build.gradle(
 `settings.gradle(.kts)`, `build.sbt`, `gradlew`, `mvnw`, `tsconfig.json`, `jsconfig.json`,
 `package.json`, `*.csproj`, `*.sln`. Override with `opts.root` (string or function).
 
-## Excerpts, not whole files
+## Bundle scopes: file, class, method
 
-Every language now records its top-level declarations as *symbols* with byte spans
-(`src/fe.rs` for `.fe`, plus the tree-sitter parsers). A bundle entry is either a whole file
-or one symbol of it:
+Every picker row and every bundle entry carries an explicit **scope**. The tiers are shared;
+each language exposes only the ones it has.
 
-```sh
-filer --root ~/ac bundle --depth 2 main.fe::riskValue     # one function + what it calls
-filer --root ~/ac bundle --at-line 120 main.fe            # the function at line 120
-filer --root ~/ac bundle main.fe                          # still the whole file
-```
+| Scope | Languages | Rendered | Closure |
+| --- | --- | --- | --- |
+| `file` | all but `.fe` | the whole file | Java: the calls of every method in the file; others: the import/type closure |
+| `symbol` | Java, Scala, Kotlin, Groovy, C#, TS/JS, `.fe` | one top-level declaration plus the file header | Java class: the calls of its methods; other symbols: the symbol closure |
+| `methods` | Java | class shell plus the listed methods; the rest as signature stubs | the seed method(s) and their calls |
 
-What that means in practice:
-
-- `.fe` has no imports and no packages. Functions and top-level `global` declarations live
-  in one project-wide namespace, so a call `clamp(...)` pulls in the file that defines
-  `clamp`; `local` names, parameters, loop variables and built-ins (`len`, `dict_get`, `ts`,
-  …) are ignored. Ambiguous names are dropped rather than guessed.
-- An FE function seed pulls in the functions it calls and the top-level declarations it
-  references, to `--depth`. Top-level declarations are selectable excerpts too.
-- Excerpts are rendered as `### path :: name (line N)` and contain the declaration plus the
-  file header (package/imports/`using`s, one time) so they stand alone. Braces left open by
-  a block namespace are closed at the end.
-- Other languages keep whole-file bundling when you pass a plain path. Java/Scala/Kotlin/
-  C#/Groovy/TS/JS types are selectable as excerpts (`Application.java::Application`), and
-  `:FilerSearch` lists one entry per symbol instead of one per file.
-- Vue symbols are not sliced out (script offsets are relative to the extracted `<script>`
-  block), so `.vue` stays whole-file.
-
-The seed under the cursor is what `:FilerHere` uses in a `.fe` buffer: put the cursor in a
-function, the bundle contains that function and its calls.
-
-### Java methods: seed file complete, dependencies pruned
-
-A Java *class* row in the picker keeps its old meaning: that class as an excerpt. A *method*
-row (`app.Service.usedEverywhere`), `filer bundle 'app/Service.java::Service.usedEverywhere'`
-and `:FilerHere` inside a method all seed a call graph:
-
-- the **file you seeded is rendered complete** (all classes and methods in it),
-- every file at depth 1+ is rendered as a class shell — package, imports, fields,
-  constructors, annotations — with only the methods on the call path,
-- their other methods become signature stubs:
-  `int unrelatedHelper();   // body omitted`
+Picker rows map 1:1 to scopes, and the CLI accepts the same targets:
 
 ```
-### `app/Service.java`                    (depth 0, complete)
+[file]   app/Service.java              whole file
+[class]  app.Service                   class excerpt, all members
+[method] app.Service.used              class shell + call path
 
-### `app/Repo.java` :: `Repo` (line 3)    (depth 1)
-package app;
+filer --root ~/code/demo bundle app/Service.java                       # file
+filer --root ~/code/demo bundle 'app/Service.java::Service'            # class
+filer --root ~/code/demo bundle 'app/Service.java::Service.used'       # method
+filer --root ~/code/demo bundle --at-line 120 app/Service.java         # scope of line 120
+```
+
+`--at-line` picks the scope of the line: a method inside a method, the class on a field,
+constructor or header, and the whole file on a package/import/blank line before the class.
+
+`.fe` is function-granular and deliberately has **no `[file]` row**: one `.fe` file can hold
+thousands of functions, so a whole-file row would drown the picker (the CLI still accepts a
+file path). Vue files and files without parsed symbols are whole-file. Everything else gains
+a `[file]` row, so the whole file is always selectable explicitly.
+
+### Java: class shell + call path
+
+A method seed (`app.Service.used`, `filer bundle 'app/Service.java::Service.used'`, or
+`:FilerHere` inside a method) renders:
+
+- the seeded class as a **shell** — package, imports, fields, constructors, annotations —
+  with only the methods on the call path in full,
+- every other method of that class as a signature stub: `int unused();   // body omitted`,
+- the classes it calls at depth 1+ the same way.
+
+It does **not** force the whole file. The `[file]` row / a plain path does that.
+
+The file list names the unit and its kept methods; each block carries the line of the class:
+
+```
+- `app/Service.java` :: `Service` [used]
+- `app/Repo.java` :: `Repo` [size] (depth 1, call)
+
+### `app/Service.java` :: `Service` (line 5)
+
+public class Service {
+    int used() { return repo.size(); }
+    int internal();   // body omitted
+}
+
+### `app/Repo.java` :: `Repo` (line 3)
 
 public class Repo {
     public int size() { return 0; }
-
     public int unused();   // body omitted
-
-    public static void staticCall() { }
 }
 ```
 
@@ -264,70 +273,93 @@ kept rather than stubbing a method that might be needed. Type-only dependencies 
 type `Repo` that is never called) are not bundled; the import line and the field signature
 still give the reader the name. Nested classes are rendered inside their enclosing class.
 
-`--depth` counts method hops. In a `.java` buffer `:FilerHere` seeds the method under the
-cursor (or its class when the cursor is on a field, constructor or blank line); the picker and
-`filer bundle 'path/Service.java::Service.usedEverywhere'` do the same explicitly. A bare
-`filer bundle path/Service.java` still uses the file-level import closure, not the call graph.
+`--depth` counts method hops for method scopes, and unit hops for file/class seeds. A
+`[file]` or `[class]` seed uses the **same call graph** for Java, not the import/type closure:
+you get the files that are actually called, nothing else. `--with-same-package` is a
+whole-class expansion and is not applied to that minimal path. A Java file without parsed
+symbols (and every other language) keeps the import/type closure.
+
+### Other languages
+
+- `.fe` has no imports and no packages. Functions and top-level `global` declarations live in
+  one project-wide namespace, so a call `clamp(...)` pulls in the file that defines `clamp`;
+  `local` names, parameters, loop variables and built-ins (`len`, `dict_get`, `ts`, …) are
+  ignored. Ambiguous names are dropped rather than guessed. Top-level declarations are
+  selectable excerpts too.
+- An FE function seed pulls in the functions it calls and the top-level declarations it
+  references, to `--depth`.
+- Scala, Kotlin, Groovy, C#, TS/JS and Vue keep today's behaviour: top-level type excerpts
+  with the file-level import closure. They gain the explicit `[file]` row; there are no
+  `[method]` scopes for them in this cut.
+
+Excerpts are rendered as `### path :: name (line N)` and contain the declaration plus the
+file header (package/imports/`using`s, one time) so they stand alone. Braces left open by
+a block namespace are closed at the end. Vue symbols are not sliced out (script offsets are
+relative to the extracted `<script>` block), so `.vue` stays whole-file.
+
+The seed under the cursor is what `:FilerHere` uses: in a `.fe` buffer the function under the
+cursor, in Java the method or class, elsewhere the whole file.
 
 ## Bundle state
 
 With `state = true` (the default) the binary writes `.filer/bundle.toml` next to the project,
-keeping **one bundle per git branch** (`version = 2`):
+keeping **one bundle per git branch** (`version = 3`). Every entry states its scope:
 
 ```toml
 # filer bundle state — `:FilerReset` clears the current branch, `:FilerResetAll` everything
 root = "/home/me/code/demo"
-version = 2
+version = 3
 
 [[bundles]]
 name = "feature/checkout"
 created = 1793618434
 depth = 2
 
-[[bundles.files]]
+# whole file
+[[bundles.entries]]
 path = "demo/src/main/java/com/example/demo/RunService.java"
+scope = "file"
 depth = 0
 reason = "seed"
 
-[[bundles.files]]
-path = "demo/src/main/java/com/example/demo/DemoDocument.java"
+# class excerpt
+[[bundles.entries]]
+path = "demo/src/main/java/com/example/demo/DemoApplication.java"
+scope = "symbol"
+symbol = "DemoApplication"
 depth = 1
 reason = "same-package"
 
-[[bundles]]
-name = "main"
-created = 1793617000
-depth = 2
-
-[[bundles.files]]
-path = "demo/src/main/java/com/example/demo/DemoApplication.java"
-depth = 0
-reason = "seed"
-```
-
-An excerpt entry also carries the declaration name; whole-file entries omit it. A pruned
-Java class adds `member` for each kept method:
-
-```toml
-[[bundles.files]]
-path = "ac/main.fe"
-symbol = "riskValue"
-depth = 0
-reason = "seed"
-
-[[bundles.files]]
-path = "src/main/java/app/Service.java"
+# class shell + kept methods
+[[bundles.entries]]
+path = "demo/src/main/java/com/example/demo/Service.java"
+scope = "methods"
 symbol = "Service"
-member = "usedEverywhere"
+methods = ["used", "internal"]
 depth = 0
 reason = "seed"
 ```
+
+Rules:
+
+- `file`: `path` only.
+- `symbol`: `path` + `symbol`.
+- `methods`: `path` + `symbol` + a non-empty `methods` list. One entry per class, even when
+  methods arrive at different depths; `depth` is the minimum and `reason` is `seed` if any
+  method is a seed, otherwise the reason of the minimum-depth method.
+
+Version 2 files (`[[bundles.files]]`, implicit scope, one entry per `member`) and version 1
+files (one bundle at the top level) are migrated on load: `path` → `file`,
+`path` + `symbol` → `symbol`, and `member` entries are grouped per class into one `methods`
+entry with the union of methods. A v2 method **seed** was stored as a whole-file entry
+(that was the old stop-gap), so it cannot be recovered and migrates to `file`; the new v3
+state records `methods` from the start.
 
 What that buys you:
 
 - The picker shows the **current branch's** bundled files as
-  `✓ com.example.demo.DemoDocument  (depth 1, same-package)`. Selecting one is a no-op
-  instead of a duplicate.
+  `✓ [class] com.example.demo.DemoDocument  (depth 1, same-package)`. Selecting one is a
+  no-op instead of a duplicate.
 - The next bundle is a **superset**: this branch's previous files are kept, new picks are
   added, depths are the minimum over both runs.
 - Switching branches keeps everything: each branch picks up its own bundle where it left
@@ -382,8 +414,9 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C
 
 `bundle` flags: `--depth N` (0 = only the given units), `--with-same-package`,
 `--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`, `--at-line N`.
-Default depth is 2. Add `::Symbol` to a file to bundle one declaration:
-`filer --root ~/ac bundle 'main.fe::riskValue'`.
+Default depth is 2. Add `::Symbol` for one declaration and `::Class.method` for a Java
+method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
+`filer --root ~/code/demo bundle 'app/Service.java::Service.used'`.
 `--with-config` adds, when they exist: `pom.xml`, the Gradle files, `build.sbt` /
 `project/*.sbt`, `tsconfig.json` / `jsconfig.json` / `package.json`, `Directory.Build.props`
 and root-level `*.csproj` / `*.sln`.

@@ -1,7 +1,7 @@
 # Plan: explicit bundle scopes (file / class / method)
 
-Status: **draft, not implemented**. Supersedes the implicit `path::symbol` + "method seed forces
-the whole file" behaviour currently in `main.rs`/`state.rs`.
+Status: **implemented** (see `a9b81a1`). Supersedes the implicit `path::symbol` + "method seed
+forces the whole file" behaviour that was in `main.rs`/`state.rs` before v3.
 
 ## Problem
 

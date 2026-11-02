@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::index::{FileEntry, Index};
-use crate::lang::{Family, Import, ImportKind, Member, MemberKind, Receiver, Symbol};
+use crate::lang::{Family, Granularity, Import, ImportKind, Member, MemberKind, Receiver, Symbol};
 
 /// Extensions tried when resolving a TypeScript/JavaScript module specifier,
 /// in preference order (TS sources win over compiled JS next to them).
@@ -78,6 +78,10 @@ pub struct ResolveOptions {
     pub depth: u32,
     /// Also pull in every file sharing a package with an included file.
     pub same_package: bool,
+    /// Use the call graph for whole-file and class seeds of member-capable
+    /// languages (Java), instead of the import/type closure. `filer bundle`
+    /// sets this; `filer deps` keeps the file-level view.
+    pub minimal: bool,
 }
 
 impl Default for ResolveOptions {
@@ -85,6 +89,7 @@ impl Default for ResolveOptions {
         Self {
             depth: 2,
             same_package: false,
+            minimal: false,
         }
     }
 }
@@ -865,6 +870,76 @@ fn resolve_class(
     (by_file.len() == 1).then(|| (by_file[0].0, by_file[0].1))
 }
 
+/// Neighbours of one unit, honouring [`ResolveOptions::minimal`]: Java file and
+/// class seeds are call-path driven instead of import driven.
+fn unit_neighbours(index: &Index, unit: &Unit, options: ResolveOptions) -> Vec<(Unit, Reason)> {
+    match unit {
+        Unit::File(position) if options.minimal => call_graph_seed(index, *position)
+            .unwrap_or_else(|| file_neighbours(index, *position, options)),
+        Unit::Symbol { file, symbol } if options.minimal => call_graph_class(index, *file, symbol)
+            .unwrap_or_else(|| symbol_neighbours(index, *file, symbol, options)),
+        Unit::File(position) => file_neighbours(index, *position, options),
+        Unit::Symbol { file, symbol } => symbol_neighbours(index, *file, symbol, options),
+        Unit::Member {
+            file,
+            class,
+            member,
+        } => member_neighbours(index, *file, class, member, options),
+    }
+}
+
+/// Calls of every method in every class of a file, for a whole-file seed.
+/// `None` keeps the old import/type closure for files that are not
+/// member-capable or have no symbols.
+fn call_graph_seed(index: &Index, position: usize) -> Option<Vec<(Unit, Reason)>> {
+    let file = index.files.get(position)?;
+    if file.language()?.granularity() != Granularity::Member || file.symbols.is_empty() {
+        return None;
+    }
+    let family = family_of(file);
+    let mut out = Vec::new();
+    for class in &file.symbols {
+        out.extend(class_calls(index, position, file, class, family));
+    }
+    Some(out)
+}
+
+/// Calls of every method of one class, for a class seed (`path::Class`).
+fn call_graph_class(
+    index: &Index,
+    position: usize,
+    class_name: &str,
+) -> Option<Vec<(Unit, Reason)>> {
+    let file = index.files.get(position)?;
+    if file.language()?.granularity() != Granularity::Member {
+        return None;
+    }
+    let class = file.symbol(class_name)?;
+    Some(class_calls(index, position, file, class, family_of(file)))
+}
+
+fn class_calls(
+    index: &Index,
+    position: usize,
+    file: &FileEntry,
+    class: &Symbol,
+    family: Option<Family>,
+) -> Vec<(Unit, Reason)> {
+    let mut out = Vec::new();
+    for member in class
+        .members
+        .iter()
+        .filter(|member| member.kind == MemberKind::Method)
+    {
+        for call in &member.calls {
+            for unit in resolve_call(index, position, file, class, member, call, family) {
+                out.push((unit, Reason::Call));
+            }
+        }
+    }
+    out
+}
+
 /// Breadth-first closure over units, keeping track of why each one was pulled
 /// in. Returns units in discovery order, seeds first (depth 0), duplicates
 /// removed. A whole-file unit supersedes symbol units of the same file.
@@ -889,15 +964,7 @@ pub fn closure_units(
         if current_depth >= options.depth {
             continue;
         }
-        let neighbours = match &current {
-            Unit::File(position) => file_neighbours(index, *position, options),
-            Unit::Symbol { file, symbol } => symbol_neighbours(index, *file, symbol, options),
-            Unit::Member {
-                file,
-                class,
-                member,
-            } => member_neighbours(index, *file, class, member, options),
-        };
+        let neighbours = unit_neighbours(index, &current, options);
 
         for (neighbour, reason) in neighbours {
             if depth_of.contains_key(&neighbour) {
@@ -1225,6 +1292,7 @@ mod tests {
             ResolveOptions {
                 depth: 1,
                 same_package: false,
+                minimal: false,
             },
         );
         let members: Vec<(String, String)> = order
@@ -1277,9 +1345,92 @@ mod tests {
             ResolveOptions {
                 depth: 0,
                 same_package: false,
+                minimal: false,
             },
         );
         assert_eq!(order.len(), 1);
+    }
+
+    fn member_names(order: &[(Unit, u32, Reason)]) -> Vec<(String, String)> {
+        order
+            .iter()
+            .filter_map(|(unit, _, _)| {
+                Some((unit.symbol()?.to_string(), unit.member()?.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn java_file_seed_uses_the_call_graph() {
+        let index = java_fixture();
+        let order = closure_units(
+            &index,
+            &[Unit::File(0)],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let members = member_names(&order);
+        for expected in [
+            ("Helper", "pong"),
+            ("Local", "ping"),
+            ("Repo", "size"),
+            ("Repo", "staticCall"),
+            ("Base", "inherited"),
+            ("Base", "parent"),
+        ] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(class, member)| class == expected.0 && member == expected.1),
+                "missing {expected:?} in {members:?}"
+            );
+        }
+        // Not the import/type closure: untouched files stay out entirely.
+        assert!(!order
+            .iter()
+            .any(|(unit, _, _)| matches!(unit, Unit::File(_)) && unit.file() != 0));
+        assert!(!members
+            .iter()
+            .any(|(class, member)| class == "Repo" && member == "unused"));
+        assert_eq!(order[0], (Unit::File(0), 0, Reason::Seed));
+    }
+
+    #[test]
+    fn java_class_seed_uses_the_call_graph() {
+        let index = java_fixture();
+        let order = closure_units(
+            &index,
+            &[Unit::Symbol {
+                file: 0,
+                symbol: "Service".to_string(),
+            }],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let members = member_names(&order);
+        assert!(members
+            .iter()
+            .any(|(class, member)| class == "Repo" && member == "size"));
+        assert!(!members
+            .iter()
+            .any(|(class, member)| class == "Repo" && member == "unused"));
+        assert_eq!(
+            order[0],
+            (
+                Unit::Symbol {
+                    file: 0,
+                    symbol: "Service".to_string(),
+                },
+                0,
+                Reason::Seed,
+            )
+        );
     }
 
     #[test]
@@ -1295,6 +1446,7 @@ mod tests {
             ResolveOptions {
                 depth: 1,
                 same_package: false,
+                minimal: false,
             },
         );
         assert!(order.iter().any(|(unit, _, _)| *unit
@@ -1316,6 +1468,7 @@ mod tests {
             ResolveOptions {
                 depth: 1,
                 same_package: false,
+                minimal: false,
             },
         );
         let units: Vec<(usize, &str, u32, Reason)> = order
@@ -1347,6 +1500,7 @@ mod tests {
             ResolveOptions {
                 depth: 1,
                 same_package: false,
+                minimal: false,
             },
         );
         assert!(!order
@@ -1369,6 +1523,7 @@ mod tests {
             ResolveOptions {
                 depth: 1,
                 same_package: false,
+                minimal: false,
             },
         );
         assert_eq!(
@@ -1424,6 +1579,7 @@ mod tests {
             ResolveOptions {
                 depth: 2,
                 same_package: false,
+                minimal: false,
             },
         );
         let paths: Vec<(&str, u32)> = order
@@ -1489,6 +1645,7 @@ mod tests {
             ResolveOptions {
                 depth: 0,
                 same_package: false,
+                minimal: false,
             },
         );
         assert_eq!(order.len(), 1);
@@ -1550,6 +1707,7 @@ mod tests {
             ResolveOptions {
                 depth: 1,
                 same_package: true,
+                minimal: false,
             },
         );
         let rels: Vec<&str> = order

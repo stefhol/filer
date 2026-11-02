@@ -98,16 +98,6 @@ impl FileEntry {
                 .map(|member| (symbol, member))
         })
     }
-
-    /// Name used as a single-line label in pickers.
-    pub fn label(&self) -> String {
-        let fqn = self.primary_fqn();
-        if fqn.is_empty() {
-            self.rel.clone()
-        } else {
-            fqn
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -495,6 +485,7 @@ mod tests {
             ResolveOptions {
                 depth: 1,
                 same_package: false,
+                minimal: false,
             },
         );
         assert!(

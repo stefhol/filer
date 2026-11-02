@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::index::Index;
 use crate::lang::{Language, MemberKind};
 use crate::resolve::Reason;
+use crate::state::Selection;
 
 pub struct BundleOptions {
     pub title: Option<String>,
@@ -27,26 +28,86 @@ impl Default for BundleOptions {
     }
 }
 
+/// One unit of a bundle: a whole file, one symbol excerpt, or a class shell
+/// with only some methods kept. `methods` is non-empty exactly when the scope
+/// is [`Selection::Methods`].
 pub struct BundleFile {
     pub rel: String,
     pub abs: PathBuf,
-    pub depth: u32,
-    /// Why the file is in the bundle; shown in the file list.
-    pub reason: Reason,
-    /// Render only this top-level declaration instead of the whole file.
-    /// `None` keeps the file-level behaviour.
+    pub scope: Selection,
+    /// Top-level declaration for `symbol`/`methods` scopes.
     pub symbol: Option<String>,
-    /// Keep only this member (method) of `symbol`; the rest of the class is
-    /// rendered as signature stubs.
-    pub member: Option<String>,
+    /// Kept methods for `methods` scope; the rest of the class is rendered as
+    /// signature stubs.
+    pub methods: BTreeSet<String>,
+    pub depth: u32,
+    /// Why the unit is in the bundle; shown in the file list.
+    pub reason: Reason,
 }
 
 impl BundleFile {
+    pub fn whole(rel: String, abs: PathBuf, depth: u32, reason: Reason) -> Self {
+        Self {
+            rel,
+            abs,
+            scope: Selection::File,
+            symbol: None,
+            methods: BTreeSet::new(),
+            depth,
+            reason,
+        }
+    }
+
+    pub fn excerpt(rel: String, abs: PathBuf, depth: u32, reason: Reason, symbol: String) -> Self {
+        Self {
+            rel,
+            abs,
+            scope: Selection::Symbol,
+            symbol: Some(symbol),
+            methods: BTreeSet::new(),
+            depth,
+            reason,
+        }
+    }
+
+    pub fn members(
+        rel: String,
+        abs: PathBuf,
+        depth: u32,
+        reason: Reason,
+        symbol: String,
+        methods: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            rel,
+            abs,
+            scope: Selection::Methods,
+            symbol: Some(symbol),
+            methods,
+            depth,
+            reason,
+        }
+    }
+
     pub fn label(&self) -> String {
-        match (&self.symbol, &self.member) {
-            (Some(symbol), Some(member)) => format!("`{}` :: `{symbol}.{member}`", self.rel),
-            (Some(symbol), None) => format!("`{}` :: `{symbol}`", self.rel),
-            _ => format!("`{}`", self.rel),
+        match self.scope {
+            Selection::File => format!("`{}`", self.rel),
+            Selection::Symbol => match &self.symbol {
+                Some(symbol) => format!("`{}` :: `{symbol}`", self.rel),
+                None => format!("`{}`", self.rel),
+            },
+            Selection::Methods => match &self.symbol {
+                Some(symbol) => format!(
+                    "`{}` :: `{symbol}` [{}]",
+                    self.rel,
+                    self.methods
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => format!("`{}`", self.rel),
+            },
         }
     }
 }
@@ -59,30 +120,93 @@ enum Content<'a> {
     },
 }
 
-/// Groups member excerpts of the same class so the class shell is rendered once
+impl Content<'_> {
+    fn entry(&self) -> &BundleFile {
+        match self {
+            Content::Single(file) => file,
+            Content::Class { entry, .. } => entry,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Content::Single(file) => file.label(),
+            Content::Class { entry, members } => format!(
+                "`{}` :: `{}` [{}]",
+                entry.rel,
+                entry.symbol.as_deref().unwrap_or(""),
+                members.iter().copied().collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+
+    fn methods_kept(&self) -> usize {
+        match self {
+            Content::Single(_) => 0,
+            Content::Class { members, .. } => members.len(),
+        }
+    }
+}
+
+/// `file > symbol > methods`: an entry whose file or class is already covered
+/// adds nothing.
+fn visible(files: &[BundleFile]) -> Vec<&BundleFile> {
+    let whole: HashSet<&str> = files
+        .iter()
+        .filter(|file| file.scope == Selection::File)
+        .map(|file| file.rel.as_str())
+        .collect();
+    let classes: HashSet<(&str, &str)> = files
+        .iter()
+        .filter(|file| file.scope == Selection::Symbol)
+        .filter_map(|file| {
+            file.symbol
+                .as_deref()
+                .map(|symbol| (file.rel.as_str(), symbol))
+        })
+        .collect();
+    files
+        .iter()
+        .filter(|file| match file.scope {
+            Selection::File => true,
+            Selection::Symbol => !whole.contains(file.rel.as_str()),
+            Selection::Methods => {
+                !whole.contains(file.rel.as_str())
+                    && file
+                        .symbol
+                        .as_deref()
+                        .is_none_or(|symbol| !classes.contains(&(file.rel.as_str(), symbol)))
+            }
+        })
+        .collect()
+}
+
+/// Groups method entries of the same class so the class shell is rendered once
 /// with the union of the kept methods.
 fn group<'a>(files: &'a [BundleFile]) -> Vec<Content<'a>> {
     let mut contents = Vec::new();
-    let mut by_class: HashMap<(String, String), usize> = HashMap::new();
-    for file in files {
-        let (Some(symbol), Some(member)) = (&file.symbol, &file.member) else {
+    let mut by_class: HashMap<(&str, &str), usize> = HashMap::new();
+    for file in visible(files) {
+        let Some(symbol) = file
+            .symbol
+            .as_deref()
+            .filter(|_| file.scope == Selection::Methods)
+        else {
             contents.push(Content::Single(file));
             continue;
         };
-        let key = (file.rel.clone(), symbol.clone());
+        let key = (file.rel.as_str(), symbol);
         match by_class.get(&key) {
             Some(&position) => {
                 if let Some(Content::Class { members, .. }) = contents.get_mut(position) {
-                    members.insert(member.as_str());
+                    members.extend(file.methods.iter().map(String::as_str));
                 }
             }
             None => {
                 by_class.insert(key, contents.len());
-                let mut members = BTreeSet::new();
-                members.insert(member.as_str());
                 contents.push(Content::Class {
                     entry: file,
-                    members,
+                    members: file.methods.iter().map(String::as_str).collect(),
                 });
             }
         }
@@ -101,23 +225,34 @@ pub fn render(index: &Index, files: &[BundleFile], options: &BundleOptions) -> S
     let title = options.title.clone().unwrap_or_else(|| name.clone());
     out.push_str(&format!("# Code bundle: {title}\n\n"));
     out.push_str(&format!("- root: `{}`\n", index.root.to_string_lossy()));
-    let distinct: HashSet<&str> = files.iter().map(|file| file.rel.as_str()).collect();
-    out.push_str(&format!("- files: {}\n", distinct.len()));
     let contents = group(files);
-    let has_members = files.iter().any(|file| file.member.is_some());
-    if has_members || contents.len() != distinct.len() {
-        out.push_str(&format!("- excerpts: {}\n", contents.len()));
+    let distinct: HashSet<&str> = contents
+        .iter()
+        .map(|content| content.entry().rel.as_str())
+        .collect();
+    out.push_str(&format!("- files: {}\n", distinct.len()));
+    let excerpts = contents
+        .iter()
+        .filter(|content| content.entry().scope != Selection::File)
+        .count();
+    if excerpts > 0 {
+        out.push_str(&format!("- excerpts: {excerpts}\n"));
+    }
+    let methods_kept: usize = contents.iter().map(Content::methods_kept).sum();
+    if methods_kept > 0 {
+        out.push_str(&format!("- methods: {methods_kept}\n"));
     }
     out.push_str(&format!("- import depth: {}\n\n", options.depth));
 
     out.push_str("## Files\n\n");
-    for file in files {
+    for content in &contents {
+        let file = content.entry();
         let detail = match (file.depth, file.reason) {
             (0, Reason::Seed) => String::new(),
             (0, reason) => format!(" ({})", reason.as_str()),
             (depth, reason) => format!(" (depth {depth}, {})", reason.as_str()),
         };
-        out.push_str(&format!("- {}{detail}\n", file.label()));
+        out.push_str(&format!("- {}{detail}\n", content.label()));
     }
     out.push_str("\n## Contents\n");
 
@@ -150,7 +285,11 @@ fn render_unit(out: &mut String, index: &Index, file: &BundleFile, options: &Bun
         }
     };
 
-    let Some(symbol) = &file.symbol else {
+    let Some(symbol) = file
+        .symbol
+        .as_ref()
+        .filter(|_| file.scope != Selection::File)
+    else {
         out.push_str(&format!("\n### {}\n\n", file.label()));
         out.push_str(&render_text(&String::from_utf8_lossy(&bytes), language));
         return;
@@ -463,22 +602,22 @@ mod tests {
 
         let index = Index::build(&root);
         let files = vec![
-            BundleFile {
-                rel: "Service.java".to_string(),
-                abs: root.join("Service.java"),
-                depth: 0,
-                reason: Reason::Seed,
-                symbol: Some("Service".to_string()),
-                member: Some("used".to_string()),
-            },
-            BundleFile {
-                rel: "Repo.java".to_string(),
-                abs: root.join("Repo.java"),
-                depth: 1,
-                reason: Reason::Call,
-                symbol: Some("Repo".to_string()),
-                member: Some("size".to_string()),
-            },
+            BundleFile::members(
+                "Service.java".to_string(),
+                root.join("Service.java"),
+                0,
+                Reason::Seed,
+                "Service".to_string(),
+                BTreeSet::from(["used".to_string()]),
+            ),
+            BundleFile::members(
+                "Repo.java".to_string(),
+                root.join("Repo.java"),
+                1,
+                Reason::Call,
+                "Repo".to_string(),
+                BTreeSet::from(["size".to_string()]),
+            ),
         ];
         let markdown = render(&index, &files, &BundleOptions::default());
         assert!(
@@ -505,6 +644,54 @@ mod tests {
             !markdown.contains("int unused() { return 1; }"),
             "{markdown}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_whole_file_supersedes_its_excerpts() {
+        let root = std::env::temp_dir().join(format!("filer-bundle-cover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Service.java"),
+            "package app;\n\npublic class Service {\n    int used() { return 1; }\n    int other() { return 2; }\n}\n",
+        )
+        .unwrap();
+
+        let index = Index::build(&root);
+        let files = vec![
+            BundleFile::whole(
+                "Service.java".to_string(),
+                root.join("Service.java"),
+                0,
+                Reason::Seed,
+            ),
+            BundleFile::excerpt(
+                "Service.java".to_string(),
+                root.join("Service.java"),
+                1,
+                Reason::Call,
+                "Service".to_string(),
+            ),
+            BundleFile::members(
+                "Service.java".to_string(),
+                root.join("Service.java"),
+                1,
+                Reason::Call,
+                "Service".to_string(),
+                BTreeSet::from(["used".to_string()]),
+            ),
+        ];
+        let markdown = render(&index, &files, &BundleOptions::default());
+        // One file line, one content block, and the whole class text.
+        assert_eq!(
+            markdown.matches("- `Service.java`").count(),
+            1,
+            "{markdown}"
+        );
+        assert!(markdown.contains("- files: 1"), "{markdown}");
+        assert!(!markdown.contains("excerpts:"), "{markdown}");
+        assert!(markdown.contains("int other() { return 2; }"), "{markdown}");
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -30,6 +30,35 @@ pub enum Language {
     Fe,
 }
 
+/// How finely a language can be bundled and picked.
+///
+/// Every language has whole files (except Formula Engine, where one file can
+/// hold thousands of functions). Only languages with a call graph expose
+/// methods, and only Java does in this cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Granularity {
+    /// Whole files only (Vue, files without symbols).
+    File,
+    /// `[file]` plus one row per top-level symbol.
+    Symbol,
+    /// One row per top-level function, no `[file]` row (Formula Engine).
+    Function,
+    /// `[file]`, `[class]` and `[method]` rows, with a call graph (Java).
+    Member,
+}
+
+impl Granularity {
+    /// Whether the picker offers a whole-file row for this language.
+    pub fn file_row(self) -> bool {
+        self != Granularity::Function
+    }
+
+    /// Whether top-level symbols are selectable excerpts.
+    pub fn symbol_rows(self) -> bool {
+        self != Granularity::File
+    }
+}
+
 /// Languages that share an import model and may resolve each other's files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Family {
@@ -71,6 +100,16 @@ impl Language {
             "vue" => Some(Language::Vue),
             "fe" => Some(Language::Fe),
             _ => None,
+        }
+    }
+
+    /// Bundling granularity this language supports. See [`Granularity`].
+    pub fn granularity(self) -> Granularity {
+        match self {
+            Language::Fe => Granularity::Function,
+            Language::Java => Granularity::Member,
+            Language::Vue => Granularity::File,
+            _ => Granularity::Symbol,
         }
     }
 
@@ -445,6 +484,19 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn granularity_per_language() {
+        assert_eq!(Language::Java.granularity(), Granularity::Member);
+        assert_eq!(Language::Fe.granularity(), Granularity::Function);
+        assert_eq!(Language::Vue.granularity(), Granularity::File);
+        assert_eq!(Language::Scala.granularity(), Granularity::Symbol);
+        assert_eq!(Language::TypeScript.granularity(), Granularity::Symbol);
+        assert!(!Language::Fe.granularity().file_row());
+        assert!(Language::Fe.granularity().symbol_rows());
+        assert!(Language::Java.granularity().symbol_rows());
+        assert!(!Language::Vue.granularity().symbol_rows());
     }
 
     #[test]

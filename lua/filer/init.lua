@@ -143,6 +143,10 @@ function M.search(opts)
       return nil
     end
     local fqn = item.fqn or ""
+    local scope = item.scope
+    if scope == vim.NIL then
+      scope = nil
+    end
     local symbol = item.symbol
     if symbol == vim.NIL then
       symbol = nil
@@ -150,6 +154,10 @@ function M.search(opts)
     local member = item.member
     if member == vim.NIL then
       member = nil
+    end
+    local kind = item.kind
+    if kind == vim.NIL then
+      kind = nil
     end
     local line_number = item.line
     if line_number == vim.NIL then
@@ -163,10 +171,11 @@ function M.search(opts)
     if reason == vim.NIL then
       reason = nil
     end
-    local label = fqn ~= "" and fqn or item.path
+    -- `[file]`, `[class]`, `[method]`, `[type]`, `[function]`, `[declaration]`.
+    local label = "[" .. (kind or "file") .. "] " .. (fqn ~= "" and fqn or item.path)
     -- Functions are not unique across files (one .fe file holds thousands),
     -- so show where the function lives.
-    if symbol and item.kind == "function" then
+    if symbol and kind == "function" then
       label = label .. "  (" .. item.path .. ")"
     end
     local included = item.included == true
@@ -180,9 +189,10 @@ function M.search(opts)
     return {
       value = item,
       path = item.path,
+      scope = scope,
       symbol = symbol,
       member = member,
-      kind = item.kind,
+      kind = kind,
       line = line_number,
       fqn = fqn,
       included = included,
@@ -222,7 +232,9 @@ function M.search(opts)
         for _, entry in ipairs(selected) do
           if entry.included then
             already = already + 1
-          elseif entry.member and entry.symbol then
+          elseif entry.scope == "file" or (not entry.scope and not entry.symbol) then
+            paths[#paths + 1] = entry.path
+          elseif (entry.scope == "methods" or (not entry.scope and entry.member)) and entry.symbol and entry.member then
             paths[#paths + 1] = entry.path .. "::" .. entry.symbol .. "." .. entry.member
           elseif entry.symbol then
             paths[#paths + 1] = entry.path .. "::" .. entry.symbol
