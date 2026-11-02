@@ -1,0 +1,102 @@
+name: Weekly open PR report
+
+on:
+  schedule:
+    # Saturday 07:00 Europe/Berlin. GitHub cron is UTC and does not follow DST,
+    # so both candidates are scheduled (05:00 UTC in summer, 06:00 UTC in
+    # winter) and the job keeps the one that lands on 07:00 local time.
+    - cron: "0 5 * * 6"
+    - cron: "0 6 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: pr-report
+  cancel-in-progress: false
+
+env:
+  ISSUE_TITLE: "Weekly open PR report"
+  TZ: Europe/Berlin
+
+jobs:
+  report:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check it is 07:00 in Europe/Berlin
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Manual run: skipping the time gate."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          hour=$(date +%H)
+          if [ "$hour" = "07" ]; then
+            echo "Local time is 07:00, reporting."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Local time is $hour:00, not 07:00 — skipping this cron hit."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect open PRs
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 200 \
+            --json number,title,url,isDraft,createdAt > prs.json
+
+          count=$(jq 'length' prs.json)
+          stamp=$(date '+%Y-%m-%d %H:%M %Z')
+
+          {
+            echo "Open PRs in \`$GITHUB_REPOSITORY\` — **$count** open, as of $stamp."
+            echo
+            if [ "$count" -eq 0 ]; then
+              echo "No open pull requests."
+            else
+              jq -r 'sort_by(.createdAt)[]
+                | "- #\(.number) \(.title) — \(.url)" + (if .isDraft then " (draft)" else "" end)' \
+                prs.json
+            fi
+            echo
+            echo "_Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID_"
+          } > body.md
+
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update tracking issue
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Match the title locally: GitHub's `in:title` search does not reliably
+          # match a quoted phrase, which would produce duplicate issues.
+          number=$(gh issue list --state all --limit 200 --json number,title \
+            --jq ".[] | select(.title == \"$ISSUE_TITLE\") | .number" \
+            | sort -n | head -n1)
+
+          if [ -n "$number" ]; then
+            if [ "$(gh issue view "$number" --json state --jq .state)" = "CLOSED" ]; then
+              gh issue reopen "$number"
+            fi
+            gh issue edit "$number" --body-file body.md
+            # The comment is what triggers the weekly notification email.
+            gh issue comment "$number" --body-file body.md
+            echo "Updated #$number." >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body-file body.md
+            echo "Opened the tracking issue." >> "$GITHUB_STEP_SUMMARY"
+          fi

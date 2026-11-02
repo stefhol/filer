@@ -164,7 +164,7 @@ You can still release by hand: bump `version` in `Cargo.toml`/`Cargo.lock`, comm
 Every push to `master` also runs `.github/workflows/ci.yml` (fmt, clippy, tests) and uploads a
 `filer-x86_64-unknown-linux-gnu.tar.xz` workflow artifact kept for 90 days.
 
-Two scheduled workflows keep dependencies current and audited (both also support
+Three scheduled workflows keep dependencies current, audited and reviewed (all support
 *Run workflow* from the Actions UI):
 
 - `.github/workflows/renovate.yml` runs self-hosted Renovate daily against `master`.
@@ -175,6 +175,11 @@ Two scheduled workflows keep dependencies current and audited (both also support
 - `.github/workflows/audit.yml` runs `cargo audit` against `Cargo.lock` daily. It fails the
   run and opens (or comments on) a `Security: RustSec advisories in dependencies` issue when
   advisories are found, and never fails on yanked/unmaintained warnings alone.
+- `.github/workflows/pr-report.yml` lists the open pull requests every Saturday at 07:00
+  `Europe/Berlin` into a `Weekly open PR report` tracking issue. GitHub cron is UTC and has no
+  DST, so both candidate hours are scheduled and the job only proceeds when the local hour is
+  `07`. The weekly comment on the issue is what delivers the email notification; there are no
+  mail credentials involved.
 
 ## Neovim setup
 
