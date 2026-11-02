@@ -3,7 +3,12 @@
 
 use tree_sitter::{Node, Parser};
 
-use crate::lang::{finish_symbols, symbol_from_node, Import, ImportKind, Source, SymbolKind};
+use crate::lang::{
+    finish_symbols, leading_comment_start, line_of, symbol_from_node, Call, Import, ImportKind,
+    Member, MemberKind, Receiver, Source, Symbol, SymbolKind,
+};
+
+const COMMENTS: &[&str] = &["comment"];
 
 pub struct ScalaParser {
     parser: Parser,
@@ -118,13 +123,10 @@ fn walk_scope(
                 if let Some(name) = child.child_by_field_name("name") {
                     let text = text_of(name, src);
                     if !text.is_empty() {
-                        out.symbols.push(symbol_from_node(
-                            child,
-                            &text,
-                            SymbolKind::Type,
-                            &["comment"],
-                            src,
-                        ));
+                        let mut symbol =
+                            symbol_from_node(child, &text, SymbolKind::Type, COMMENTS, src);
+                        collect_members(child, src, &mut symbol);
+                        out.symbols.push(symbol);
                         out.types.push(text);
                     }
                 }
@@ -134,6 +136,315 @@ fn walk_scope(
             }
             _ => {}
         }
+    }
+}
+
+/// Methods, constructors, fields and supertypes of one class/object/trait,
+/// with the calls each member makes and the receiver types the resolver needs.
+fn collect_members(class: Node<'_>, src: &str, symbol: &mut Symbol) {
+    symbol.supertypes = supertypes(class, src);
+
+    // `class Service(val repo: Repo)` makes `repo` a field.
+    if let Some(parameters) = class.child_by_field_name("class_parameters") {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            if parameter.kind() != "class_parameter" {
+                continue;
+            }
+            if !has_modifier_token(parameter, &["val", "var"]) {
+                continue;
+            }
+            if let (Some(name), Some(ty)) = (
+                parameter.child_by_field_name("name"),
+                parameter
+                    .child_by_field_name("type")
+                    .and_then(|ty| type_name(ty, src)),
+            ) {
+                symbol.fields.push((text_of(name, src), ty));
+            }
+        }
+    }
+
+    let Some(body) = class.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        match member.kind() {
+            "function_definition" | "function_declaration" => {
+                let Some(name) = member.child_by_field_name("name") else {
+                    continue;
+                };
+                let name = text_of(name, src);
+                if name.is_empty() {
+                    continue;
+                }
+                let start = leading_comment_start(member, COMMENTS);
+                let body_start = member
+                    .child_by_field_name("body")
+                    .map(|body| body_marker(member).unwrap_or_else(|| body.start_byte()));
+                let kind = if name == "this" {
+                    MemberKind::Constructor
+                } else {
+                    MemberKind::Method
+                };
+                symbol.members.push(Member {
+                    name,
+                    kind,
+                    start,
+                    end: member.end_byte(),
+                    line: line_of(src, start),
+                    body_start,
+                    params: parameter_names(member.child_by_field_name("parameters"), src),
+                    locals: local_names(member, src),
+                    calls: calls_in(member, src),
+                });
+            }
+            "val_definition" | "var_definition" => {
+                if let Some((name, ty)) = defined_name_and_type(member, src) {
+                    symbol.fields.push((name, ty));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn has_modifier_token(node: Node<'_>, tokens: &[&str]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if tokens.contains(&child.kind()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Start of the body expression: the `=` of `def f = ...`/`val x = ...`, or the
+/// `{` of a block body, so the rendered signature stops before it.
+fn body_marker(node: Node<'_>) -> Option<usize> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "=" {
+            return Some(child.start_byte());
+        }
+    }
+    None
+}
+
+/// Name and declared type of `val x: Type` / `var x: Type`.
+fn defined_name_and_type(node: Node<'_>, src: &str) -> Option<(String, String)> {
+    let pattern = node.child_by_field_name("pattern")?;
+    let name = match pattern.kind() {
+        "identifier" | "operator_identifier" => text_of(pattern, src),
+        "identifiers" => {
+            let mut cursor = pattern.walk();
+            let name = pattern
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "identifier" | "operator_identifier"))
+                .map(|child| text_of(child, src))?;
+            name
+        }
+        _ => return None,
+    };
+    let ty = node
+        .child_by_field_name("type")
+        .and_then(|ty| type_name(ty, src))?;
+    (!name.is_empty()).then_some((name, ty))
+}
+
+fn parameter_names(parameters: Option<Node<'_>>, src: &str) -> Vec<(String, String)> {
+    let Some(parameters) = parameters else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if !matches!(parameter.kind(), "parameter" | "class_parameter") {
+            continue;
+        }
+        if let (Some(name), Some(ty)) = (
+            parameter.child_by_field_name("name"),
+            parameter
+                .child_by_field_name("type")
+                .and_then(|ty| type_name(ty, src)),
+        ) {
+            out.push((text_of(name, src), ty));
+        }
+    }
+    out
+}
+
+fn local_names(member: Node<'_>, src: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![member];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            // `val x: Type = ...` / `var x: Type = ...` inside the body.
+            "val_definition" | "var_definition" => {
+                if let Some(entry) = defined_name_and_type(node, src) {
+                    out.push(entry);
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+/// Simple name of a type: `Repo`, `List` for `List[Repo]`, `Repo` for
+/// `com.example.Repo` and `Repo` for `Repo @annot`.
+fn type_name(node: Node<'_>, src: &str) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "identifier" | "operator_identifier" => {
+            let text = text_of(node, src);
+            (!text.is_empty()).then_some(text)
+        }
+        "generic_type" | "projected_type" => node
+            .child_by_field_name("type")
+            .and_then(|ty| type_name(ty, src)),
+        "stable_type_identifier" | "singleton_type" => {
+            let mut cursor = node.walk();
+            let mut last = None;
+            for child in node.named_children(&mut cursor) {
+                if matches!(
+                    child.kind(),
+                    "identifier" | "type_identifier" | "operator_identifier"
+                ) {
+                    last = Some(text_of(child, src));
+                }
+            }
+            last.or_else(|| {
+                node.named_children(&mut cursor)
+                    .find_map(|child| type_name(child, src))
+            })
+        }
+        // `annotated_type` has no `type` field: its first type-ish child is the
+        // type, the rest are annotations.
+        _ => {
+            let mut cursor = node.walk();
+            let found = node.named_children(&mut cursor).find(|child| {
+                matches!(
+                    child.kind(),
+                    "type_identifier"
+                        | "generic_type"
+                        | "stable_type_identifier"
+                        | "projected_type"
+                        | "singleton_type"
+                        | "annotated_type"
+                        | "applied_constructor_type"
+                )
+            });
+            found.and_then(|child| type_name(child, src))
+        }
+    }
+}
+
+fn supertypes(class: Node<'_>, src: &str) -> Vec<String> {
+    let Some(extends) = class.child_by_field_name("extend") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = extends.walk();
+    for ty in extends.children_by_field_name("type", &mut cursor) {
+        if let Some(name) = type_name(ty, src) {
+            out.push(name);
+        }
+    }
+    if out.is_empty() {
+        let mut cursor = extends.walk();
+        for child in extends.named_children(&mut cursor) {
+            if let Some(name) = type_name(child, src) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+fn calls_in(member: Node<'_>, src: &str) -> Vec<Call> {
+    let mut out = Vec::new();
+    let mut stack = vec![member];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression" {
+            if let Some(function) = node.child_by_field_name("function") {
+                if let Some(call) = call_of(function, src) {
+                    out.push(call);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+fn call_of(function: Node<'_>, src: &str) -> Option<Call> {
+    match function.kind() {
+        "identifier" | "operator_identifier" => {
+            let name = text_of(function, src);
+            (!name.is_empty()).then_some(Call {
+                name,
+                receiver: Receiver::Bare,
+            })
+        }
+        // `foo[Int](...)`.
+        "generic_function" => function
+            .child_by_field_name("function")
+            .and_then(|inner| call_of(inner, src)),
+        "field_expression" => {
+            let name = function
+                .child_by_field_name("field")
+                .map(|field| text_of(field, src))?;
+            let receiver = function
+                .child_by_field_name("value")
+                .map(|value| receiver_of(value, src))
+                .unwrap_or(Receiver::Unknown);
+            (!name.is_empty()).then_some(Call { name, receiver })
+        }
+        _ => None,
+    }
+}
+
+fn receiver_of(node: Node<'_>, src: &str) -> Receiver {
+    match node.kind() {
+        "this" => Receiver::This,
+        "super" => Receiver::Super,
+        "identifier" | "operator_identifier" => {
+            let text = text_of(node, src);
+            match text.as_str() {
+                "this" => Receiver::This,
+                "super" => Receiver::Super,
+                _ => Receiver::Name(text),
+            }
+        }
+        "field_expression" => node
+            .child_by_field_name("field")
+            .map(|field| Receiver::Name(text_of(field, src)))
+            .unwrap_or(Receiver::Unknown),
+        "instance_expression" => {
+            let mut cursor = node.walk();
+            let ty = node.named_children(&mut cursor).find(|child| {
+                matches!(
+                    child.kind(),
+                    "type_identifier"
+                        | "generic_type"
+                        | "stable_type_identifier"
+                        | "annotated_type"
+                        | "applied_constructor_type"
+                )
+            });
+            ty.and_then(|ty| type_name(ty, src))
+                .map(Receiver::Name)
+                .unwrap_or(Receiver::Unknown)
+        }
+        _ => Receiver::Unknown,
     }
 }
 
@@ -479,6 +790,97 @@ mod tests {
                 source.uses
             );
         }
+    }
+
+    #[test]
+    fn extracts_members_fields_supertypes_and_calls() {
+        let source = parse(
+            r#"
+            package app
+
+            abstract class Service(val repo: Repo, val count: Int) extends Base with Api {
+              var helper: Helper = new Helper()
+
+              def used(local: Local, h: Helper): Int = {
+                val temp: Local = new Local()
+                temp.ping()
+                h.pong()
+                repo.find()
+                Helper.staticCall()
+                this.inside()
+                super.parent()
+                count
+              }
+
+              def omitted: Int = 1
+              def inside(): Unit = {}
+              def nothing(): Unit
+            }
+            "#,
+        );
+        let service = &source.symbols[0];
+        assert_eq!(service.name, "Service");
+        assert_eq!(service.supertypes, vec!["Base", "Api"]);
+        for expected in [("repo", "Repo"), ("count", "Int"), ("helper", "Helper")] {
+            assert!(
+                service
+                    .fields
+                    .iter()
+                    .any(|(name, ty)| name == expected.0 && ty == expected.1),
+                "missing {expected:?} in {:?}",
+                service.fields
+            );
+        }
+
+        let used = service
+            .members
+            .iter()
+            .find(|member| member.name == "used")
+            .expect("used");
+        assert_eq!(used.kind, MemberKind::Method);
+        assert_eq!(
+            used.params,
+            vec![
+                ("local".to_string(), "Local".to_string()),
+                ("h".to_string(), "Helper".to_string()),
+            ]
+        );
+        assert_eq!(used.locals, vec![("temp".to_string(), "Local".to_string())]);
+        let receivers: Vec<(&str, &Receiver)> = used
+            .calls
+            .iter()
+            .map(|call| (call.name.as_str(), &call.receiver))
+            .collect();
+        for (name, receiver) in [
+            ("ping", Receiver::Name("temp".to_string())),
+            ("pong", Receiver::Name("h".to_string())),
+            ("find", Receiver::Name("repo".to_string())),
+            ("staticCall", Receiver::Name("Helper".to_string())),
+            ("inside", Receiver::This),
+            ("parent", Receiver::Super),
+        ] {
+            assert!(
+                receivers
+                    .iter()
+                    .any(|(call_name, call_receiver)| *call_name == name
+                        && **call_receiver == receiver),
+                "missing {name}: {receivers:?}"
+            );
+        }
+        assert!(used.body_start.is_some());
+
+        let omitted = service
+            .members
+            .iter()
+            .find(|member| member.name == "omitted")
+            .expect("omitted");
+        assert!(omitted.body_start.is_some());
+        let nothing = service
+            .members
+            .iter()
+            .find(|member| member.name == "nothing")
+            .expect("nothing");
+        assert_eq!(nothing.body_start, None);
     }
 
     #[test]

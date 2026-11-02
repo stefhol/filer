@@ -33,7 +33,7 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 11;
+const CACHE_VERSION: u32 = 12;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {

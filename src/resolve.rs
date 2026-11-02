@@ -1298,6 +1298,73 @@ mod tests {
     }
 
     #[test]
+    fn scala_method_and_file_seeds_use_the_call_graph() {
+        let root = index_from_disk(
+            "scala",
+            &[
+                (
+                    "app/Service.scala",
+                    "package app\n\nclass Service(val repo: Repo) extends Base {\n  def used(helper: Helper): Int = {\n    helper.pong()\n    repo.size()\n  }\n\n  def omitted: Int = 1\n}\n",
+                ),
+                (
+                    "app/Repo.scala",
+                    "package app\n\nclass Repo {\n  def size(): Int = 0\n  def unused(): Int = 1\n}\n",
+                ),
+                (
+                    "app/Helper.scala",
+                    "package app\n\nclass Helper {\n  def pong(): Unit = {}\n  def quiet(): Unit = {}\n}\n",
+                ),
+                (
+                    "app/Base.scala",
+                    "package app\n\nclass Base {\n  def parent(): Unit = {}\n}\n",
+                ),
+            ],
+        );
+        let index = Index::build(&root);
+        let service = index.by_rel["app/Service.scala"];
+
+        let order = closure_units(
+            &index,
+            &[member_seed(service, "Service", "used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let members = member_names(&order);
+        for expected in [("Helper", "pong"), ("Repo", "size")] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(class, member)| class == expected.0 && member == expected.1),
+                "missing {expected:?} in {members:?}"
+            );
+        }
+        assert!(!members
+            .iter()
+            .any(|(class, member)| class == "Repo" && member == "unused"));
+
+        let order = closure_units(
+            &index,
+            &[Unit::File(service)],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(order.iter().any(|(unit, _, _)| {
+            unit.symbol() == Some("Repo") && unit.member() == Some("size")
+        }));
+        assert!(!order
+            .iter()
+            .any(|(unit, _, _)| unit.member() == Some("unused")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn csharp_method_and_file_seeds_use_the_call_graph() {
         let root = index_from_disk(
             "csharp",
