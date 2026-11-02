@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::index::Index;
 use crate::lang::{Language, MemberKind, Symbol};
-use crate::resolve::Reason;
+use crate::resolve::{Diagnostic, Reason};
 use crate::schema::SCHEMA_VERSION;
 use crate::state::Selection;
 
@@ -176,6 +176,15 @@ pub struct BundleEntry {
     pub note: Option<&'static str>,
 }
 
+/// How much of the index the JSON envelope stands on. Index-wide, so a
+/// `bundle` and a `show` over the same root report the same numbers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Coverage {
+    pub files_indexed: usize,
+    pub files_skipped: usize,
+    pub imports_unresolved: usize,
+}
+
 /// The bundle as data. `markdown` and [`RenderedBundle::to_json`] are both
 /// derived from `entries`, so the two surfaces cannot describe different units.
 pub struct RenderedBundle {
@@ -189,12 +198,18 @@ pub struct RenderedBundle {
     pub appendix: Option<String>,
     pub entries: Vec<BundleEntry>,
     pub markdown: String,
+    /// What the traversal declined to include (empty for `show`, which does not
+    /// resolve).
+    pub diagnostics: Vec<Diagnostic>,
+    /// Index-wide completeness counters for the same envelope.
+    pub coverage: Coverage,
 }
 
 impl RenderedBundle {
     /// The versioned JSON envelope. `entries` always names the same units as
-    /// the markdown; `omitted` is the subset that was not rendered, and
-    /// `diagnostics` is reserved for issue #10.
+    /// the markdown; `omitted` is the subset that was not rendered,
+    /// `diagnostics` is what the traversal declined, and `coverage` says how
+    /// complete the index behind it is.
     pub fn to_json(&self) -> serde_json::Value {
         let entries: Vec<serde_json::Value> = self
             .entries
@@ -244,6 +259,8 @@ impl RenderedBundle {
             .entries
             .iter()
             .any(|entry| entry.note == Some("too_large"));
+        let diagnostics: Vec<serde_json::Value> =
+            self.diagnostics.iter().map(Diagnostic::to_json).collect();
         serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "root": self.root,
@@ -260,7 +277,12 @@ impl RenderedBundle {
             },
             "entries": entries,
             "omitted": omitted,
-            "diagnostics": [],
+            "diagnostics": diagnostics,
+            "coverage": {
+                "files_indexed": self.coverage.files_indexed,
+                "files_skipped": self.coverage.files_skipped,
+                "imports_unresolved": self.coverage.imports_unresolved,
+            },
             "state_toml": self.appendix,
         })
     }
@@ -484,6 +506,8 @@ pub fn describe(index: &Index, files: &[BundleFile], options: &BundleOptions) ->
         appendix: options.appendix.clone(),
         entries,
         markdown,
+        diagnostics: Vec::new(),
+        coverage: Coverage::default(),
     }
 }
 

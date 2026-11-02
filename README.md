@@ -418,6 +418,7 @@ filer --root ~/code/demo search --query user           # JSON lines, one per sym
 filer --root ~/code/demo search --query user --plain   # fqn<TAB>path[::symbol]
 filer --root ~/code/demo search --query 'discount rounding' --json  # empty -> hint
 filer --root ~/code/demo deps src/main/java/com/example/app/Application.java
+filer --root ~/code/demo deps 'app/Service.java::Service.used' --unit
 filer --root ~/code/demo bundle --depth 2 --with-config \
       src/main/java/com/example/app/Application.java > bundle.md
 filer --root ~/code/demo bundle 'src/main/java/app/Service.java::Service.usedEverywhere'
@@ -488,6 +489,13 @@ $ filer --root ~/code/demo refs TaxRate --json
 [{"path":"app/Service.java","symbol":"Service","member":null,"line":2,"kind":"use"}]
 ```
 
+`deps` lists the import/call closure of one seed. By default every row is a file, even
+when the seed is a method; add `--unit` to keep the units (`path::Symbol`,
+`path::Class.method`) the traversal actually discovered. Both modes run the same
+breadth-first walk, so the unit list is the file list differ-by-unit, not a second
+resolver. `deps --json` also carries the materialized `edges` and the `diagnostics` for
+the files it touched.
+
 `callers` follows call edges only (`Reason::Call`); an imported type is not a caller.
 `why` reads the state file (`--state`, default `<root>/.filer/bundle.toml`) and the current
 branch (`--branch`), walks `graph.inc` back to a `reason = "seed"` entry, and returns the
@@ -508,7 +516,8 @@ output covered here (`search`, `deps`, `bundle`, `show`, `index`) carries `schem
 
 ```sh
 filer --root ~/code/demo --json search --query Service   # JSON lines, one row per unit
-filer --root ~/code/demo --json deps app/Service.java    # {"schema_version":1,"deps":[...]}
+filer --root ~/code/demo --json deps app/Service.java    # {"schema_version":1,"seed":...,"deps":[...],"edges":[...],"diagnostics":[...]}
+filer --root ~/code/demo --json deps 'app/Service.java::Service.used' --unit
 filer --root ~/code/demo --json bundle --depth 2 app/Service.java
 filer --root ~/code/demo --json show
 filer --root ~/code/demo --json index
@@ -546,7 +555,10 @@ filer --root ~/code/demo --json index
     }
   ],
   "omitted": [],
-  "diagnostics": [],
+  "diagnostics": [
+    {"kind": "unresolved-import", "path": "app/Service.java", "import": "com.acme.Tax"}
+  ],
+  "coverage": {"files_indexed": 812, "files_skipped": 34, "imports_unresolved": 19},
   "state_toml": "version = 3\n..."
 }
 ```
@@ -559,11 +571,63 @@ filer --root ~/code/demo --json index
   span; there is no tokenizer dependency.
 - `state_toml` preserves the bundle-state appendix as TOML inside the JSON envelope, so
   the semantic state stays readable in the format the sidecar uses.
-- `diagnostics` is reserved for the diagnostics work; it is an empty array for now.
+- `diagnostics` lists what the traversal declined to include for **this** bundle (see
+  [Diagnostics and coverage](#diagnostics-and-coverage)); `show` does not resolve, so its
+  array is empty.
+- `coverage` is index-wide, so it describes how complete the tool's view of the repo is:
+  `files_indexed`, `files_skipped` (supported-language files that could not be read or
+  parsed) and `imports_unresolved` (import statements no indexed file provides). The
+  per-unit version of the last number is `diagnostics`.
 - `deps --json` deliberately **wraps** its array: it used to print a bare `[...]`, now it
   prints `{"schema_version":1,"deps":[...]}` so the version is a top-level key. Update
   consumers with `jq '.deps'`. `search` stays JSON lines and adds `schema_version` to each
   row, which is additive for the Neovim picker.
+- `deps --json` additionally carries `seed` (canonical unit label), `granularity`
+  (`file` or `unit`, matching `--unit`), `edges` (`{from, to, reason, line}` with canonical
+  unit labels; `line` is `null` when the edge has no single call site) and `diagnostics`.
+  Each `deps` row keeps `path`, `fqn`, `depth`, `reason` and adds `unit`, `scope`,
+  `symbol`, `member`. The fields are additive, so `schema_version` stays `1`.
+
+```json
+{
+  "schema_version": 1,
+  "seed": "app/Pricing.java::Pricing.round",
+  "granularity": "unit",
+  "deps": [
+    {"path": "app/Repo.java", "fqn": "app.Repo", "depth": 1, "reason": "call",
+     "unit": "app/Repo.java::Repo.size", "scope": "methods", "symbol": "Repo", "member": "size"}
+  ],
+  "edges": [
+    {"from": "app/Pricing.java::Pricing.round", "to": "app/Repo.java::Repo.size",
+     "reason": "call", "line": 10}
+  ],
+  "diagnostics": [
+    {"kind": "unresolved-import", "path": "app/Pricing.java", "import": "com.acme.Tax"}
+  ]
+}
+```
+
+### Diagnostics and coverage
+
+Everything filer declines to include used to disappear. A precise tool that silently drops
+half a slice is worse than a coarse one, so the JSON surface reports the gaps: markdown
+`bundle` warns with a diagnostic count, `deps` prints each diagnostic, and `bundle --json` /
+`deps --json` carry the full list. `--quiet` silences the warnings, not the JSON.
+
+`kind` is a **closed enum**. Each kind carries a fixed payload field in addition to `kind`
+and `path`:
+
+| `kind` | Payload | Meaning |
+| --- | --- | --- |
+| `unresolved-import` | `import` | No indexed file provides the import (JDK, stdlib, npm, NuGet, ...). |
+| `unknown-receiver` | `line`, `call` | A call through an arbitrary expression (`a.b().c()`), whose receiver type is not known. The parsers record the call name, not the expression. |
+| `unresolved-call` | `line`, `name` | The receiver/type name resolved to nothing. |
+| `method-not-found` | `line`, `name` | The class is known but declares no such method; the whole class is kept instead. |
+| `type-only-skipped` | `symbol` | A type in scope that a call-path bundle deliberately skips. |
+| `ambiguous` | `line`, `name` | Several same-named candidates; filer refuses to guess. |
+
+New kinds are a wire-format change. Diagnostics are sorted (path, line, kind, name) and
+deduplicated so repeated seeds and expansions do not multiply them.
 
 Rebuilding the markdown from the envelope:
 
@@ -612,8 +676,9 @@ parameters, locals, imports, comments or bodies. `.fe` calls and top-level decla
 matched by name too, but file contents are not searched.
 
 `--quiet` (global) suppresses the trailing `filer: N units, M new on this run` summary,
-the `dropping ...` notices and the `unresolved ...` list. Hard errors still print. A
-successful `bundle --quiet` writes nothing to stderr.
+the `dropping ...` notices and the diagnostic notes (unresolved imports, unknown
+receivers, skipped type-only dependencies, ...). Hard errors still print. A successful
+`bundle --quiet` writes nothing to stderr; the same information stays in `bundle --json`.
 
 ## How resolution works
 
@@ -660,7 +725,12 @@ successful `bundle --quiet` writes nothing to stderr.
    to the symbol that declares it (a sibling in the same file first). A whole-file unit that
    ends up in the same bundle supersedes its symbol units.
 8. Breadth-first walk from the seeds up to `--depth`, preserving discovery order so the
-   bundle reads top-down from your entry point.
+   bundle reads top-down from your entry point. Materialized edges are kept in the graph,
+   so `deps --json` can expose them and `callers`/`why` can walk them backwards.
+9. While resolving, record what was declined (unresolved imports, unknown receivers,
+   method-not-found fallbacks, skipped type-only deps, ambiguities) as diagnostics. They
+   travel with the closure, not with the rendered markdown, so `bundle --json` can report
+   gaps in the slice it just produced.
 
 ## Adding another language
 
