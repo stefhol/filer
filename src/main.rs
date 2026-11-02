@@ -1,5 +1,6 @@
 //! `filer` — bundle source files and their import closure for a chat LLM.
 
+mod atomic;
 mod bundle;
 mod csharp;
 mod fe;

@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
+use crate::atomic;
 use crate::lang::{Import, Language, Member, SourceParser, Symbol};
 
 const SKIP_DIRS: &[&str] = &[
@@ -354,14 +355,36 @@ impl Cache {
         let Some(path) = cache_path(root) else {
             return Cache::default();
         };
-        let Ok(bytes) = fs::read(&path) else {
-            return Cache::default();
+        Cache::load_path(&path, root)
+    }
+
+    /// A torn or truncated cache rebuilds silently into a fresh parse; only a
+    /// cache that is *present but unreadable* is worth a warning.
+    fn load_path(path: &Path, root: &Path) -> Cache {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Cache::default(),
+            Err(error) => {
+                eprintln!(
+                    "filer: ignoring unreadable index cache {}: {error}",
+                    path.display()
+                );
+                return Cache::default();
+            }
         };
         match serde_json::from_slice::<Cache>(&bytes) {
             Ok(cache) if cache.version == CACHE_VERSION && cache.root == root.to_string_lossy() => {
                 cache
             }
-            _ => Cache::default(),
+            // A new CACHE_VERSION after an upgrade is normal; rebuild quietly.
+            Ok(_) => Cache::default(),
+            Err(error) => {
+                eprintln!(
+                    "filer: ignoring corrupt index cache {}: {error}",
+                    path.display()
+                );
+                Cache::default()
+            }
         }
     }
 
@@ -398,11 +421,8 @@ impl Cache {
             root: root.to_string_lossy().to_string(),
             entries,
         };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         if let Ok(json) = serde_json::to_vec(&cache) {
-            let _ = fs::write(path, json);
+            let _ = atomic::write(&path, &json);
         }
     }
 }
@@ -423,6 +443,25 @@ fn cache_path(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::resolve::{closure_detailed, Reason, ResolveOptions};
+
+    #[test]
+    fn corrupt_cache_is_rebuilt_not_fatal() {
+        let dir = std::env::temp_dir().join(format!("filer-cache-corrupt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.json");
+
+        fs::write(&path, "{\"version\":15,\"root\":\"/repo\",\"entries\":[").unwrap();
+        let cache = Cache::load_path(&path, Path::new("/repo"));
+        assert!(cache.entries.is_empty());
+
+        fs::write(&path, "{\"version\":0,\"root\":\"/repo\",\"entries\":[]}").unwrap();
+        let cache = Cache::load_path(&path, Path::new("/repo"));
+        assert!(cache.version == CACHE_VERSION);
+        assert!(cache.entries.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn indexes_every_supported_extension() {

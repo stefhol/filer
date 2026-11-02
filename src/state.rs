@@ -14,6 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::atomic;
+
 const VERSION: u32 = 3;
 
 /// Granularity of one bundle entry / picker row.
@@ -327,14 +329,32 @@ pub fn default_path(root: &Path) -> PathBuf {
     root.join(".filer").join("bundle.toml")
 }
 
+/// Read the state file. A missing file is `None`; a corrupt or unreadable one
+/// warns and is also `None`, so the caller rebuilds the bundle instead of
+/// aborting.
 pub fn load(path: &Path) -> Option<StateDoc> {
-    let text = fs::read_to_string(path).ok()?;
-    parse(&text)
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            eprintln!(
+                "filer: ignoring unreadable state {}: {error}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    match parse(&text) {
+        Ok(doc) => Some(doc),
+        Err(error) => {
+            eprintln!("filer: ignoring corrupt state {}: {error}", path.display());
+            None
+        }
+    }
 }
 
-fn parse(text: &str) -> Option<StateDoc> {
-    let stored: StoredDoc = toml::from_str(text).ok()?;
-    Some(stored.into_state())
+fn parse(text: &str) -> Result<StateDoc, toml::de::Error> {
+    toml::from_str::<StoredDoc>(text).map(StoredDoc::into_state)
 }
 
 pub fn save(path: &Path, doc: &StateDoc) -> std::io::Result<()> {
@@ -350,15 +370,13 @@ pub fn save(path: &Path, doc: &StateDoc) -> std::io::Result<()> {
             let _ = fs::write(ignore, "*\n");
         }
     }
-    fs::write(path, to_toml(doc))
+    // Temp file in the same directory, fsync, rename: a crash or a concurrent
+    // writer can only leave the old file or the new one, never a torn TOML.
+    atomic::write(path, to_toml(doc).as_bytes())
 }
 
 pub fn clear(path: &Path) -> std::io::Result<bool> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
+    atomic::remove(path)
 }
 
 /// State file contents, with a hint for whoever opens the file directly.
@@ -426,6 +444,23 @@ fn head_file(root: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_state_is_ignored_not_fatal() {
+        let dir = std::env::temp_dir().join(format!("filer-state-corrupt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bundle.toml");
+
+        fs::write(&path, "version = [3\n").unwrap();
+        assert!(load(&path).is_none(), "torn TOML must not be fatal");
+        assert!(load(&dir.join("missing.toml")).is_none());
+
+        fs::write(&path, to_toml(&StateDoc::new(Path::new("/repo")))).unwrap();
+        assert!(load(&path).is_some(), "a rebuilt state must load again");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn file(path: &str, depth: u32, reason: &str) -> StateFile {
         StateFile {
