@@ -150,10 +150,19 @@ export function timeoutFrom(env: Env = {}): number {
   return Math.floor(parsed);
 }
 
-/** `--filer-root` > `FILER_ROOT`; `undefined` means "ask git, then cwd". */
-export function rootFrom(input: { flag?: string; env?: Env } = {}): string | undefined {
+/**
+ * `--filer-root` > `FILER_ROOT` > `/filer root`; `undefined` means "ask git,
+ * then cwd".
+ */
+export function rootFrom(
+  input: { flag?: string; env?: Env; session?: string } = {},
+): string | undefined {
   const env = input.env ?? {};
-  return nonEmpty(input.flag) ?? nonEmpty(env.FILER_ROOT);
+  return (
+    nonEmpty(input.flag) ??
+    nonEmpty(env.FILER_ROOT) ??
+    nonEmpty(input.session)
+  );
 }
 
 /** One `git rev-parse --show-toplevel`, or `null` outside a repository. */
@@ -175,11 +184,16 @@ export async function detectGitRoot(
 export interface RootResolutionInput {
   /** `--filer-root`. */
   flagRoot?: string;
+  /** `/filer root`, persisted for the session by the commands. */
+  sessionRoot?: string;
   cwd: string;
   signal?: AbortSignal;
 }
 
-/** Resolution order: `--filer-root` > `FILER_ROOT` > git toplevel > cwd. */
+/**
+ * Resolution order: `--filer-root` > `FILER_ROOT` > `/filer root` > git
+ * toplevel > cwd.
+ */
 export interface RootResolver {
   resolve(input: RootResolutionInput): Promise<string>;
 }
@@ -210,7 +224,11 @@ export function createRootResolver(options: RootResolverOptions = {}): RootResol
 
   return {
     async resolve(input: RootResolutionInput): Promise<string> {
-      const explicit = rootFrom({ flag: input.flagRoot, env });
+      const explicit = rootFrom({
+        ...(input.flagRoot === undefined ? {} : { flag: input.flagRoot }),
+        env,
+        ...(input.sessionRoot === undefined ? {} : { session: input.sessionRoot }),
+      });
       if (explicit !== undefined) return explicit;
       let pending = cache.get(input.cwd);
       if (pending === undefined) {

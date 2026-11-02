@@ -1060,11 +1060,13 @@ The extension spawns `filer`, so the binary has to exist: `cargo install --path 
 
 | Setting | Flag | Environment | Fallback |
 | --- | --- | --- | --- |
-| binary | `--filer-bin PATH` | `FILER_BIN` | `filer` on `PATH` |
-| project root | `--filer-root DIR` | `FILER_ROOT` | `git rev-parse --show-toplevel`, then the session's working directory |
+| binary | `--filer-bin PATH` | `FILER_BIN` | `/filer bin`, then `filer` on `PATH` |
+| project root | `--filer-root DIR` | `FILER_ROOT` | `/filer root`, then `git rev-parse --show-toplevel`, then the session's working directory |
 
 Both flags are global to pi (`pi --filer-bin /opt/filer/filer`), and the root is what the CLI
 receives as `--root`. The git lookup runs at most once per working directory per session.
+A `/filer bin` or `/filer root` override sits between the environment and the fallback; the
+commands section below explains how those overrides persist.
 
 ### Cap and timeout
 
@@ -1081,8 +1083,27 @@ The extension parses the JSON surface directly, so it expects `schema_version` 1
 the binary together. Extension and binary ship as one version: a binary from a different
 release is a mismatch error, not half-parsed data.
 
-The tool set and the `/filer` commands are not registered in this installment (#41, #42);
-loading the extension today adds the two flags above.
+### Tools and commands
+
+The extension registers the eight `filer_*` tools (`bundle`, `show`, `search`, `deps`,
+`callers`, `why`, `refs`, `state`) and one `/filer` command with subcommands:
+
+| Command | Behavior |
+| --- | --- |
+| `/filer` | Subcommand list plus the resolved binary, root, branch and schema version |
+| `/filer bundle <seed...> [--depth N] [--reset]` | Runs `bundle` with `persist: true`, appends the markdown without a turn and reports `N units, M new` |
+| `/filer show [branch]` | Re-renders the saved bundle into the session |
+| `/filer state` | Branch and entries (`path`, `scope`, `depth`, `reason`) |
+| `/filer reset [--all]` | Clears the branch (or every branch) behind a confirmation |
+| `/filer index` | Coverage and language/file counts |
+| `/filer why <unit>` | `seed -> hop (line N) -> target` |
+| `/filer bin [path]` | Shows or sets the binary; a new path is verified with `--version` first |
+| `/filer root [path]` | Shows or sets the project root |
+
+`/filer bin` and `/filer root` are session overrides: they are appended as a
+`filer-overrides` entry and restored from the active branch on `session_start` and
+`session_tree`. The documented precedence still holds (`--filer-bin`/`FILER_BIN` over a
+session bin), and the status line shows `<units> units · <root>` after a bundle/show.
 
 ## How resolution works
 
