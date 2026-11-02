@@ -1,18 +1,12 @@
 # filer
 
-Select Java, Scala, Kotlin, Groovy, C#, Rust, TypeScript, JavaScript, Vue or Asset Control
-Formula Engine (`.fe`) code in Neovim, get one pastable markdown blob for your chat LLM —
+Select code in Neovim and get one pastable markdown blob for your chat LLM or coding agent —
 with the files your selection imports, and the files those import, already included.
 
-For `.fe` files the unit is the **function** you picked: `main.fe::riskValue` pulls in that
-function and the functions it calls, not the whole 20 000-line file. For Java a method can be
-the entry point too: the **file you seed stays complete**, and every file pulled in at
-depth 1+ keeps its class shell (package, imports, fields, constructors) with only the methods
-on the call path; everything else becomes a signature stub.
-
-You have a chat interface but no agentic workflow. `filer` covers the boring part: finding
-the three or four files that belong together and formatting them so the model sees the
-whole picture instead of a fragment.
+`filer` covers the boring part: finding the three or four files that belong together and
+formatting them so the model sees the whole picture instead of a fragment. The same
+selection is available as versioned JSON, so an agent can pull its own context instead of
+being pasted to.
 
 ```
 ┌─ Telescope: filer: symbols (demo) ───────────────────┐
@@ -33,10 +27,16 @@ whole picture instead of a fragment.
 
 ## What it does
 
-- Indexes `.java`, `.scala` / `.sbt` / `.sc`, `.kt` / `.kts`, `.groovy` / `.gradle`, `.cs`,
-  `.rs`, `.ts` / `.tsx`, `.js` / `.jsx` / `.mjs` / `.cjs`, `.vue` and `.fe` files under the
-  project root (tree-sitter based except `.fe`, which has a small hand-written parser; no LSP,
-  no classpath, no compiler).
+Supported languages: Java, Scala, Kotlin, Groovy, C#, Rust, TypeScript, JavaScript, Vue and
+`.fe`. Parsing is tree-sitter based (no LSP, no classpath, no compiler). Three tiers of
+support:
+
+| Tier | Languages | What you get |
+| --- | --- | --- |
+| Full | Java, Scala, Kotlin, Groovy, C#, Rust, TS/JS | import/`use`/module resolution, type-usage edges, call graph, `[file]`/`[class]`/`[method]` scopes |
+| Whole-file | Vue | `<script>` blocks parsed as TS/JS; never sliced |
+| Function-level | `.fe` | one project-wide namespace; calls resolved by name; function seeds |
+
 - Resolves package-style imports against the files that actually exist in your repo:
   Java `import a.b.C;` / `import static ...` / `import a.b.*;`, Scala 2 and 3 (selector
   lists, renames, `given`, comma-separated imports, nested or braced packages, package
@@ -57,9 +57,8 @@ whole picture instead of a fragment.
   their explicit imports instead of repo-wide name guessing.
 - Extracts **symbols** (top-level functions, classes, objects, global declarations, Rust
   structs/enums/traits/functions, Java methods) with their byte spans, so a bundle can carry
-  one function out of a huge file.
-  `.fe` functions are the primary use case: they call each other across a project-wide
-  namespace, exactly like the language's IntelliJ plugin resolves them. Class methods add a second one: class shell for context, call-path bodies for content.
+  one declaration out of a huge file. Class methods add a second granularity: class shell for
+  context, call-path bodies for content.
 - Every entry has an explicit **scope** — `file`, `symbol` or `methods` — so the picker,
   the state file and the renderer agree on what was included and why.
 - Walks the resulting graph to a configurable depth, then sorts what it found into a
@@ -73,6 +72,9 @@ whole picture instead of a fragment.
   old state automatically.
 - Renders the selection as markdown: header, file list with import depths, then one fenced
   block per file or excerpt. Fences grow automatically if a file already contains backticks.
+- Speaks JSON as well as markdown: spans, tokens, a budget report, diagnostics, coverage and
+  the provenance chain, with stable exit codes and `--quiet` for clean tool output. That is
+  the agent-facing contract; markdown is one consumer of it.
 - Caches the index in `~/.cache/filer/`, keyed by root path and invalidated per file by
   mtime + size. Re-indexing a 2000-file project takes ~40 ms, so the picker re-queries on
   every keystroke.
@@ -86,7 +88,7 @@ Things it deliberately does not do: compile your project, read `pom.xml` / `buil
 Scala stdlib, npm packages, NuGet packages, Rust crates and other third-party imports are
 simply reported as unresolved (`tsconfig` path aliases are not read). Imports only resolve
 within the same language family (JVM-ish languages with each other, TS/JS/Vue with each
-other, Rust with itself, FE with itself), never across.
+other, Rust with itself), never across.
 
 ## Build
 
@@ -196,7 +198,7 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 | Command | Effect |
 | --- | --- |
 | `:FilerSearch` | Telescope picker of bundle scopes: `[file]` for every file, `[class]`/`[method]` for class-based languages, `[type]`/`[function]` elsewhere. `<Tab>` multi-selects, `<CR>` bundles. |
-| `:FilerHere` | Bundles the current buffer with its closure. In a `.fe` file the function under the cursor is the seed; in Java, Kotlin, Scala, Groovy, C#, Rust and TS/JS, the method under the cursor (or its class); elsewhere the whole file. `:FilerHere!` asks for a depth first. |
+| `:FilerHere` | Bundles the current buffer with its closure. The declaration under the cursor is the seed — the enclosing method or class, or the whole file when nothing more specific applies. `:FilerHere!` asks for a depth first. |
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute) or excerpts (`path::Symbol`). `:FilerBundle! …` asks for a depth first. |
 | `:FilerDepth [n]` | With no argument, shows the current depth; with `n`, uses it for every following bundle; `:FilerDepth reset` restores the `setup` value. |
 | `:FilerShow [branch]` | Re-renders the saved bundle (current file contents) without re-resolving. |
@@ -232,7 +234,7 @@ each language exposes only the ones it has.
 
 | Scope | Languages | Rendered | Closure |
 | --- | --- | --- | --- |
-| `file` | all but `.fe` | the whole file | Java/Rust: the calls of every method or function in the file; others: the import/type closure |
+| `file` | all but function-level languages | the whole file | Java/Rust: the calls of every method or function in the file; others: the import/type closure |
 | `symbol` | all parsed languages (Vue stays whole-file) | one top-level declaration plus the file header | class/type: the calls of its methods; other symbols: the symbol closure |
 | `methods` | Java, Kotlin, Groovy, C#, Scala, Rust, TS/JS | class/type shell plus the listed methods; the rest as signature stubs | the seed method(s) and their calls |
 
@@ -252,10 +254,10 @@ filer --root ~/code/demo bundle --at-line 120 app/Service.java         # scope o
 `--at-line` picks the scope of the line: a method inside a method, the class on a field,
 constructor or header, and the whole file on a package/import/blank line before the class.
 
-`.fe` is function-granular and deliberately has **no `[file]` row**: one `.fe` file can hold
-thousands of functions, so a whole-file row would drown the picker (the CLI still accepts a
-file path). Vue files and files without parsed symbols are whole-file. Everything else gains
-a `[file]` row, so the whole file is always selectable explicitly.
+Function-level languages deliberately have **no `[file]` row**: one file can hold thousands
+of functions, so a whole-file row would drown the picker (the CLI still accepts a file path).
+Vue files and files without parsed symbols are whole-file. Everything else gains a `[file]`
+row, so the whole file is always selectable explicitly.
 
 ### Member scopes: class shell + call path
 
@@ -315,32 +317,23 @@ you get the files that are actually called, nothing else. `--with-same-package` 
 whole-class expansion and is not applied to that minimal path. A Java file without parsed
 symbols (and every other language) keeps the import/type closure.
 
-### Other languages
+### Language notes
 
-- `.fe` has no imports and no packages. Functions and top-level `global` declarations live in
-  one project-wide namespace, so a call `clamp(...)` pulls in the file that defines `clamp`;
-  `local` names, parameters, loop variables and built-ins (`len`, `dict_get`, `ts`, …) are
-  ignored. Ambiguous names are dropped rather than guessed. Top-level declarations are
-  selectable excerpts too.
-- An FE function seed pulls in the functions it calls and the top-level declarations it
-  references, to `--depth`.
-- TypeScript/JavaScript classes get the same `[class]`/`[method]` tiers. Type annotations on
-  fields, parameters and locals type the receivers, and module imports (`./Repo`) resolve the
-  classes. JavaScript has no annotations, so only `this.x()` and bare calls create edges.
-- Rust structs/enums/traits get the same `[class]`/`[method]` tiers. Methods from every
-  `impl Type` block in a file are attached to the type; `self`, `self.field`, parameter and
-  local types resolve receivers, `Self::`/`Type::` resolve associated calls, and free
-  functions resolve by unique name across the crate. `use crate/self/super` paths and
-  `mod` declarations follow the Cargo module layout.
-- Vue stays whole-file: its script offsets are relative to the extracted `<script>` block, so
-  `.vue` is never sliced.
+- TS/JS: type annotations on fields, parameters and locals type receivers, and module imports
+  (`./Repo`) resolve classes. JavaScript has no annotations, so only `this.x()` and bare calls
+  create edges.
+- Rust: methods from every `impl Type` block attach to the type; `self`, `self.field`,
+  parameter and local types resolve receivers; `Self::`/`Type::` resolve associated calls;
+  free functions resolve by unique name across the crate.
+- Vue is never sliced: its script offsets are relative to the extracted `<script>` block, so
+  it is always bundled whole.
 
 Excerpts are rendered as `### path :: name (line N)` and contain the declaration plus the
 file header (package/imports/`using`s, one time) so they stand alone. Braces left open by
 a block namespace are closed at the end.
 
-The seed under the cursor is what `:FilerHere` uses: in a `.fe` buffer the function under the
-cursor, in a class-based language the method or class, elsewhere the whole file.
+The seed is the declaration under the cursor: the enclosing method or class, or the whole file
+when nothing more specific applies.
 
 ## Bundle state
 
@@ -625,8 +618,8 @@ combined; reading that list is a plain file read — filer never runs `git`, so
 `git diff --name-only | filer bundle --seeds-from -` is your own pipeline.
 Default depth is 2. Global flags: `--json`, `--quiet`, `--include GLOB`, `--exclude GLOB`,
 `--no-ignore`, `--session ID` (see below and [Sessions](#sessions-one-state-file-per-agent)),
-`--roots DIR[,DIR]` (see below). Add `::Symbol` for one declaration and `::Class.method` for a Java or
-Rust method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
+`--roots DIR[,DIR]` (see below).
+Add `::Symbol` for one declaration and `::Class.method` for a Java or Rust method scope:
 `filer --root ~/code/demo bundle 'app/Service.java::Service.used'`,
 `filer --root ~/code/demo bundle 'src/app/service.rs::Service.used'`.
 `--with-config` adds, when they exist: `pom.xml`, the Gradle files, `build.sbt` /
@@ -694,8 +687,9 @@ Empty results print `[]` with `--json` and exit `4`, like `search`.
 
 ### JSON surface
 
-The JSON form is the stable product; markdown is one consumer of the same data. Every JSON
-output covered here (`search`, `deps`, `bundle`, `show`, `index`) carries `schema_version: 1`:
+The JSON form is the stable product and the surface an agent drives; markdown is one
+consumer of the same data. Every JSON output covered here (`search`, `deps`, `bundle`,
+`show`, `index`) carries `schema_version: 1`:
 
 ```sh
 filer --root ~/code/demo --json search --query Service   # JSON lines, one row per unit
@@ -867,8 +861,7 @@ $ filer --root ~/code/demo search --query 'discount rounding' --json
 ```
 
 The picker scores FQN, relative path and symbol/member names only — never fields,
-parameters, locals, imports, comments or bodies. `.fe` calls and top-level declarations are
-matched by name too, but file contents are not searched.
+parameters, locals, imports, comments or bodies. File contents are not searched.
 
 `--quiet` (global) suppresses the trailing `filer: N units, M new on this run` summary,
 the `dropping ...` notices and the diagnostic notes (unresolved imports, unknown
@@ -887,7 +880,7 @@ Every command builds the same index, so the filter is global:
   - a glob containing `/` is matched against the project-relative path and is anchored at
     the root: `--include 'src/**'`, `--exclude '**/legacy/**'`;
   - a glob without `/` is matched against the file name at any depth, like the same line in a
-    `.gitignore`: `--include '*.fe'`, `--exclude '*.gen.java'`;
+    `.gitignore`: `--include '*.kt'`, `--exclude '*.gen.java'`;
   - `*` stays inside one path segment (`src/*.java` does not reach `src/app/Service.java`),
     `**` crosses segments, and `--exclude` wins over `--include`;
   - globs filter files, never directories: nothing is pruned behind your back.
@@ -964,10 +957,7 @@ run. `filer index --update` never resolves, bundles or touches the bundle state.
 3. Build `fqn -> files`, `package -> files`, simple-name and `symbol -> (file, index)` maps.
    A name can exist in several languages, so lookups are filtered by language family:
    JVM-ish (Java, Scala, Kotlin, Groovy, C#) only resolve against each other, TS/JS/Vue only
-   against each other, Rust only against Rust, and Asset Control Formula Engine is its own
-   family with a single global namespace: calls and top-level declarations resolve by unique
-   name across `.fe` files (the IDE plugin's stub indexes do the same, and index a top-level
-   declaration whether it says `local` or `global`).
+   against each other, and Rust only against Rust.
 4. For a package-style import, try the full name, then trim trailing segments one at a time
    (`a.b.C.member` → `a.b.C`), which also covers nested types like `a.b.C.Inner` and Scala
    selectors / `given` imports. Wildcards expand to the package, or to the object/type they
@@ -1004,50 +994,22 @@ run. `filer index --update` never resolves, bundles or touches the bundle state.
 
 ## Adding another language
 
-`src/lang.rs` holds the language-neutral [`Source`](src/lang.rs) struct (`package`, `types`,
-`imports` with an `ImportKind`, `uses`, `symbols` with byte spans, `preamble_end`), the
-`Language` -> extension map and the `Language::family` grouping that keeps resolution
-between compatible languages only. The per-language modules (`java`, `scala`, `kotlin`,
-`groovy`, `csharp`, `rust`, `web`, `fe`) only translate their grammar into that struct. To add
-another package+import language: add a parser module returning `Source`, add an arm to
-`Language::from_path` and `SourceParser::parse`, and pick a fence string. Indexing, closure,
-state and rendering need no changes. A language with a different import model (like TS/JS
-module paths or Rust's `crate`/`self`/`super` paths) needs its own resolver branch in
-`src/resolve.rs` — that is where `ImportKind::Module` and `Family::Rust` are handled.
+`src/lang.rs` holds the language-neutral `Source` struct (`package`, `types`, `imports` with
+an `ImportKind`, `uses`, `symbols` with byte spans, `preamble_end`), the `Language` →
+extension map, and the `Language::family` grouping that keeps resolution between compatible
+languages only. Each per-language module (`java`, `scala`, `kotlin`, `groovy`, `csharp`,
+`rust`, `web`) only translates its grammar into that struct.
+
+To add another package+import language:
+
+1. Add a parser module that returns `Source`.
+2. Add an arm to `Language::from_path` and to the parser dispatch.
+3. Pick the markdown fence string.
+
+Indexing, closure, state and rendering need no changes. A language with a different import
+model (TS/JS module paths, Rust's `crate`/`self`/`super` paths) needs its own resolver branch
+in `src/resolve.rs` — that is where `ImportKind::Module` and `Family::Rust` are handled.
 
 Populating `symbols` is optional: use `symbol_from_node` for a tree-sitter declaration (it
 extends the span over the doc comment and records the line) and `finish_symbols` to assign
-per-symbol uses. Return no symbols and the language keeps whole-file bundling. `.fe` is the
-opposite extreme: a hand-written lexer in `src/fe.rs` because no tree-sitter grammar exists
-and filer only needs function boundaries, not statements.
-
-## Layout
-
-```
-src/main.rs     CLI (search / bundle / deps / index)
-src/lang.rs     language detection, families, Source/Import model, parser dispatch
-src/java.rs     tree-sitter-java parsing, members/calls for pruning + tests
-src/scala.rs    tree-sitter-scala parsing, import normalization + tests
-src/kotlin.rs   tree-sitter-kotlin parsing + tests
-src/groovy.rs   tree-sitter-groovy parsing + tests
-src/csharp.rs   tree-sitter-c-sharp parsing (namespaces, usings) + tests
-src/rust.rs     tree-sitter-rust parsing (use/mod, items, impl methods) + tests
-src/web.rs      TypeScript/JavaScript parsing, Vue SFC extraction + tests
-src/fe.rs       Asset Control Formula Engine lexer/parser + tests
-src/index.rs    tree walk, parallelism, disk cache
-src/resolve.rs  import resolution, closure, tests
-src/bundle.rs   markdown + JSON surface, class-shell pruning + tests
-src/schema.rs   wire-format version shared by every JSON output
-src/state.rs    TOML bundle state, branch detection, tests
-lua/filer/      Neovim plugin: picker, bundling, bundle buffer
-plugin/filer.lua user commands
-examples/lazyvim.lua  copy-paste LazyVim spec with the defaults above
-```
-
-`cargo test` covers parsing for every language (packages/namespaces, Scala import forms,
-Kotlin/Groovy/C# imports, Rust use/mod and impl methods, TS/JS module specifiers, Vue
-scripts, FE functions/declarations), static/wildcard/module resolution, family isolation,
-name inference without imports, closure
-depth, same-package expansion, symbol extraction and symbol closure (including depth bounds
-and whole-file supersession), preamble brace balancing, fence selection, TOML round-trips
-with `symbol` entries, and branch staleness.
+per-symbol uses. Return no symbols and the language keeps whole-file bundling.
