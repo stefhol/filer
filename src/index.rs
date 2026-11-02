@@ -7,13 +7,16 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
-use walkdir::{DirEntry, WalkDir};
 
 use crate::atomic;
+use crate::filter::Filter;
 use crate::lang::{end_line_of, Import, Language, Member, SourceParser, Symbol};
 
-const SKIP_DIRS: &[&str] = &[
+/// Build output and tool caches, skipped even with `--no-ignore`: they are never
+/// source, and walking them is what makes a first index slow.
+pub const SKIP_DIRS: &[&str] = &[
     ".git",
     ".gradle",
     ".idea",
@@ -134,9 +137,18 @@ pub struct Index {
 }
 
 impl Index {
+    /// The default view: `.gitignore` honored, no `--include`/`--exclude`.
+    /// Only the in-crate tests build an unfiltered index without a [`Filter`].
+    #[cfg(test)]
     pub fn build(root: &Path) -> Index {
+        Index::build_with(root, &Filter::default())
+    }
+
+    /// The filtered view of the tree: ignore files plus the caller's globs
+    /// decide which paths exist as far as every other command is concerned.
+    pub fn build_with(root: &Path, filter: &Filter) -> Index {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let paths = collect_source_files(&root);
+        let paths = collect_source_files(&root, filter);
 
         let mut cache = Cache::load(&root);
         let stale: HashMap<String, CacheEntry> = cache
@@ -191,20 +203,36 @@ impl Index {
             }
         }
 
-        Cache::store(&root, &index);
+        Cache::store(&root, &index, &stale);
         index
     }
 }
 
-fn collect_source_files(root: &Path) -> Vec<PathBuf> {
-    WalkDir::new(root)
+fn collect_source_files(root: &Path, filter: &Filter) -> Vec<PathBuf> {
+    let mut builder = WalkBuilder::new(root);
+    builder
         .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !is_skipped(entry))
+        // Dot directories still hold sources in some projects; only ignore files
+        // and `SKIP_DIRS` remove paths.
+        .hidden(false)
+        // Ignore files belong to the project root, not to whatever directory the
+        // user happens to call filer from.
+        .parents(false)
+        // `.gitignore` is honored in a plain directory too, not only in a repo.
+        .require_git(false)
+        .ignore(filter.ignore_files())
+        .git_ignore(filter.ignore_files())
+        .git_global(filter.ignore_files())
+        .git_exclude(filter.ignore_files());
+    builder.filter_entry(|entry| !is_skipped(entry));
+
+    builder
+        .build()
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
         .map(|entry| entry.into_path())
         .filter(|path| Language::from_path(path).is_some())
+        .filter(|path| filter.allows(&relative(root, path)))
         .collect()
 }
 
@@ -212,7 +240,7 @@ fn is_skipped(entry: &DirEntry) -> bool {
     if entry.depth() == 0 {
         return false;
     }
-    if entry.file_type().is_dir() {
+    if entry.file_type().is_some_and(|kind| kind.is_dir()) {
         let name = entry.file_name().to_string_lossy();
         return SKIP_DIRS.contains(&name.as_ref());
     }
@@ -404,11 +432,16 @@ impl Cache {
         }
     }
 
-    fn store(root: &Path, index: &Index) {
+    /// Writes the parsed entries, then carries over the previous run's entries
+    /// for files this run did not walk. A path hidden by a `.gitignore` edit or by
+    /// `--include`/`--exclude` keeps its parse memo (it is only ever used when the
+    /// path is walked again, and mtime+size still decide whether it is valid), so
+    /// un-hiding it costs no parse. A file that no longer exists is dropped.
+    fn store(root: &Path, index: &Index, stale: &HashMap<String, CacheEntry>) {
         let Some(path) = cache_path(root) else {
             return;
         };
-        let entries = index
+        let mut entries: Vec<CacheEntry> = index
             .files
             .iter()
             .filter_map(|file| {
@@ -433,6 +466,15 @@ impl Cache {
                 })
             })
             .collect();
+
+        let current: std::collections::HashSet<&str> =
+            index.files.iter().map(|file| file.rel.as_str()).collect();
+        for (rel, entry) in stale {
+            if !current.contains(rel.as_str()) && fs::metadata(root.join(rel)).is_ok() {
+                entries.push(entry.clone());
+            }
+        }
+
         let cache = Cache {
             version: CACHE_VERSION,
             root: root.to_string_lossy().to_string(),

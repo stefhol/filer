@@ -5,6 +5,7 @@ mod bundle;
 mod csharp;
 mod error;
 mod fe;
+mod filter;
 mod groovy;
 mod index;
 mod java;
@@ -24,6 +25,7 @@ use clap::{Args, Parser, Subcommand};
 
 use bundle::{BundleFile, BundleOptions};
 use error::{FilerError, EXIT_EMPTY, EXIT_INTERNAL};
+use filter::Filter;
 use index::{FileEntry, Index};
 use lang::{Granularity, Language, Member, MemberKind, Symbol, SymbolKind};
 use resolve::{build_graph, drop_covered_symbols, Reason, ResolveOptions, Unit};
@@ -49,6 +51,19 @@ struct Cli {
     /// Suppress progress summaries and non-fatal warnings on stderr.
     #[arg(long, global = true)]
     quiet: bool,
+
+    /// Only index files matching this glob. Repeatable; a pattern without `/`
+    /// matches the file name at any depth, so `--include '*.fe'` works.
+    #[arg(long, global = true, value_name = "GLOB")]
+    include: Vec<String>,
+
+    /// Leave out files matching this glob. Repeatable, wins over `--include`.
+    #[arg(long, global = true, value_name = "GLOB")]
+    exclude: Vec<String>,
+
+    /// Do not honor `.gitignore`, `.ignore` or `core.excludesFile` when walking.
+    #[arg(long, global = true)]
+    no_ignore: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -240,9 +255,17 @@ fn main() {
         // --help / --version are successful output, not errors.
         Err(error) => error.exit(),
     };
+    let filter = match Filter::new(&cli.include, &cli.exclude, !cli.no_ignore) {
+        Ok(filter) => filter,
+        Err(error) => {
+            error.emit(cli.json);
+            std::process::exit(error.code.exit_code());
+        }
+    };
     let context = Context {
         json: cli.json,
         quiet: cli.quiet,
+        filter,
     };
     match run(&context, cli.root, cli.command) {
         // A successful run that produced nothing: exit 4 without stderr noise.
@@ -255,12 +278,14 @@ fn main() {
     }
 }
 
-/// Global output switches shared by every command.
+/// Global output switches and the index view shared by every command.
 struct Context {
     /// `--json`: errors are envelopes, `search` hints at an empty result.
     json: bool,
     /// `--quiet`: no summaries and no soft warnings on stderr.
     quiet: bool,
+    /// `--include`/`--exclude`/`--no-ignore`: which files exist for this run.
+    filter: Filter,
 }
 
 impl Context {
@@ -382,7 +407,7 @@ fn granularity_of(file: &FileEntry) -> Granularity {
 }
 
 fn search(root: &Path, args: SearchArgs, context: &Context) -> Result<bool, FilerError> {
-    let index = Index::build(root);
+    let index = Index::build_with(root, &context.filter);
     let branch = args
         .branch
         .clone()
@@ -663,8 +688,8 @@ fn read_source(file: &FileEntry) -> Result<Vec<u8>, FilerError> {
 }
 
 /// `filer resolve app.Pricing.discount`: exact FQN lookup, never fuzzy.
-fn resolve_cmd(root: &Path, args: ResolveArgs, _context: &Context) -> Result<bool, FilerError> {
-    let index = Index::build(root);
+fn resolve_cmd(root: &Path, args: ResolveArgs, context: &Context) -> Result<bool, FilerError> {
+    let index = Index::build_with(root, &context.filter);
     let fqn = args.fqn.trim();
     for file in &index.files {
         for symbol in &file.symbols {
@@ -690,8 +715,8 @@ fn resolve_cmd(root: &Path, args: ResolveArgs, _context: &Context) -> Result<boo
 }
 
 /// `filer locate --at-line 61 src/Pricing.java`: line -> the unit that owns it.
-fn locate_cmd(root: &Path, args: LocateArgs, _context: &Context) -> Result<bool, FilerError> {
-    let index = Index::build(root);
+fn locate_cmd(root: &Path, args: LocateArgs, context: &Context) -> Result<bool, FilerError> {
+    let index = Index::build_with(root, &context.filter);
     let root = index.root.clone();
     let Some(rel) = locate(&index, &root, &args.file) else {
         return Err(FilerError::file_not_found(format!(
@@ -833,7 +858,7 @@ fn score(fqn: &str, rel: &str, names: &[String], query: &str, tokens: &[&str]) -
 }
 
 fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), FilerError> {
-    let index = Index::build(root);
+    let index = Index::build_with(root, &context.filter);
     let root = index.root.clone();
     let state_path = args.state.clone();
 
@@ -922,6 +947,14 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
             continue;
         };
         let Some(&position) = index.by_rel.get(&rel) else {
+            // Not walked: outside the root, filtered out, or not a source file.
+            // The text is still bundled as-is, but a supported extension means
+            // the path was hidden from the index and the caller should know.
+            if Language::from_path(Path::new(&rel)).is_some() {
+                context.warn(format!(
+                    "{rel} is not in the index (ignored, filtered or skipped); bundling the file as-is"
+                ));
+            }
             extras.push(BundleFile::whole(
                 rel.clone(),
                 root.join(&rel),
@@ -1230,7 +1263,7 @@ fn offset_of_line(source: &str, line: usize) -> usize {
 }
 
 fn deps(root: &Path, args: DepsArgs, context: &Context) -> Result<(), FilerError> {
-    let index = Index::build(root);
+    let index = Index::build_with(root, &context.filter);
     let root = index.root.clone();
     let seed = resolve_unit(&index, &root, &args.file)?;
     let seeds = [seed.clone()];
@@ -1454,7 +1487,7 @@ fn bundle_units(index: &Index, bundle: &BranchBundle) -> Vec<(Unit, u32, Reason)
 }
 
 fn callers_cmd(root: &Path, args: CallersArgs, context: &Context) -> Result<bool, FilerError> {
-    let index = Index::build(root);
+    let index = Index::build_with(root, &context.filter);
     let root = index.root.clone();
     let target = resolve_unit(&index, &root, &args.unit)?;
     let found = resolve::callers(&index, &target, args.depth);
@@ -1493,7 +1526,7 @@ fn callers_cmd(root: &Path, args: CallersArgs, context: &Context) -> Result<bool
 }
 
 fn why_cmd(root: &Path, args: WhyArgs, context: &Context) -> Result<bool, FilerError> {
-    let index = Index::build(root);
+    let index = Index::build_with(root, &context.filter);
     let root = index.root.clone();
     let target = resolve_unit(&index, &root, &args.unit)?;
     let path = args
@@ -1650,7 +1683,7 @@ fn why_cmd(root: &Path, args: WhyArgs, context: &Context) -> Result<bool, FilerE
 }
 
 fn refs_cmd(root: &Path, args: RefsArgs, context: &Context) -> Result<bool, FilerError> {
-    let index = Index::build(root);
+    let index = Index::build_with(root, &context.filter);
     let found = resolve::references(&index, &args.name);
 
     if found.is_empty() {
@@ -1696,7 +1729,7 @@ fn refs_cmd(root: &Path, args: RefsArgs, context: &Context) -> Result<bool, File
 /// Re-renders one branch's bundle from the state file: same files, same depths
 /// and reasons, current file contents.
 fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerError> {
-    let index = Index::build(root);
+    let index = Index::build_with(root, &context.filter);
     let root = index.root.clone();
     let path = args
         .state
@@ -1907,7 +1940,7 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
 }
 
 fn index_cmd(root: &Path, context: &Context) {
-    let index = Index::build(root);
+    let index = Index::build_with(root, &context.filter);
     let path = state::default_path(&index.root);
     let branch = state::current_branch(&index.root);
     let doc = state::load(&path);

@@ -457,7 +457,8 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C
 
 `bundle` flags: `--depth N` (0 = only the given units), `--with-same-package`,
 `--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`, `--at-line N`.
-Default depth is 2. Global flags: `--json`, `--quiet` (see below). Add `::Symbol` for one declaration and `::Class.method` for a Java or
+Default depth is 2. Global flags: `--json`, `--quiet`, `--include GLOB`, `--exclude GLOB`,
+`--no-ignore` (see below). Add `::Symbol` for one declaration and `::Class.method` for a Java or
 Rust method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
 `filer --root ~/code/demo bundle 'app/Service.java::Service.used'`,
 `filer --root ~/code/demo bundle 'src/app/service.rs::Service.used'`.
@@ -695,11 +696,35 @@ the `dropping ...` notices and the diagnostic notes (unresolved imports, unknown
 receivers, skipped type-only dependencies, ...). Hard errors still print. A successful
 `bundle --quiet` writes nothing to stderr; the same information stays in `bundle --json`.
 
+### What gets indexed: ignore files and globs
+
+Every command builds the same index, so the filter is global:
+
+- `.gitignore`, `.git/info/exclude`, the global `core.excludesFile` and `.ignore` files are
+  honored by default — a plain directory works too, `git` is not required and nothing is
+  shelled out. `--no-ignore` turns that layer off for one run. The build/cache directories
+  below stay skipped either way.
+- `--include GLOB` / `--exclude GLOB` (repeatable) narrow the view further:
+  - a glob containing `/` is matched against the project-relative path and is anchored at
+    the root: `--include 'src/**'`, `--exclude '**/legacy/**'`;
+  - a glob without `/` is matched against the file name at any depth, like the same line in a
+    `.gitignore`: `--include '*.fe'`, `--exclude '*.gen.java'`;
+  - `*` stays inside one path segment (`src/*.java` does not reach `src/app/Service.java`),
+    `**` crosses segments, and `--exclude` wins over `--include`;
+  - globs filter files, never directories: nothing is pruned behind your back.
+- The filter is part of the index, not a post-filter. `search` shows the filtered view,
+  `deps`/`callers`/`why` resolve only inside it, and a hidden path is `not_indexed` (exit 3).
+  `bundle` still bundles an explicitly named filtered-out file — argv is the caller's
+  literal input — and warns that the file is outside the index.
+- The cache follows: a path leaves the index as soon as it is ignored or excluded, while its
+  parse memo survives if the file still exists, so un-ignoring it costs no re-parse.
+
 ## How resolution works
 
 1. Walk the tree, skipping `.git`, `.gradle`, `.idea`, `.filer`, `.venv`, `.next`, `.nuxt`,
    `.output`, `.turbo`, `.svelte-kit`, `target`, `build`, `out`, `bin`, `dist`, `coverage`
-   and `node_modules`.
+   and `node_modules`, plus whatever `.gitignore`/`.ignore` hides (see above; `--no-ignore`
+   opts out).
 2. Parse each file with the tree-sitter grammar for its extension (`src/lang.rs`; Vue uses
    the TypeScript grammar on its `<script>` blocks). Java types are
    classes/interfaces/enums/records/annotations; Scala adds objects, traits and top-level
