@@ -1,10 +1,10 @@
 //! pi extension entry point.
 //!
-//! This installment only wires discovery: the two CLI flags and the adapter
-//! that every future tool and command calls. It deliberately registers no
-//! tools and no commands (#41 / #42) and starts no process — some pi
-//! invocations load extensions without a session, so the factory must stay
-//! side-effect free. The first `resolve()` happens on demand.
+//! It wires discovery (the two CLI flags and the adapter every tool and command
+//! calls), then registers the eight `filer_*` tools (#41) and the `/filer`
+//! command with its subcommands (#42). Registration starts no process — some pi
+//! invocations load extensions without a session, so the factory stays
+//! side-effect free and the first `resolve()` happens on demand.
 //!
 //! Everything below `index.ts` is pi-free at runtime (type-only imports), so
 //! `bun test` does not need the pi runtime.
