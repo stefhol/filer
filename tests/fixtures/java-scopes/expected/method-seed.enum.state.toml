@@ -1,0 +1,19 @@
+# filer bundle state — `:FilerReset` clears the current branch, `:FilerResetAll` everything
+root = "<root>"
+version = 3
+
+[[bundles]]
+name = "<branch>"
+created = <timestamp>
+depth = 2
+
+[[bundles.entries]]
+path = "src/main/java/com/example/method/Level.java"
+scope = "methods"
+symbol = "Level"
+methods = [
+    "scaled",
+    "weight",
+]
+depth = 0
+reason = "seed"
