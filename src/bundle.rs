@@ -130,15 +130,18 @@ struct UnitRender {
     rendered: bool,
     note: Option<&'static str>,
     span: Option<Span>,
+    /// BLAKE3 of the raw span, hex encoded (see [`span_hash`]).
+    hash: Option<String>,
 }
 
 impl UnitRender {
-    fn rendered(markdown: String, span: Span) -> Self {
+    fn rendered(markdown: String, span: Span, hash: String) -> Self {
         Self {
             markdown,
             rendered: true,
             note: None,
             span: Some(span),
+            hash: Some(hash),
         }
     }
 
@@ -148,12 +151,13 @@ impl UnitRender {
             rendered: false,
             note: Some(note),
             span: None,
+            hash: None,
         }
     }
 }
 
-/// One unit in the JSON surface. The first twelve fields are the wire contract
-/// (`path` .. `rendered`); `label` and `markdown` carry the exact strings the
+/// One unit in the JSON surface. The first thirteen fields are the wire
+/// contract (`path` .. `rendered`); `label` and `markdown` carry the exact strings the
 /// markdown renderer emits so consumers can rebuild it.
 pub struct BundleEntry {
     pub path: String,
@@ -167,6 +171,8 @@ pub struct BundleEntry {
     pub start_byte: Option<usize>,
     pub end_byte: Option<usize>,
     pub tokens: usize,
+    /// Hex BLAKE3 of the raw source span; `None` when the unit was omitted.
+    pub hash: Option<String>,
     pub rendered: bool,
     /// The `## Files` line for this unit, without the leading `- `.
     pub label: String,
@@ -227,6 +233,7 @@ impl RenderedBundle {
                     "start_byte": entry.start_byte,
                     "end_byte": entry.end_byte,
                     "tokens": entry.tokens,
+                    "hash": entry.hash,
                     "rendered": entry.rendered,
                     "label": entry.label,
                     "markdown": entry.markdown,
@@ -456,6 +463,7 @@ pub fn describe(index: &Index, files: &[BundleFile], options: &BundleOptions) ->
             Content::Single(_) => file.methods.iter().cloned().collect(),
         };
         let span = unit.span;
+        let hash = unit.hash;
         let (start_line, end_line, start_byte, end_byte) = match span {
             Some(span) => (
                 Some(span.start_line),
@@ -481,6 +489,7 @@ pub fn describe(index: &Index, files: &[BundleFile], options: &BundleOptions) ->
             start_byte,
             end_byte,
             tokens,
+            hash,
             rendered: unit.rendered,
             label,
             markdown: unit.markdown,
@@ -536,7 +545,8 @@ fn render_unit(index: &Index, file: &BundleFile, options: &BundleOptions) -> Uni
             start_line: 1,
             end_line: end_line_number(&bytes, bytes.len()),
         };
-        return UnitRender::rendered(markdown, span);
+        let hash = span_hash(&bytes, span.start_byte, span.end_byte);
+        return UnitRender::rendered(markdown, span, hash);
     };
 
     let Some(symbol_entry) = symbol_span(index, file, symbol) else {
@@ -585,15 +595,14 @@ fn render_unit(index: &Index, file: &BundleFile, options: &BundleOptions) -> Uni
     }
     markdown.push_str(&render_text(&text, language));
 
-    UnitRender::rendered(
-        markdown,
-        Span {
-            start_byte: start,
-            end_byte: end,
-            start_line: line,
-            end_line: symbol_entry.end_line.max(line),
-        },
-    )
+    let span = Span {
+        start_byte: start,
+        end_byte: end,
+        start_line: line,
+        end_line: symbol_entry.end_line.max(line),
+    };
+    let hash = span_hash(&bytes, start, end);
+    UnitRender::rendered(markdown, span, hash)
 }
 
 /// Reads the file unless it exceeds `max_file_bytes`. The second value is the
@@ -705,15 +714,22 @@ fn render_member_group(
     }
     markdown.push_str(&render_text(&format!("{prefix}{text}"), language));
 
-    UnitRender::rendered(
-        markdown,
-        Span {
-            start_byte: class.start,
-            end_byte: class.end,
-            start_line: line,
-            end_line: class.end_line.max(line),
-        },
-    )
+    let span = Span {
+        start_byte: class.start,
+        end_byte: class.end,
+        start_line: line,
+        end_line: class.end_line.max(line),
+    };
+    let hash = span_hash(&bytes, class.start, class.end);
+    UnitRender::rendered(markdown, span, hash)
+}
+
+/// BLAKE3 fingerprint of a byte span, hex encoded. This is a TOCTOU check
+/// between an agent reading a span and patching it, not a security boundary.
+pub fn span_hash(bytes: &[u8], start: usize, end: usize) -> String {
+    let end = end.min(bytes.len());
+    let start = start.min(end);
+    blake3::hash(&bytes[start..end]).to_hex().to_string()
 }
 
 fn render_text(content: &str, language: &str) -> String {

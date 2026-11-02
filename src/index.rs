@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::atomic;
-use crate::lang::{Import, Language, Member, SourceParser, Symbol};
+use crate::lang::{end_line_of, Import, Language, Member, SourceParser, Symbol};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -34,7 +34,7 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 15;
+const CACHE_VERSION: u32 = 16;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -55,6 +55,11 @@ pub struct FileEntry {
     /// End of the file header (license, package, imports): the first symbol's
     /// start. Prepended to each symbol excerpt so it stands alone.
     pub preamble_end: usize,
+    /// File size in bytes, cached so `search` can budget without a read.
+    pub size: u64,
+    /// 1-based line of the last byte, cached so `search` can budget without a
+    /// read.
+    pub end_line: usize,
 }
 
 impl FileEntry {
@@ -291,6 +296,8 @@ fn load_one(
                     uses: cached.uses.clone(),
                     symbols: cached.symbols.clone(),
                     preamble_end: cached.preamble_end,
+                    size: cached.size,
+                    end_line: cached.end_line,
                 },
             ));
         }
@@ -311,6 +318,8 @@ fn load_one(
             uses: parsed.uses,
             symbols: parsed.symbols,
             preamble_end: parsed.preamble_end,
+            size,
+            end_line: end_line_of(&source, 0, source.len()),
         },
     ))
 }
@@ -353,6 +362,8 @@ struct CacheEntry {
     symbols: Vec<Symbol>,
     #[serde(default)]
     preamble_end: usize,
+    #[serde(default)]
+    end_line: usize,
 }
 
 impl Cache {
@@ -418,6 +429,7 @@ impl Cache {
                     uses: file.uses.clone(),
                     symbols: file.symbols.clone(),
                     preamble_end: file.preamble_end,
+                    end_line: file.end_line,
                 })
             })
             .collect();
