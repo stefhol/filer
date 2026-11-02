@@ -203,6 +203,18 @@ pub struct Coverage {
     pub imports_unresolved: usize,
 }
 
+impl Coverage {
+    /// The one shape every envelope uses (`bundle`, `show`, `index`), so the
+    /// three cannot drift apart.
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "files_indexed": self.files_indexed,
+            "files_skipped": self.files_skipped,
+            "imports_unresolved": self.imports_unresolved,
+        })
+    }
+}
+
 /// The bundle as data. `markdown` and [`RenderedBundle::to_json`] are both
 /// derived from `entries`, so the two surfaces cannot describe different units.
 pub struct RenderedBundle {
@@ -318,11 +330,7 @@ impl RenderedBundle {
             "entries": entries,
             "omitted": omitted,
             "diagnostics": diagnostics,
-            "coverage": {
-                "files_indexed": self.coverage.files_indexed,
-                "files_skipped": self.coverage.files_skipped,
-                "imports_unresolved": self.coverage.imports_unresolved,
-            },
+            "coverage": self.coverage.to_json(),
             "state_toml": self.appendix,
         })
     }

@@ -2593,6 +2593,7 @@ fn index_cmd(root: &Path, args: IndexArgs, context: &Context) -> Result<(), File
                     "reused": index.reused_count,
                     "parsed": index.parsed_count,
                 },
+                "coverage": coverage(&index).to_json(),
                 "state": state,
             })
         );
@@ -2702,6 +2703,55 @@ fn update_cmd(root: &Path, inputs: &[String], context: &Context) -> Result<(), F
     Ok(())
 }
 
+/// One stored branch bundle as JSON: the envelope of `state --json`'s `current`.
+fn branch_bundle_json(bundle: &BranchBundle) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = bundle
+        .files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "path": file.path,
+                "scope": file.scope.as_str(),
+                "symbol": file.symbol,
+                "methods": file.methods,
+                "depth": file.depth,
+                "reason": file.reason,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "branch": bundle.name,
+        "created": bundle.created,
+        "depth": bundle.depth,
+        "entries": entries,
+    })
+}
+
+/// One row per stored branch, without the entries themselves.
+fn branch_row_json(bundle: &BranchBundle) -> serde_json::Value {
+    serde_json::json!({
+        "branch": bundle.name,
+        "label": state::branch_label(&bundle.name),
+        "entries": bundle.files.len(),
+        "created": bundle.created,
+        "depth": bundle.depth,
+    })
+}
+
+/// The `--json` result of a `state --clear` run: one object, `cleared` naming
+/// the branch removed, `"all"`, or `null` when there was nothing to clear.
+fn print_cleared(root: &Path, path: &Path, cleared: Option<&str>) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "root": root.to_string_lossy(),
+            "state_path": path.to_string_lossy(),
+            "cleared": cleared,
+        })
+    );
+}
+
 fn state_cmd(root: &Path, args: StateArgs, context: &Context) -> Result<(), FilerError> {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let path = args
@@ -2714,34 +2764,42 @@ fn state_cmd(root: &Path, args: StateArgs, context: &Context) -> Result<(), File
                 .map(|id| state::session_path(&canonical, id))
         })
         .unwrap_or_else(|| state::default_path(&canonical));
-    let current = state::current_branch(root);
+    let branch = state::current_branch(root);
 
     if args.all {
-        match state::clear(&path) {
-            Ok(true) => println!("filer: cleared every branch ({})", path.display()),
-            Ok(false) => println!("filer: no state at {}", path.display()),
-            Err(error) => {
-                return Err(FilerError::internal(format!(
-                    "cannot remove {}: {error}",
-                    path.display()
-                )));
-            }
+        let cleared = state::clear(&path).map_err(|error| {
+            FilerError::internal(format!("cannot remove {}: {error}", path.display()))
+        })?;
+        if context.json {
+            print_cleared(&canonical, &path, cleared.then_some("all"));
+        } else if cleared {
+            println!("filer: cleared every branch ({})", path.display());
+        } else {
+            println!("filer: no state at {}", path.display());
         }
         return Ok(());
     }
 
     if args.clear {
-        let target = args.branch.clone().unwrap_or_else(|| current.clone());
+        let target = args.branch.clone().unwrap_or_else(|| branch.clone());
         let Some(mut doc) = state::load(&path) else {
-            println!("filer: no state at {}", path.display());
+            if context.json {
+                print_cleared(&canonical, &path, None);
+            } else {
+                println!("filer: no state at {}", path.display());
+            }
             return Ok(());
         };
         if !doc.remove(&target) {
-            println!(
-                "filer: no bundle for {} in {}",
-                state::branch_label(&target),
-                path.display()
-            );
+            if context.json {
+                print_cleared(&canonical, &path, None);
+            } else {
+                println!(
+                    "filer: no bundle for {} in {}",
+                    state::branch_label(&target),
+                    path.display()
+                );
+            }
             return Ok(());
         }
         if let Err(error) = state::save(&path, &doc) {
@@ -2750,23 +2808,53 @@ fn state_cmd(root: &Path, args: StateArgs, context: &Context) -> Result<(), File
                 path.display()
             )));
         }
+        if context.json {
+            print_cleared(&canonical, &path, Some(&target));
+        } else {
+            println!(
+                "filer: cleared bundle for {} ({})",
+                state::branch_label(&target),
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let doc = state::load(&path);
+    let target = args.branch.clone().unwrap_or_else(|| branch.clone());
+
+    if context.json {
+        let bundles = doc
+            .as_ref()
+            .map(|doc| doc.bundles.as_slice())
+            .unwrap_or(&[]);
         println!(
-            "filer: cleared bundle for {} ({})",
-            state::branch_label(&target),
-            path.display()
+            "{}",
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "root": canonical.to_string_lossy(),
+                "state_path": path.to_string_lossy(),
+                "branch": branch,
+                "label": state::branch_label(&branch),
+                "exists": doc.is_some(),
+                "current": doc
+                    .as_ref()
+                    .and_then(|doc| doc.bundle(&target))
+                    .map(branch_bundle_json),
+                "branches": bundles.iter().map(branch_row_json).collect::<Vec<_>>(),
+            })
         );
         return Ok(());
     }
 
-    let Some(doc) = state::load(&path) else {
+    let Some(doc) = doc else {
         println!("filer: no state at {}", path.display());
         return Ok(());
     };
     println!("state:    {}", path.display());
-    println!("current:  {}", state::branch_label(&current));
+    println!("current:  {}", state::branch_label(&branch));
     println!("branches: {}", doc.bundles.len());
 
-    let target = args.branch.clone().unwrap_or_else(|| current.clone());
     let Some(bundle) = doc.bundle(&target) else {
         println!(
             "filer: no bundle for {} — stored: {}",
@@ -2810,15 +2898,7 @@ fn saved_bundle_json(root: &Path, path: &Path, branch: &str) -> serde_json::Valu
     let branches: Vec<serde_json::Value> = doc
         .iter()
         .flat_map(|doc| doc.bundles.iter())
-        .map(|bundle| {
-            serde_json::json!({
-                "branch": bundle.name,
-                "label": state::branch_label(&bundle.name),
-                "entries": bundle.files.len(),
-                "depth": bundle.depth,
-                "created": bundle.created,
-            })
-        })
+        .map(branch_row_json)
         .collect();
     let entries = doc
         .as_ref()
