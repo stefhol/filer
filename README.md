@@ -162,8 +162,9 @@ cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
 {
   "stefhol/filer",
   name = "filer",
-  cmd = { "FilerSearch", "FilerHere", "FilerBundle" },
+  cmd = { "FilerSearch", "FilerHere", "FilerBundle", "FilerDepth" },
   keys = {
+    { "<leader>fd", "<cmd>FilerDepth<cr>", desc = "filer: show depth" },
     { "<leader>fc", function() require("filer").search() end, desc = "filer: bundle for chat" },
     { "<leader>fh", function() require("filer").here() end, desc = "filer: bundle current file" },
     { "<leader>fC", function() require("filer").bundle({ vim.api.nvim_buf_get_name(0) }, { depth = 0 }) end, desc = "filer: bundle current file only" },
@@ -171,7 +172,7 @@ cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
   opts = {
     bin = nil,            -- $PATH (the release installer); set a path if not installed
     root = nil,           -- detect via .git / pom.xml / build.gradle(.kts) / build.sbt / ...
-    depth = 2,            -- import hops to follow
+    depth = 2,            -- import hops to follow; change live with :FilerDepth
     same_package = false, -- also pull in sibling files of the same package
     with_config = false,  -- also add pom.xml / gradle / build.sbt / tsconfig / csproj
     split = "vsplit",     -- or "split", "tabnew"
@@ -190,11 +191,25 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 | Command | Effect |
 | --- | --- |
 | `:FilerSearch` | Telescope picker of bundle scopes: `[file]` for every file, `[class]`/`[method]` for class-based languages, `[type]`/`[function]` elsewhere. `<Tab>` multi-selects, `<CR>` bundles. |
-| `:FilerHere` | Bundles the current buffer with its closure. In a `.fe` file the function under the cursor is the seed; in Java, Kotlin, Scala, Groovy, C#, Rust and TS/JS, the method under the cursor (or its class); elsewhere the whole file. |
-| `:FilerBundle {files}` | Bundles the given files (relative to root or absolute) or excerpts (`path::Symbol`). |
+| `:FilerHere` | Bundles the current buffer with its closure. In a `.fe` file the function under the cursor is the seed; in Java, Kotlin, Scala, Groovy, C#, Rust and TS/JS, the method under the cursor (or its class); elsewhere the whole file. `:FilerHere!` asks for a depth first. |
+| `:FilerBundle {files}` | Bundles the given files (relative to root or absolute) or excerpts (`path::Symbol`). `:FilerBundle! …` asks for a depth first. |
+| `:FilerDepth [n]` | With no argument, shows the current depth; with `n`, uses it for every following bundle; `:FilerDepth reset` restores the `setup` value. |
 | `:FilerShow [branch]` | Re-renders the saved bundle (current file contents) without re-resolving. |
 | `:FilerReset` | Forgets this branch's bundle; the next bundle starts empty. |
 | `:FilerResetAll` | Forgets every branch's bundle. |
+
+### Depth
+
+`depth` is how many import/symbol hops to follow — `0` bundles only the seeds. Set the
+starting value with `opts.depth` (default `2`), change it at runtime with `:FilerDepth 3`,
+and revert with `:FilerDepth reset`. Per-call overrides work from Lua and never touch the
+config:
+
+```lua
+require("filer").here({ depth = 0 })                     -- this file only
+require("filer").bundle({ "src/Service.java" }, { depth = 1 })
+require("filer").search({ depth = 4 })                   -- depth of the next pick
+```
 
 In the bundle buffer: `y` yanks, `q` closes. The buffer is `nofile` and never written to
 disk. Bundling again — picker or `:FilerHere` — refills that same window and buffer instead
