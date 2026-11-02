@@ -134,6 +134,8 @@ struct LocateArgs {
 #[derive(Args)]
 struct BundleArgs {
     /// Files to bundle, as paths relative to the root (or absolute paths).
+    /// Add `::Symbol` for one declaration and `::Class.method` for a method
+    /// scope, e.g. `app/Service.java::Service.used`.
     #[arg(required = true, value_name = "FILE")]
     files: Vec<String>,
     /// Import hops to follow. 0 bundles only the given files.
@@ -157,8 +159,8 @@ struct BundleArgs {
     /// Start from an empty bundle instead of the saved state.
     #[arg(long)]
     reset: bool,
-    /// Bundle the symbol under this 1-based line instead of the whole file
-    /// (used by `:FilerHere` inside a `.fe` file).
+    /// Bundle the symbol under this 1-based line instead of the whole file,
+    /// in any indexed language (used by `:FilerHere`).
     #[arg(long, value_name = "LINE")]
     at_line: Option<usize>,
 }
