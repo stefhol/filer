@@ -1,10 +1,12 @@
 -- Ready-to-use lazy.nvim spec (LazyVim and kickstart.nvim).
+-- The plugin is fetched from GitHub master; no local checkout is needed.
+-- Install the `filer` binary first with the release installer (see README), so
+-- it is on $PATH.
 -- LazyVim:   copy to ~/.config/nvim/lua/plugins/filer.lua
 -- kickstart: copy to ~/.config/nvim/lua/custom/plugins/filer.lua
--- Adjust `dir` to where this repo lives.
 return {
   {
-    dir = "~/Work/filer",
+    "stefhol/filer",
     name = "filer",
     -- Commands are defined by plugin/filer.lua, so lazy-loading on them is safe.
     cmd = { "FilerSearch", "FilerHere", "FilerBundle", "FilerShow", "FilerReset", "FilerResetAll" },
@@ -20,7 +22,7 @@ return {
       },
     },
     opts = {
-      -- Path to the binary. nil = $PATH, then this repo's target/{release,debug}/filer.
+      -- Path to the binary. nil = $PATH (where the release installer puts it).
       bin = nil,
       -- Project root. nil = detect via .git / pom.xml / build.gradle(.kts) / build.sbt / gradlew / mvnw.
       root = nil,

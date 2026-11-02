@@ -102,16 +102,19 @@ Tick *dry_run* to only compute and print the next version — nothing is committ
 released. (`dry_run` checks out the ref you dispatched on, so the button can be tested from a
 branch.)
 
-You can still release by hand: `git tag vX.Y.Z && git push origin vX.Y.Z` triggers the same
-release workflow, as long as `version` in `Cargo.toml` already matches the tag.
+You can still release by hand: bump `version` in `Cargo.toml`/`Cargo.lock`, commit, tag
+(`git tag vX.Y.Z`), push both, then dispatch the build with
+`gh workflow run release.yml -f tag=vX.Y.Z` (the workflow no longer fires on tag pushes).
 
 Every push to `master` also runs `.github/workflows/ci.yml` (fmt, clippy, tests) and uploads a
 `filer-x86_64-unknown-linux-gnu.tar.xz` workflow artifact kept for 90 days.
 
 ## Neovim setup
 
+Install the binary first with the [release installer](#install) (it lands on `$PATH`).
 The full, copy-paste spec lives in [`examples/lazyvim.lua`](examples/lazyvim.lua) — it
-already carries the defaults below. Drop it into your config and fix `dir`:
+already carries the defaults below and pulls the plugin straight from GitHub `master`, so no
+local checkout is needed. Drop it into your config:
 
 ```sh
 # LazyVim / lazy.nvim import dir:
@@ -122,7 +125,7 @@ cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
 
 ```lua
 {
-  dir = "~/Work/filer",
+  "stefhol/filer",
   name = "filer",
   cmd = { "FilerSearch", "FilerHere", "FilerBundle" },
   keys = {
@@ -131,7 +134,7 @@ cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
     { "<leader>fC", function() require("filer").bundle({ vim.api.nvim_buf_get_name(0) }, { depth = 0 }) end, desc = "filer: bundle current file only" },
   },
   opts = {
-    bin = nil,            -- $PATH, then this repo's target/{release,debug}/filer
+    bin = nil,            -- $PATH (the release installer); set a path if not installed
     root = nil,           -- detect via .git / pom.xml / build.gradle(.kts) / build.sbt / ...
     depth = 2,            -- import hops to follow
     same_package = false, -- also pull in sibling files of the same package

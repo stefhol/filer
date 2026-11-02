@@ -2,7 +2,7 @@
 local M = {}
 
 M.config = {
-  -- Path to the `filer` binary. nil = look up PATH, then this repo's target/.
+  -- Path to the `filer` binary. nil = $PATH, then a local checkout's target/.
   bin = nil,
   -- Project root. nil = detect from the current buffer (git/maven/gradle markers).
   root = nil,
@@ -90,7 +90,10 @@ function M.bin()
       return bin_cache
     end
   end
-  error("filer: binary not found. Run `cargo build --release` in " .. plugin_root .. " or set opts.bin")
+  error(
+    "filer: binary not found. Install it with the release installer "
+      .. "(https://github.com/stefhol/filer#install) or set opts.bin"
+  )
 end
 
 function M.setup(opts)
