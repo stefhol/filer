@@ -60,6 +60,12 @@ enum Command {
     Bundle(BundleArgs),
     /// Print the import closure of a single file.
     Deps(DepsArgs),
+    /// List the callers of one unit, nearest first.
+    Callers(CallersArgs),
+    /// Explain how a unit entered the saved bundle.
+    Why(WhyArgs),
+    /// Find indexed use and call sites of a name.
+    Refs(RefsArgs),
     /// Re-render the saved bundle from the state file.
     Show(ShowArgs),
     /// Build the index cache and print stats.
@@ -127,6 +133,36 @@ struct DepsArgs {
     /// Import hops to follow.
     #[arg(long, default_value_t = 2)]
     depth: u32,
+}
+
+#[derive(Args)]
+struct CallersArgs {
+    /// Unit to inspect: `path`, `path::Symbol` or `path::Class.method`.
+    #[arg(value_name = "UNIT")]
+    unit: String,
+    /// How many caller hops to follow. 1 = direct callers only.
+    #[arg(long, default_value_t = 1)]
+    depth: u32,
+}
+
+#[derive(Args)]
+struct WhyArgs {
+    /// Unit to explain: `path`, `path::Symbol` or `path::Class.method`.
+    #[arg(value_name = "UNIT")]
+    unit: String,
+    /// State file. Defaults to <root>/.filer/bundle.toml.
+    #[arg(long, value_name = "FILE")]
+    state: Option<PathBuf>,
+    /// Branch whose bundle is explained. Defaults to the current branch.
+    #[arg(long, value_name = "BRANCH")]
+    branch: Option<String>,
+}
+
+#[derive(Args)]
+struct RefsArgs {
+    /// Identifier to invert: a symbol/member name as the resolver records it.
+    #[arg(value_name = "NAME")]
+    name: String,
 }
 
 #[derive(Args)]
@@ -231,6 +267,9 @@ fn run(context: &Context, root: Option<PathBuf>, command: Command) -> Result<boo
         Command::Search(args) => search(&root, args, context),
         Command::Bundle(args) => bundle_cmd(&root, args, context).map(|()| false),
         Command::Deps(args) => deps(&root, args, context).map(|()| false),
+        Command::Callers(args) => callers_cmd(&root, args, context),
+        Command::Why(args) => why_cmd(&root, args, context),
+        Command::Refs(args) => refs_cmd(&root, args, context),
         Command::Show(args) => show_cmd(&root, args, context).map(|()| false),
         Command::Index => {
             index_cmd(&root);
@@ -1014,6 +1053,338 @@ fn deps(root: &Path, args: DepsArgs, context: &Context) -> Result<(), FilerError
     }
 
     Ok(())
+}
+
+/// Resolve a CLI unit argument (`path`, `path::Symbol`, `path::Class.method`)
+/// against the index, with the same seed rules `bundle` uses.
+fn resolve_unit(index: &Index, root: &Path, input: &str) -> Result<Unit, FilerError> {
+    let (path, symbol) = split_symbol(input);
+    let Some(rel) = locate(index, root, path) else {
+        return Err(FilerError::file_not_found(format!(
+            "{path} is not inside {}",
+            root.display()
+        )));
+    };
+    let Some(&position) = index.by_rel.get(&rel) else {
+        return Err(FilerError::not_indexed(format!(
+            "{rel} is not indexed (binary, skipped directory or unsupported language?)"
+        ))
+        .with_hint("run `filer index` to see what the index contains"));
+    };
+    match symbol {
+        Some(symbol) => seed_unit(index, position, symbol)
+            .ok_or_else(|| FilerError::symbol_not_found(&index.files[position].rel, symbol)),
+        None => Ok(Unit::File(position)),
+    }
+}
+
+/// Canonical `path`, `path::Symbol` or `path::Class.method` of a unit.
+fn unit_label(index: &Index, unit: &Unit) -> String {
+    let rel = index
+        .files
+        .get(unit.file())
+        .map(|file| file.rel.as_str())
+        .unwrap_or("");
+    match unit {
+        Unit::File(_) => rel.to_string(),
+        Unit::Symbol { symbol, .. } => format!("{rel}::{symbol}"),
+        Unit::Member { class, member, .. } => format!("{rel}::{class}.{member}"),
+    }
+}
+
+fn unit_scope(unit: &Unit) -> &'static str {
+    match unit {
+        Unit::File(_) => "file",
+        Unit::Symbol { .. } => "symbol",
+        Unit::Member { .. } => "methods",
+    }
+}
+
+/// The units recorded in one branch bundle, validated against the live index.
+fn bundle_units(index: &Index, bundle: &BranchBundle) -> Vec<(Unit, u32, Reason)> {
+    let mut units = Vec::new();
+    for file in &bundle.files {
+        let Some(&position) = index.by_rel.get(&file.path) else {
+            continue;
+        };
+        let depth = file.depth;
+        match file.scope {
+            Selection::File => {
+                units.push((Unit::File(position), depth, Reason::from_str(&file.reason)))
+            }
+            Selection::Symbol => {
+                if let Some(symbol) = &file.symbol {
+                    if index.files[position].symbol(symbol).is_some() {
+                        units.push((
+                            Unit::Symbol {
+                                file: position,
+                                symbol: symbol.clone(),
+                            },
+                            depth,
+                            Reason::from_str(&file.reason),
+                        ));
+                    }
+                }
+            }
+            Selection::Methods => {
+                let Some(class) = &file.symbol else {
+                    continue;
+                };
+                for member in &file.methods {
+                    units.push((
+                        Unit::Member {
+                            file: position,
+                            class: class.clone(),
+                            member: member.clone(),
+                        },
+                        depth,
+                        Reason::from_str(&file.reason),
+                    ));
+                }
+            }
+        }
+    }
+    units
+}
+
+fn callers_cmd(root: &Path, args: CallersArgs, context: &Context) -> Result<bool, FilerError> {
+    let index = Index::build(root);
+    let root = index.root.clone();
+    let target = resolve_unit(&index, &root, &args.unit)?;
+    let found = resolve::callers(&index, &target, args.depth);
+
+    if found.is_empty() {
+        if context.json {
+            println!("[]");
+        }
+        return Ok(true);
+    }
+
+    if context.json {
+        let rows: Vec<serde_json::Value> = found
+            .iter()
+            .map(|caller| {
+                serde_json::json!({
+                    "caller": unit_label(&index, &caller.unit),
+                    "line": caller.line,
+                    "depth": caller.depth,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!(rows));
+        return Ok(false);
+    }
+
+    for caller in &found {
+        println!(
+            "{}{} (line {})",
+            "  ".repeat(caller.depth.saturating_sub(1) as usize),
+            unit_label(&index, &caller.unit),
+            caller.line
+        );
+    }
+    Ok(false)
+}
+
+fn why_cmd(root: &Path, args: WhyArgs, context: &Context) -> Result<bool, FilerError> {
+    let index = Index::build(root);
+    let root = index.root.clone();
+    let target = resolve_unit(&index, &root, &args.unit)?;
+    let path = args
+        .state
+        .clone()
+        .unwrap_or_else(|| state::default_path(&root));
+    let Some(doc) = state::load(&path) else {
+        return Err(FilerError::new(
+            error::Code::StateNotFound,
+            format!("no bundle state at {}", path.display()),
+        )
+        .with_hint("bundle something first"));
+    };
+    let branch = args
+        .branch
+        .clone()
+        .unwrap_or_else(|| state::current_branch(&root));
+    let Some(bundle) = doc.bundle(&branch).cloned() else {
+        return Err(FilerError::new(
+            error::Code::BranchNotFound,
+            format!(
+                "no bundle for branch {} in {}",
+                state::branch_label(&branch),
+                path.display()
+            ),
+        )
+        .with_hint("`filer state` lists every branch with a bundle"));
+    };
+
+    let entries = bundle_units(&index, &bundle);
+    let target_entry = entries.iter().find(|(unit, _, _)| unit == &target).cloned();
+    let mut seeds: Vec<Unit> = entries
+        .iter()
+        .filter(|(_, _, reason)| *reason == Reason::Seed)
+        .map(|(unit, _, _)| unit.clone())
+        .collect();
+    if seeds.is_empty() {
+        seeds = entries
+            .iter()
+            .filter(|(_, depth, _)| *depth == 0)
+            .map(|(unit, _, _)| unit.clone())
+            .collect();
+    }
+    let max_depth = bundle
+        .depth
+        .max(target_entry.as_ref().map_or(0, |(_, depth, _)| *depth))
+        .max(1);
+
+    let mut chain = resolve::why(&index, &seeds, &target, max_depth);
+    if chain.is_none() {
+        // A whole-file or whole-class seed covers every unit inside it; there is
+        // no edge to walk when the target sits inside that seed.
+        if let Some((cover, _, Reason::Seed)) = entries.iter().find(|(unit, _, reason)| {
+            *reason == Reason::Seed
+                && match unit {
+                    Unit::File(file) => *file == target.file(),
+                    Unit::Symbol { file, symbol } => {
+                        *file == target.file() && target.symbol() == Some(symbol.as_str())
+                    }
+                    Unit::Member { .. } => false,
+                }
+        }) {
+            let mut hops = vec![resolve::WhyHop {
+                unit: cover.clone(),
+                line: 0,
+                reason: Reason::Seed,
+            }];
+            if cover != &target {
+                hops.push(resolve::WhyHop {
+                    unit: target.clone(),
+                    line: 0,
+                    reason: Reason::Seed,
+                });
+            }
+            chain = Some(hops);
+        }
+    }
+
+    let Some(chain) = chain else {
+        return Err(FilerError::new(
+            error::Code::SymbolNotFound,
+            format!(
+                "{} is not reachable from a seed in {}",
+                unit_label(&index, &target),
+                path.display()
+            ),
+        )
+        .with_hint("bundle the unit first, or pass --state/--branch"));
+    };
+
+    let reason = target_entry
+        .as_ref()
+        .map(|(_, _, reason)| *reason)
+        .or_else(|| chain.last().map(|hop| hop.reason))
+        .unwrap_or(Reason::Usage);
+    let depth = target_entry
+        .as_ref()
+        .map(|(_, depth, _)| *depth)
+        .unwrap_or(chain.len().saturating_sub(1) as u32);
+
+    if context.json {
+        let hops: Vec<serde_json::Value> = chain
+            .iter()
+            .enumerate()
+            .map(|(position, hop)| {
+                let recorded = entries.iter().find(|(unit, _, _)| unit == &hop.unit);
+                serde_json::json!({
+                    "unit": unit_label(&index, &hop.unit),
+                    "path": index.files.get(hop.unit.file()).map(|file| file.rel.clone()),
+                    "scope": unit_scope(&hop.unit),
+                    "symbol": hop.unit.symbol(),
+                    "member": hop.unit.member(),
+                    "line": if hop.line == 0 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(hop.line)
+                    },
+                    "reason": hop.reason.as_str(),
+                    "depth": recorded.map_or(position as u32, |(_, depth, _)| *depth),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "target": unit_label(&index, &target),
+                "reason": reason.as_str(),
+                "depth": depth,
+                "chain": hops,
+            })
+        );
+        return Ok(false);
+    }
+
+    println!(
+        "{} ({} at depth {})",
+        unit_label(&index, &target),
+        reason.as_str(),
+        depth
+    );
+    for (position, hop) in chain.iter().enumerate() {
+        if position == 0 {
+            println!("seed {}", unit_label(&index, &hop.unit));
+        } else {
+            println!(
+                "  -> {} ({} line {})",
+                unit_label(&index, &hop.unit),
+                hop.reason.as_str(),
+                hop.line
+            );
+        }
+    }
+    Ok(false)
+}
+
+fn refs_cmd(root: &Path, args: RefsArgs, context: &Context) -> Result<bool, FilerError> {
+    let index = Index::build(root);
+    let found = resolve::references(&index, &args.name);
+
+    if found.is_empty() {
+        if context.json {
+            println!("[]");
+        }
+        return Ok(true);
+    }
+
+    if context.json {
+        let rows: Vec<serde_json::Value> = found
+            .iter()
+            .map(|reference| {
+                serde_json::json!({
+                    "path": index.files[reference.file].rel,
+                    "symbol": reference.symbol,
+                    "member": reference.member,
+                    "line": reference.line,
+                    "kind": reference.kind.as_str(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!(rows));
+        return Ok(false);
+    }
+
+    for reference in &found {
+        let label = match &reference.member {
+            Some(member) => format!("{}.{member}", reference.symbol),
+            None => reference.symbol.clone(),
+        };
+        println!(
+            "{}:{} {} {}",
+            index.files[reference.file].rel,
+            reference.line,
+            reference.kind.as_str(),
+            label
+        );
+    }
+    Ok(false)
 }
 
 /// Re-renders one branch's bundle from the state file: same files, same depths

@@ -652,6 +652,53 @@ pub struct Diagnostic {
     pub name: String,
 }
 
+/// One incoming call edge found by [`callers`]. `line` is the call site in
+/// `unit` that invokes the queried unit. `depth` is 1 for a direct caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    pub unit: Unit,
+    pub line: u32,
+    pub depth: u32,
+}
+
+/// One hop of a [`why`] chain. `line` is 0 for the seed, otherwise the call
+/// site in the previous hop that pulled this unit in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhyHop {
+    pub unit: Unit,
+    pub line: u32,
+    pub reason: Reason,
+}
+
+/// Whether a [`Reference`] is a name use or a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefKind {
+    Use,
+    Call,
+}
+
+impl RefKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefKind::Use => "use",
+            RefKind::Call => "call",
+        }
+    }
+}
+
+/// One indexed site that mentions a name: the inverse of `Symbol.uses`,
+/// `Symbol.calls` and `Member.calls`. `line` is the call line for calls and
+/// the enclosing declaration line for uses (uses are stored per symbol, not
+/// per occurrence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    pub file: usize,
+    pub symbol: String,
+    pub member: Option<String>,
+    pub line: u32,
+    pub kind: RefKind,
+}
+
 #[derive(Debug, Default)]
 pub struct Graph {
     /// Outgoing edges for every expanded unit, in resolution order.
@@ -713,6 +760,266 @@ impl Graph {
         }
         drop_covered_symbols(order)
     }
+}
+
+/// Every unit that can record an outgoing call: one member unit per method,
+/// or one symbol unit for languages that keep calls on the symbol (Fe, Rust
+/// free functions). Whole-file units are only used for file-granularity files.
+fn call_units(index: &Index) -> Vec<Unit> {
+    let mut units = Vec::new();
+    for (position, file) in index.files.iter().enumerate() {
+        let granularity = file
+            .language()
+            .map(|language| language.granularity())
+            .unwrap_or(Granularity::File);
+        match granularity {
+            Granularity::File => units.push(Unit::File(position)),
+            Granularity::Function => {
+                for symbol in &file.symbols {
+                    units.push(Unit::Symbol {
+                        file: position,
+                        symbol: symbol.name.clone(),
+                    });
+                }
+            }
+            Granularity::Member => {
+                for symbol in &file.symbols {
+                    let methods: Vec<&Member> = symbol
+                        .members
+                        .iter()
+                        .filter(|member| member.kind == MemberKind::Method)
+                        .collect();
+                    if methods.is_empty() {
+                        units.push(Unit::Symbol {
+                            file: position,
+                            symbol: symbol.name.clone(),
+                        });
+                    } else {
+                        for member in methods {
+                            units.push(Unit::Member {
+                                file: position,
+                                class: symbol.name.clone(),
+                                member: member.name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    units
+}
+
+fn unit_sort_key(index: &Index, unit: &Unit) -> (String, String, String) {
+    (
+        index
+            .files
+            .get(unit.file())
+            .map(|file| file.rel.clone())
+            .unwrap_or_default(),
+        unit.symbol().unwrap_or("").to_string(),
+        unit.member().unwrap_or("").to_string(),
+    )
+}
+
+fn sort_edges(index: &Index, edges: &mut [&Edge]) {
+    edges.sort_by(|left, right| {
+        unit_sort_key(index, &left.to)
+            .cmp(&unit_sort_key(index, &right.to))
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+}
+
+/// Direct and transitive callers of `target`, nearest first. The graph is
+/// materialized one hop out of every call-recording unit in the index, then
+/// traversed over its reverse (`inc`) edges. Only `Reason::Call` edges count:
+/// an imported type is not a caller.
+pub fn callers(index: &Index, target: &Unit, max_depth: u32) -> Vec<Caller> {
+    if max_depth == 0 {
+        return Vec::new();
+    }
+    let seeds = call_units(index);
+    let mut graph = build_graph(
+        index,
+        &seeds,
+        ResolveOptions {
+            depth: 1,
+            same_package: false,
+            minimal: true,
+        },
+    );
+    let inc = graph.reverse();
+
+    let mut seen: HashMap<Unit, u32> = HashMap::new();
+    seen.insert(target.clone(), 0);
+    let mut queue: VecDeque<(Unit, u32)> = VecDeque::new();
+    queue.push_back((target.clone(), 0));
+    let mut found: Vec<Caller> = Vec::new();
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        let Some(edges) = inc.get(&current) else {
+            continue;
+        };
+        let mut edges: Vec<&Edge> = edges
+            .iter()
+            .filter(|edge| edge.reason == Reason::Call)
+            .collect();
+        sort_edges(index, &mut edges);
+        for edge in edges {
+            let next = depth + 1;
+            if let Some(&known) = seen.get(&edge.to) {
+                if known <= next {
+                    continue;
+                }
+            }
+            seen.insert(edge.to.clone(), next);
+            found.push(Caller {
+                unit: edge.to.clone(),
+                line: edge.line,
+                depth: next,
+            });
+            queue.push_back((edge.to.clone(), next));
+        }
+    }
+
+    found.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| unit_sort_key(index, &left.unit).cmp(&unit_sort_key(index, &right.unit)))
+            .then_with(|| left.line.cmp(&right.line))
+    });
+    found.dedup_by(|left, right| left.depth == right.depth && left.unit == right.unit);
+    found
+}
+
+/// Walk the reverse graph from `target` back to the nearest seed, returning the
+/// forward chain seed -> ... -> target. Each hop carries the call site that
+/// pulled it in; the seed has no call site.
+pub fn why(index: &Index, seeds: &[Unit], target: &Unit, max_depth: u32) -> Option<Vec<WhyHop>> {
+    let seed_set: HashSet<Unit> = seeds.iter().cloned().collect();
+    if seed_set.contains(target) {
+        return Some(vec![WhyHop {
+            unit: target.clone(),
+            line: 0,
+            reason: Reason::Seed,
+        }]);
+    }
+    let mut graph = build_graph(
+        index,
+        seeds,
+        ResolveOptions {
+            depth: max_depth,
+            same_package: false,
+            minimal: true,
+        },
+    );
+    let inc = graph.reverse();
+
+    // parent[caller] = (callee, line of caller -> callee, edge reason).
+    let mut parent: HashMap<Unit, (Unit, u32, Reason)> = HashMap::new();
+    let mut seen: HashSet<Unit> = HashSet::new();
+    seen.insert(target.clone());
+    let mut queue: VecDeque<Unit> = VecDeque::new();
+    queue.push_back(target.clone());
+
+    let mut from_seed: Option<Unit> = None;
+    while let Some(current) = queue.pop_front() {
+        if seed_set.contains(&current) {
+            from_seed = Some(current);
+            break;
+        }
+        let Some(edges) = inc.get(&current) else {
+            continue;
+        };
+        let mut edges: Vec<&Edge> = edges.iter().collect();
+        sort_edges(index, &mut edges);
+        for edge in edges {
+            if !seen.insert(edge.to.clone()) {
+                continue;
+            }
+            parent.insert(edge.to.clone(), (current.clone(), edge.line, edge.reason));
+            queue.push_back(edge.to.clone());
+        }
+    }
+
+    // Walking the reverse graph backwards left `parent[caller] = (callee,
+    // line, reason)` for every caller we reached, so the forward chain can be
+    // read from the seed towards the target.
+    let seed = from_seed?;
+    let mut chain: Vec<WhyHop> = vec![WhyHop {
+        unit: seed.clone(),
+        line: 0,
+        reason: Reason::Seed,
+    }];
+    let mut node = seed;
+    while node != *target {
+        let (next, line, reason) = parent.get(&node)?.clone();
+        chain.push(WhyHop {
+            unit: next.clone(),
+            line,
+            reason,
+        });
+        node = next;
+    }
+    Some(chain)
+}
+
+/// All indexed use/call sites of `name`, in deterministic path/line order.
+/// This is an inversion of the parser's recorded edges, not a text search:
+/// comments, string literals and body text are deliberately out of scope.
+pub fn references(index: &Index, name: &str) -> Vec<Reference> {
+    let mut found = Vec::new();
+    for (position, file) in index.files.iter().enumerate() {
+        for symbol in &file.symbols {
+            if symbol.uses.iter().any(|used| used == name) {
+                found.push(Reference {
+                    file: position,
+                    symbol: symbol.name.clone(),
+                    member: None,
+                    line: symbol.line as u32,
+                    kind: RefKind::Use,
+                });
+            }
+            for call in &symbol.calls {
+                if call.name == name {
+                    found.push(Reference {
+                        file: position,
+                        symbol: symbol.name.clone(),
+                        member: None,
+                        line: call.line as u32,
+                        kind: RefKind::Call,
+                    });
+                }
+            }
+            for member in &symbol.members {
+                for call in &member.calls {
+                    if call.name == name {
+                        found.push(Reference {
+                            file: position,
+                            symbol: symbol.name.clone(),
+                            member: Some(member.name.clone()),
+                            line: call.line as u32,
+                            kind: RefKind::Call,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    found.sort_by(|left, right| {
+        index.files[left.file]
+            .rel
+            .cmp(&index.files[right.file].rel)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+            .then_with(|| left.member.cmp(&right.member))
+            .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+    });
+    found
 }
 
 fn import_reason(kind: ImportKind) -> Reason {
@@ -2982,6 +3289,122 @@ mod tests {
             "{:?}",
             graph.diagnostics
         );
+    }
+
+    fn callers_fixture(name: &str) -> (std::path::PathBuf, Index) {
+        let root = index_from_disk(
+            name,
+            &[
+                (
+                    "app/Repo.java",
+                    "package app;\npublic class Repo {\n    public void size() {}\n}\n",
+                ),
+                (
+                    "app/Service.java",
+                    "package app;\npublic class Service {\n    private Repo repo;\n    public void used() {\n        repo.size();\n    }\n}\n",
+                ),
+                (
+                    "app/Controller.java",
+                    "package app;\npublic class Controller {\n    private Service service;\n    public void handle() {\n        service.used();\n    }\n}\n",
+                ),
+            ],
+        );
+        let index = crate::index::Index::build(&root);
+        (root, index)
+    }
+
+    fn member_pos(index: &Index, rel: &str, class: &str, member: &str) -> Unit {
+        let position = *index.by_rel.get(rel).unwrap_or_else(|| panic!("{rel}"));
+        member_seed(position, class, member)
+    }
+
+    #[test]
+    fn callers_walk_reverse_call_edges_to_the_requested_depth() {
+        let (root, index) = callers_fixture("callers-depth");
+        let target = member_pos(&index, "app/Repo.java", "Repo", "size");
+
+        let direct = callers(&index, &target, 1);
+        assert_eq!(direct.len(), 1, "{direct:?}");
+        assert_eq!(
+            direct[0].unit,
+            member_pos(&index, "app/Service.java", "Service", "used")
+        );
+        assert_eq!(direct[0].line, 5);
+        assert_eq!(direct[0].depth, 1);
+
+        let transitive = callers(&index, &target, 2);
+        assert_eq!(transitive.len(), 2, "{transitive:?}");
+        assert_eq!(transitive[0].depth, 1);
+        assert_eq!(transitive[1].depth, 2);
+        assert_eq!(
+            transitive[1].unit,
+            member_pos(&index, "app/Controller.java", "Controller", "handle")
+        );
+        assert_eq!(transitive[1].line, 5);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn why_returns_the_seed_chain_with_call_site_lines() {
+        let (root, index) = callers_fixture("callers-why");
+        let service = member_pos(&index, "app/Service.java", "Service", "used");
+        let controller = member_pos(&index, "app/Controller.java", "Controller", "handle");
+        let target = member_pos(&index, "app/Repo.java", "Repo", "size");
+
+        let chain = why(&index, std::slice::from_ref(&controller), &target, 2).unwrap();
+        assert_eq!(chain.len(), 3, "{chain:?}");
+        assert_eq!(chain[0].unit, controller);
+        assert_eq!(chain[0].reason, Reason::Seed);
+        assert_eq!(chain[0].line, 0);
+        assert_eq!(chain[1].unit, service);
+        assert_eq!(chain[1].reason, Reason::Call);
+        assert_eq!(chain[1].line, 5);
+        assert_eq!(chain[2].unit, target);
+        assert_eq!(chain[2].reason, Reason::Call);
+        assert_eq!(chain[2].line, 5);
+
+        // The seed itself needs no walk.
+        let seed_chain = why(&index, std::slice::from_ref(&service), &service, 2).unwrap();
+        assert_eq!(seed_chain.len(), 1);
+        assert_eq!(seed_chain[0].reason, Reason::Seed);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refs_invert_recorded_uses_and_calls() {
+        let (root, mut index) = callers_fixture("refs");
+
+        let calls = references(&index, "size");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].symbol, "Service");
+        assert_eq!(calls[0].member.as_deref(), Some("used"));
+        assert_eq!(calls[0].line, 5);
+        assert_eq!(calls[0].kind, RefKind::Call);
+
+        let indirect = references(&index, "used");
+        assert!(indirect.iter().any(|reference| {
+            reference.symbol == "Controller"
+                && reference.member.as_deref() == Some("handle")
+                && reference.line == 5
+                && reference.kind == RefKind::Call
+        }));
+
+        // `uses` is recorded per symbol, so the reference line is the enclosing
+        // declaration; this is the `refs TaxRate` contract for type uses.
+        let service = *index.by_rel.get("app/Service.java").unwrap();
+        index.files[service].symbols[0]
+            .uses
+            .push("TaxRate".to_string());
+        let uses = references(&index, "TaxRate");
+        assert_eq!(uses.len(), 1, "{uses:?}");
+        assert_eq!(uses[0].symbol, "Service");
+        assert_eq!(uses[0].member, None);
+        assert_eq!(uses[0].line, index.files[service].symbols[0].line as u32);
+        assert_eq!(uses[0].kind, RefKind::Use);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Ignored benchmark: `cargo test bench_reverse -- --ignored --nocapture`.
