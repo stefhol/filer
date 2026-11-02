@@ -426,6 +426,9 @@ filer --root ~/code/demo index                         # cache stats
 filer --root ~/code/demo show                          # re-render this branch's bundle
 filer --root ~/code/demo show --branch main            # ... another branch's
 filer --root ~/code/demo show --out bundle.md           # ... into a file
+filer --root ~/code/demo callers 'app/Service.java::Service.used' --depth 2 --json
+filer --root ~/code/demo why 'app/Repo.java::Repo.size' --json
+filer --root ~/code/demo refs TaxRate --json
 filer --root ~/code/demo state                         # what is stored per branch?
 filer --root ~/code/demo state --clear                 # forget this branch
 filer --root ~/code/demo state --clear --all           # forget everything
@@ -460,6 +463,43 @@ current branch's bundle (`--branch` overrides), re-reads the files from disk and
 again — useful after a restart, or to pipe a bundle into another tool. Files or excerpts
 that vanished since are dropped with a notice; asking for a branch that has no bundle lists
 the ones that do.
+
+### Callers, why, and refs
+
+The three reverse queries work on the same index and call graph as `bundle`; none of them
+searches file text.
+
+```sh
+# Who calls this unit? Depth 1 is direct callers, depth 2 follows callers of callers.
+$ filer --root ~/code/demo callers 'app/Repo.java::Repo.size' --depth 2 --json
+[{"caller":"app/Service.java::Service.used","line":5,"depth":1},
+ {"caller":"app/Controller.java::Controller.handle","line":5,"depth":2}]
+
+# How did this unit get into this branch's saved bundle? The chain starts at the seed;
+# each hop's line is the call site in the previous hop.
+$ filer --root ~/code/demo why 'app/Repo.java::Repo.size' --json
+{"target":"app/Repo.java::Repo.size","reason":"call","depth":2,
+ "chain":[{"unit":"app/Controller.java::Controller.handle","line":null,"reason":"seed",...},
+          {"unit":"app/Service.java::Service.used","line":5,"reason":"call",...},
+          {"unit":"app/Repo.java::Repo.size","line":5,"reason":"call",...}]}
+
+# Invert the recorded name uses and calls. `kind` is `use` or `call`.
+$ filer --root ~/code/demo refs TaxRate --json
+[{"path":"app/Service.java","symbol":"Service","member":null,"line":2,"kind":"use"}]
+```
+
+`callers` follows call edges only (`Reason::Call`); an imported type is not a caller.
+`why` reads the state file (`--state`, default `<root>/.filer/bundle.toml`) and the current
+branch (`--branch`), walks `graph.inc` back to a `reason = "seed"` entry, and returns the
+forward chain. If the unit sits inside a whole-file or whole-class seed, the chain stops at
+that seed.
+
+`refs` is an **edge inversion**, not grep. It reports what the resolver already recorded in
+`Symbol.uses`, `Symbol.calls` and `Member.calls`, so body text, comments and string literals
+are deliberately out of scope. A `call` row carries the call-site line; a `use` row carries
+the enclosing declaration's line because uses are stored per symbol, not per occurrence.
+
+Empty results print `[]` with `--json` and exit `4`, like `search`.
 
 ### Machine-readable errors and exit codes
 
