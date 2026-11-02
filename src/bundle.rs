@@ -65,8 +65,6 @@ pub fn render(index: &Index, files: &[BundleFile], options: &BundleOptions) -> S
 
     if let Some(appendix) = &options.appendix {
         out.push_str("\n## Bundle state\n\n");
-        out.push_str("Machine-readable list of what this bundle contains. ");
-        out.push_str("`:FilerReset` (or `filer state --clear`) drops it.\n\n");
         out.push_str("```toml\n");
         out.push_str(appendix.trim_end());
         out.push_str("\n```\n");

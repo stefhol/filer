@@ -152,11 +152,18 @@ pub fn clear(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// State file contents, with a hint for whoever opens the file directly.
 pub fn to_toml(doc: &StateDoc) -> String {
-    let body = toml::to_string_pretty(doc).unwrap_or_default();
+    let body = to_toml_plain(doc);
     format!(
         "# filer bundle state — `:FilerReset` clears the current branch, `:FilerResetAll` everything\n{body}"
     )
+}
+
+/// The same document without the human hint, for bundles that get pasted into
+/// a chat: data only.
+pub fn to_toml_plain(doc: &StateDoc) -> String {
+    toml::to_string_pretty(doc).unwrap_or_default()
 }
 
 /// Branch name for the project at `root`, read from `.git/HEAD` (no subprocess).

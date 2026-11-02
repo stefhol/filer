@@ -199,8 +199,10 @@ What that buys you:
   added, depths are the minimum over both runs.
 - Switching branches keeps everything: each branch picks up its own bundle where it left
   off, instead of losing it.
-- The bundle ends with a `## Bundle state` section holding the same TOML for just that
-  branch, so the model and you can see what came in and why.
+- The bundle ends with a `## Bundle state` section holding that branch's TOML verbatim —
+  data only, no filer instructions or prose — so the model can see what came in and why.
+  (The `.filer/bundle.toml` sidecar keeps its one-line comment; that file never goes to
+  the chat.)
 - `reason` is one of `seed`, `import`, `static-import`, `wildcard-import`, `same-package`,
   `usage`, `package`, `config`, `external`.
 

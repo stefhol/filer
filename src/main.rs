@@ -344,7 +344,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
     let appendix = branch_bundle.as_ref().map(|bundle| {
         let mut shown = StateDoc::new(&root);
         shown.upsert(bundle.clone());
-        state::to_toml(&shown)
+        state::to_toml_plain(&shown)
     });
 
     let bundle_options = BundleOptions {
@@ -522,7 +522,7 @@ fn show_cmd(root: &Path, args: ShowArgs) {
     let appendix = {
         let mut single = StateDoc::new(&root);
         single.upsert(shown);
-        state::to_toml(&single)
+        state::to_toml_plain(&single)
     };
 
     let bundle_options = BundleOptions {
