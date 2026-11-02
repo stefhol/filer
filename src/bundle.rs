@@ -15,6 +15,9 @@ use crate::state::Selection;
 /// dependency and `--max-tokens N` is exactly `--max-bytes N * 4`.
 pub const BYTES_PER_TOKEN: usize = 4;
 
+/// Built-in per-file size limit, so one huge file cannot swallow the bundle.
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 1024 * 1024;
+
 pub struct BundleOptions {
     pub title: Option<String>,
     pub depth: u32,
@@ -31,7 +34,7 @@ impl Default for BundleOptions {
         Self {
             title: None,
             depth: 2,
-            max_file_bytes: 1024 * 1024,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_bytes: None,
             appendix: None,
         }

@@ -594,12 +594,14 @@ filer --root ~/code/demo bundle --seeds-from @seeds.txt --depth 2 > seeds.md
 `--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`,
 `--seeds-from -|@FILE` (repeatable), `--at-line N`,
 `--max-bytes N`, `--max-tokens N` (see [Order and budget](#order-and-budget)), `--skip UNIT`,
-`--only-new -|@FILE` (see [Deltas: only what is new](#deltas-only-what-is-new)). `show` takes
-the same two budget flags. With `--seeds-from` the positional files become optional and both
-sources are combined; reading that list is a plain file read — filer never runs `git`, so
+`--only-new -|@FILE` (see [Deltas: only what is new](#deltas-only-what-is-new)),
+`--max-file-bytes N` (see [Config file](#config-file)). `show` takes the same budget and
+per-file flags. With `--seeds-from` the positional files become optional and both sources are
+combined; reading that list is a plain file read — filer never runs `git`, so
 `git diff --name-only | filer bundle --seeds-from -` is your own pipeline.
 Default depth is 2. Global flags: `--json`, `--quiet`, `--include GLOB`, `--exclude GLOB`,
-`--no-ignore`, `--session ID` (see below and [Sessions](#sessions-one-state-file-per-agent)). Add `::Symbol` for one declaration and `::Class.method` for a Java or
+`--no-ignore`, `--session ID` (see below and [Sessions](#sessions-one-state-file-per-agent)),
+`--roots DIR[,DIR]` (see below). Add `::Symbol` for one declaration and `::Class.method` for a Java or
 Rust method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
 `filer --root ~/code/demo bundle 'app/Service.java::Service.used'`,
 `filer --root ~/code/demo bundle 'src/app/service.rs::Service.used'`.
@@ -871,6 +873,37 @@ Every command builds the same index, so the filter is global:
   literal input — and warns that the file is outside the index.
 - The cache follows: a path leaves the index as soon as it is ignored or excluded, while its
   parse memo survives if the file still exists, so un-ignoring it costs no re-parse.
+
+
+### Config file
+
+`.filer/config.toml` holds the project's defaults, so an agent and a human stop
+disagreeing about what "context" means. Every key is optional and the precedence is
+always **flag > config file > built-in**:
+
+```toml
+[bundle]
+depth = 2                 # --depth; built-in 2
+max_file_bytes = 1048576  # --max-file-bytes / show --max-file-bytes; built-in 1 MiB
+
+[index]
+roots = ["src", "lib"]    # --roots DIR[,DIR]; built-in: the whole root
+include = ["**/*.java"]   # --include; built-in: every supported file
+exclude = ["**/generated/**"]  # --exclude; built-in: nothing
+ignore = true             # --no-ignore still wins; built-in true
+```
+
+- A flag **replaces** the config list instead of appending to it: `--exclude 'x'` with
+  `exclude = ["y"]` in the file leaves only `x` excluded. That keeps "what you asked for"
+  and "what the file asks for" separable, and makes the precedence testable.
+- `roots` must exist inside the project root; a missing or escaping root is an error, not a
+  silently empty index.
+- Unknown keys are an **error** (`depht = 2` fails with the file path and the known keys),
+  because a typo that silently changes the bundle is exactly what this file prevents.
+- The file is read from `<root>/.filer/config.toml` — the same directory as the state — so a
+  session in any worktree picks up its own defaults.
+- `filer show` re-renders with the same `[bundle] max_file_bytes`, so a reopened bundle looks
+  like the one that was written.
 
 ### Incremental index refresh
 

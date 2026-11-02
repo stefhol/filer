@@ -306,31 +306,46 @@ pub struct UpdateStats {
 }
 
 fn collect_source_files(root: &Path, filter: &Filter) -> Vec<PathBuf> {
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .follow_links(false)
-        // Dot directories still hold sources in some projects; only ignore files
-        // and `SKIP_DIRS` remove paths.
-        .hidden(false)
-        // Ignore files belong to the project root, not to whatever directory the
-        // user happens to call filer from.
-        .parents(false)
-        // `.gitignore` is honored in a plain directory too, not only in a repo.
-        .require_git(false)
-        .ignore(filter.ignore_files())
-        .git_ignore(filter.ignore_files())
-        .git_global(filter.ignore_files())
-        .git_exclude(filter.ignore_files());
-    builder.filter_entry(|entry| !is_skipped(entry));
+    // `--roots`/`[index] roots` narrow the walk; the default is the whole tree.
+    let walk_roots: Vec<&Path> = if filter.roots().is_empty() {
+        vec![root]
+    } else {
+        filter.roots().iter().map(PathBuf::as_path).collect()
+    };
 
-    builder
-        .build()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-        .map(|entry| entry.into_path())
-        .filter(|path| Language::from_path(path).is_some())
-        .filter(|path| filter.allows(&relative(root, path)))
-        .collect()
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for walk_root in walk_roots {
+        let mut builder = WalkBuilder::new(walk_root);
+        builder
+            .follow_links(false)
+            // Dot directories still hold sources in some projects; only ignore
+            // files and `SKIP_DIRS` remove paths.
+            .hidden(false)
+            // Ignore files belong to the project root, not to whatever directory
+            // the user happens to call filer from.
+            .parents(false)
+            // `.gitignore` is honored in a plain directory too, not only in a repo.
+            .require_git(false)
+            .ignore(filter.ignore_files())
+            .git_ignore(filter.ignore_files())
+            .git_global(filter.ignore_files())
+            .git_exclude(filter.ignore_files());
+        builder.filter_entry(|entry| !is_skipped(entry));
+
+        paths.extend(
+            builder
+                .build()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+                .map(|entry| entry.into_path())
+                .filter(|path| Language::from_path(path).is_some())
+                .filter(|path| filter.allows(&relative(root, path))),
+        );
+    }
+    // Overlapping roots (`src` and `src/app`) must not index a file twice.
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn is_skipped(entry: &DirEntry) -> bool {
