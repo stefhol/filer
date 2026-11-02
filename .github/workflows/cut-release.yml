@@ -1,0 +1,110 @@
+# Cut a release with one click: Actions -> "Cut release" -> Run workflow.
+#
+# Bumps the version in Cargo.toml/Cargo.lock, commits it to master, tags it, and then
+# triggers the cargo-dist release workflow (.github/workflows/release.yml) for that tag.
+#
+# Why the explicit dispatch instead of relying on the tag push: events created with the
+# repository's GITHUB_TOKEN do not start other workflows, so the tag pushed here would not
+# fire release.yml on its own. workflow_dispatch is exempt from that rule, so we call it.
+
+name: Cut release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to bump
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Exact version to release instead (e.g. 0.2.0) — overrides the bump choice
+        type: string
+        required: false
+      dry_run:
+        description: Only compute and print the version; change nothing, release nothing
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Real runs always tag master. Dry runs check out whatever ref you dispatched on,
+          # so the workflow can be exercised from a branch before it is merged.
+          ref: ${{ inputs.dry_run && github.ref_name || 'master' }}
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          current=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          next=$(.github/scripts/bump-version.sh "$current" "${{ inputs.bump }}" "${{ inputs.version }}")
+          {
+            echo "current=$current"
+            echo "next=$next"
+            echo "tag=v$next"
+          } >>"$GITHUB_OUTPUT"
+          echo "Current version: \`$current\` → new version: \`$next\`" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Refuse to reuse an existing tag
+        run: |
+          tag='${{ steps.version.outputs.tag }}'
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "error: tag $tag already exists on origin" >&2
+            exit 1
+          fi
+          echo "tag $tag is free"
+
+      - name: Bump version
+        if: ${{ !inputs.dry_run }}
+        run: |
+          next='${{ steps.version.outputs.next }}'
+          sed -i "0,/^version = \".*\"$/s//version = \"$next\"/" Cargo.toml
+          cargo update -p filer --offline
+          git diff -- Cargo.toml Cargo.lock
+
+      - name: Commit and tag
+        if: ${{ !inputs.dry_run }}
+        run: |
+          tag='${{ steps.version.outputs.tag }}'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release $tag"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin HEAD:master
+          git push origin "$tag"
+
+      - name: Start the dist release workflow
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag='${{ steps.version.outputs.tag }}'
+          gh workflow run release.yml --ref master -f tag="$tag"
+          echo "Dispatched release.yml for $tag — artifacts appear on the release page once it finishes." >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ inputs.dry_run && 'Dry run' || 'Release started' }}"
+            echo
+            echo "- version: \`${{ steps.version.outputs.current }}\` → \`${{ steps.version.outputs.next }}\`"
+            echo "- tag: \`${{ steps.version.outputs.tag }}\`"
+            if [[ '${{ inputs.dry_run }}' == 'true' ]]; then
+              echo "- nothing was committed, tagged or released"
+            else
+              echo "- https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.tag }}"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
