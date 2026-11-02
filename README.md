@@ -273,6 +273,9 @@ Calls are resolved through:
 - `Type.helper()` — static calls (including Rust `Self::helper()` and `Type::helper()`)
 - `new Type().helper()`
 - Rust bare `helper()` / `crate::module::helper()` — unique free functions in the repo
+- Scala nullary calls (`repo.size`, no parentheses) count as calls
+- Kotlin/C#/TS property access (`repo.Size`) is not treated as a method call, so getters are
+  not followed (the property is visible in the shell)
 
 Everything the resolver cannot type (`a.b().c()`, interface dispatch, third-party types) adds
 no edge. If the receiver's class is known but the method is not found, the **whole class** is

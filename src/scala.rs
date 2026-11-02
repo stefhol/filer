@@ -371,12 +371,31 @@ fn calls_in(member: Node<'_>, src: &str) -> Vec<Call> {
     let mut out = Vec::new();
     let mut stack = vec![member];
     while let Some(node) = stack.pop() {
-        if node.kind() == "call_expression" {
-            if let Some(function) = node.child_by_field_name("function") {
-                if let Some(call) = call_of(function, src, line_of(src, node.start_byte())) {
-                    out.push(call);
+        match node.kind() {
+            "call_expression" => {
+                if let Some(function) = node.child_by_field_name("function") {
+                    if let Some(call) = call_of(function, src, line_of(src, node.start_byte())) {
+                        out.push(call);
+                    }
                 }
             }
+            // Scala calls nullary methods without parentheses (`repo.size`).
+            // Treat a bare field selection as a call too; resolution only
+            // matches it when the receiver type has a method of that name.
+            "field_expression" => {
+                let is_callee = node.parent().is_some_and(|parent| {
+                    parent.kind() == "call_expression"
+                        && parent
+                            .child_by_field_name("function")
+                            .is_some_and(|function| function.id() == node.id())
+                });
+                if !is_callee {
+                    if let Some(call) = call_of(node, src, line_of(src, node.start_byte())) {
+                        out.push(call);
+                    }
+                }
+            }
+            _ => {}
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -796,6 +815,37 @@ mod tests {
                 source.uses
             );
         }
+    }
+
+    #[test]
+    fn collects_nullary_field_calls() {
+        let source = parse(
+            r#"
+            class Service(val repo: Repo) {
+              def used: Int = repo.size
+              def other: Int = repo.name.length
+            }
+            "#,
+        );
+        let used = &source.symbols[0].members[0];
+        assert!(
+            used.calls
+                .iter()
+                .any(|call| call.name == "size"
+                    && call.receiver == Receiver::Name("repo".to_string())),
+            "{:?}",
+            used.calls
+        );
+        let other = &source.symbols[0].members[1];
+        assert!(
+            other
+                .calls
+                .iter()
+                .any(|call| call.name == "name"
+                    && call.receiver == Receiver::Name("repo".to_string())),
+            "{:?}",
+            other.calls
+        );
     }
 
     #[test]
