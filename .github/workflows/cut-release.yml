@@ -70,8 +70,19 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: |
           next='${{ steps.version.outputs.next }}'
+          # Cargo.toml: the first bare `version = "..."` is the package's own
           sed -i "0,/^version = \".*\"$/s//version = \"$next\"/" Cargo.toml
-          cargo update -p filer --offline
+          # Cargo.lock: the version line directly under the `name = "filer"` entry
+          sed -i "/^name = \"filer\"$/{n;s/^version = \".*\"$/version = \"$next\"/}" Cargo.lock
+
+          # The bump must touch exactly these two lines and nothing else.
+          changed=$(git diff --numstat -- Cargo.toml Cargo.lock | wc -l)
+          if [[ $changed -ne 2 ]] || ! grep -q "^version = \"$next\"$" Cargo.toml \
+             || ! grep -A1 -m1 '^name = "filer"$' Cargo.lock | grep -q "^version = \"$next\"$"; then
+            echo "error: expected a clean two-line version bump, got:" >&2
+            git diff -- Cargo.toml Cargo.lock >&2
+            exit 1
+          fi
           git diff -- Cargo.toml Cargo.lock
 
       - name: Commit and tag
