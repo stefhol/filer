@@ -164,6 +164,18 @@ You can still release by hand: bump `version` in `Cargo.toml`/`Cargo.lock`, comm
 Every push to `master` also runs `.github/workflows/ci.yml` (fmt, clippy, tests) and uploads a
 `filer-x86_64-unknown-linux-gnu.tar.xz` workflow artifact kept for 90 days.
 
+Two scheduled workflows keep dependencies current and audited (both also support
+*Run workflow* from the Actions UI):
+
+- `.github/workflows/renovate.yml` runs self-hosted Renovate daily against `master`.
+  Policy lives in `renovate.json`: new releases must be at least **14 days** old, GitHub
+  Actions and Rust minor/patch updates are grouped, security fixes bypass the delay.
+  The run needs a `RENOVATE_TOKEN` repository secret — a PAT or GitHub App token with
+  `contents: write` and `pull_requests: write`, since the workflow `GITHUB_TOKEN` is read-only.
+- `.github/workflows/audit.yml` runs `cargo audit` against `Cargo.lock` daily. It fails the
+  run and opens (or comments on) a `Security: RustSec advisories in dependencies` issue when
+  advisories are found, and never fails on yanked/unmaintained warnings alone.
+
 ## Neovim setup
 
 Install the binary first with the [release installer](#install) (it lands on `$PATH`).

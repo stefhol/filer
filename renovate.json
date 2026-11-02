@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard"],
+  "baseBranches": ["master"],
+  "minimumReleaseAge": "14 days",
+  "schedule": ["* * * * *"],
+  "prConcurrentLimit": 5,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 5am on monday"]
+  },
+  "vulnerabilityAlerts": {
+    "minimumReleaseAge": "0 days"
+  },
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions"
+    },
+    {
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchManagers": ["cargo"],
+      "groupName": "Rust minor and patch dependencies"
+    }
+  ]
+}
