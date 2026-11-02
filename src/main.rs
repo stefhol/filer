@@ -136,8 +136,13 @@ struct BundleArgs {
     /// Files to bundle, as paths relative to the root (or absolute paths).
     /// Add `::Symbol` for one declaration and `::Class.method` for a method
     /// scope, e.g. `app/Service.java::Service.used`.
-    #[arg(required = true, value_name = "FILE")]
+    #[arg(required_unless_present = "seeds_from", value_name = "FILE")]
     files: Vec<String>,
+    /// Read seed paths from `-` (stdin) or `@FILE`, one per line. Repeatable,
+    /// so `rg -l ... | filer bundle --seeds-from -` works and long seed lists
+    /// stay off the command line.
+    #[arg(long, value_name = "SOURCE")]
+    seeds_from: Vec<String>,
     /// Import hops to follow. 0 bundles only the given files.
     #[arg(long, default_value_t = 2)]
     depth: u32,
@@ -952,11 +957,25 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         }
     }
 
+    // Explicit arguments first, then whatever `--seeds-from` added, so
+    // `--at-line` keeps applying to the first positional file.
+    let mut inputs = args.files.clone();
+    for source in &args.seeds_from {
+        inputs.extend(read_seeds(source)?);
+    }
+    if inputs.is_empty() {
+        return Err(
+            FilerError::empty_result("no seed paths to bundle").with_hint(
+                "write one path per line to --seeds-from, or pass the files on the command line",
+            ),
+        );
+    }
+
     let mut seeds: Vec<Unit> = Vec::new();
     let mut extras: Vec<BundleFile> = Vec::new();
     let mut at_line_used = false;
 
-    for input in &args.files {
+    for input in &inputs {
         let (path, symbol) = split_symbol(input);
         let Some(rel) = locate(&index, &root, path) else {
             context.warn(format!("skipping {path}: not inside {}", root.display()));
@@ -1250,6 +1269,33 @@ fn coverage(index: &Index) -> bundle::Coverage {
         files_skipped: index.files_skipped,
         imports_unresolved: resolve::unresolved_import_count(index),
     }
+}
+
+/// Seeds from a file instead of argv: one `path` or `path::Symbol` per line,
+/// blank lines and `#` comments skipped, surrounding whitespace (including the
+/// `\r` of a CRLF file) trimmed. `-` reads stdin, `@FILE` and a bare path read
+/// that file. No `git` subprocess: piping `git diff --name-only` in is the
+/// caller's job.
+fn read_seeds(source: &str) -> Result<Vec<String>, FilerError> {
+    let text = if source == "-" {
+        std::io::read_to_string(std::io::stdin()).map_err(|error| {
+            FilerError::internal(format!("cannot read seeds from stdin: {error}"))
+        })?
+    } else {
+        let path = Path::new(source.strip_prefix('@').unwrap_or(source));
+        std::fs::read_to_string(path).map_err(|error| {
+            FilerError::file_not_found(format!(
+                "cannot read seeds from {}: {error}",
+                path.display()
+            ))
+        })?
+    };
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect())
 }
 
 /// `path::symbol` (Windows drive letters do not contain `::`).
