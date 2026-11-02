@@ -1,6 +1,6 @@
 [package]
 name = "filer"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Bundle Java and Scala sources and their import closure into chat-ready markdown"
 license = "MIT"
