@@ -84,9 +84,11 @@ jobs:
             echo "_Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID_"
           } > body.md
 
-          number=$(gh issue list --state open --search "\"$ISSUE_TITLE\" in:title" \
-            --json number,title --jq ".[] | select(.title == \"$ISSUE_TITLE\") | .number" \
-            | head -n1)
+          # Match the title locally: GitHub's `in:title` search does not reliably
+          # match a quoted phrase, which produced duplicate issues.
+          number=$(gh issue list --state open --limit 200 --json number,title \
+            --jq ".[] | select(.title == \"$ISSUE_TITLE\") | .number" \
+            | sort -n | head -n1)
 
           if [ -n "$number" ]; then
             gh issue comment "$number" --body-file body.md
