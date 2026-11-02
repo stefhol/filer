@@ -32,6 +32,6 @@
     "@earendil-works/pi-tui": "^1.5.0",
     "@types/bun": "^1.3.0",
     "typebox": "^1.3.0",
-    "typescript": "^5.9.0"
+    "typescript": "^7.0.0"
   }
 }
