@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::atomic;
 use crate::filter::Filter;
 use crate::lang::{end_line_of, Import, Language, Member, SourceParser, Symbol};
+use crate::tsconfig::{self, TsConfig};
 
 /// Build output and tool caches, skipped even with `--no-ignore`: they are never
 /// source, and walking them is what makes a first index slow.
@@ -128,6 +129,11 @@ pub struct Index {
     pub by_symbol: HashMap<String, Vec<(usize, usize)>>,
     pub by_package: HashMap<String, Vec<usize>>,
     pub by_rel: HashMap<String, usize>,
+    /// `tsconfig.json` / `jsconfig.json` files that can be the nearest config
+    /// for an indexed file; [`TsConfig::nearest`] picks one by directory. They
+    /// are re-read on every build (a config is tiny) instead of being cached
+    /// per file, so editing one takes effect without invalidating the index.
+    pub tsconfigs: Vec<TsConfig>,
     /// Number of files re-parsed on this run (for `filer index` stats).
     pub parsed_count: usize,
     pub reused_count: usize,
@@ -163,6 +169,7 @@ impl Index {
 
         let mut index = Index {
             root: root.clone(),
+            tsconfigs: tsconfig::collect(&root, &files),
             files,
             ..Default::default()
         };
