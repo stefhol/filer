@@ -466,7 +466,7 @@ Cleaning up:
 | Nuke every branch | `:FilerResetAll` (or `filer state --clear --all`) |
 | Clear a different branch | `filer state --clear --branch main` |
 | Want a one-off bundle, no state | `opts.state = false`, or `filer bundle` without `--state` |
-| See what is stored | `filer state` (add `--branch NAME` for another branch) |
+| See what is stored | `filer state` (add `--branch NAME` for another branch, `--json` for the [JSON envelope](#state---json)) |
 | Reopen yesterday's bundle | `:FilerShow` / `:FilerShow main` / `filer show --branch main` |
 
 `.filer/.gitignore` containing `*` is created automatically, so the state never shows up in
@@ -741,7 +741,7 @@ Empty results print `[]` with `--json` and exit `4`, like `search`.
 
 The JSON form is the stable product and the surface an agent drives; markdown is one
 consumer of the same data. Every JSON output covered here (`search`, `deps`, `bundle`,
-`show`, `index`) carries `schema_version: 1`:
+`show`, `index`, `state`) carries `schema_version: 1`:
 
 ```sh
 filer --root ~/code/demo --json search --query Service   # JSON lines, one row per unit
@@ -750,6 +750,7 @@ filer --root ~/code/demo --json deps 'app/Service.java::Service.used' --unit
 filer --root ~/code/demo --json bundle --depth 2 app/Service.java
 filer --root ~/code/demo --json show
 filer --root ~/code/demo --json index
+filer --root ~/code/demo --json state                    # what is stored, as data
 ```
 
 `bundle --json` and `show --json` emit one envelope per run:
@@ -818,7 +819,10 @@ filer --root ~/code/demo --json index
 - `coverage` is index-wide, so it describes how complete the tool's view of the repo is:
   `files_indexed`, `files_skipped` (supported-language files that could not be read or
   parsed) and `imports_unresolved` (import statements no indexed file provides). The
-  per-unit version of the last number is `diagnostics`.
+  per-unit version of the last number is `diagnostics`. `index --json` carries the same
+  object at the top level, so a caller that only builds the index can report how complete
+  it is without bundling anything (`filer --json index` = `{"schema_version":1,...,
+  "coverage":{"files_indexed":812,"files_skipped":34,"imports_unresolved":19}}`).
 - `deps --json` deliberately **wraps** its array: it used to print a bare `[...]`, now it
   prints `{"schema_version":1,"deps":[...]}` so the version is a top-level key. Update
   consumers with `jq '.deps'`. `search` stays JSON lines and adds `schema_version` to each
@@ -847,6 +851,52 @@ filer --root ~/code/demo --json index
   ]
 }
 ```
+
+### `state --json`
+
+`filer state` prints a table; `filer --json state` prints one envelope with the same facts, so
+a script or a tool can read the stored bundle without parsing prose:
+
+```json
+{
+  "schema_version": 1,
+  "root": "/repo",
+  "state_path": "/repo/.filer/bundle.toml",
+  "branch": "main",
+  "label": "main",
+  "exists": true,
+  "current": {
+    "branch": "main",
+    "created": 1793618434,
+    "depth": 2,
+    "entries": [
+      {"path": "app/Service.java", "scope": "methods", "symbol": "Service",
+       "methods": ["used"], "depth": 0, "reason": "seed"}
+    ]
+  },
+  "branches": [
+    {"branch": "main", "label": "main", "entries": 3, "created": 1793618434, "depth": 2}
+  ]
+}
+```
+
+- `entries` mirrors the state file: `scope` is `file`, `symbol` or `methods`, `symbol` and
+  `methods` are `null` and `[]` for `file` entries, and `reason` is the same closed enum as
+  the markdown appendix.
+- `branches` lists every stored branch, the current one included; consumers filter. It holds
+  `branch`, `label`, the entry count plus `created` and `depth`, not the entries themselves.
+- `current` is the bundle for `--branch` (default: the current branch) with its entries;
+  it is `null` when there is no state file at all or no bundle for that branch. Both cases
+  exit `0`: asking for a branch with no bundle is not an error here, because `show --branch`
+  already owns `branch_not_found` (exit `2`).
+- `exists` is `false` when no state file could be read, which is also when `current` is
+  `null`; `branches` is then `[]`.
+- `--clear` and `--clear --all` print
+  `{"schema_version":1,"root":...,"state_path":...,"cleared":"main"|"all"}` and exit `0`;
+  `cleared` is `null` when there was nothing to clear (no state file, or no bundle for that
+  branch). Without `--json` the prose output is unchanged.
+- `--quiet` only silences warnings on stderr, so it never changes `state --json` or
+  `index --json`.
 
 ### Diagnostics and coverage
 
