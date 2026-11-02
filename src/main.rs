@@ -26,7 +26,7 @@ use bundle::{BundleFile, BundleOptions};
 use error::{FilerError, EXIT_EMPTY, EXIT_INTERNAL};
 use index::{FileEntry, Index};
 use lang::{Granularity, Language, MemberKind, SymbolKind};
-use resolve::{closure_units, drop_covered_symbols, Reason, ResolveOptions, Unit};
+use resolve::{build_graph, drop_covered_symbols, Reason, ResolveOptions, Unit};
 use schema::SCHEMA_VERSION;
 use state::{BranchBundle, Selection, StateDoc, StateFile};
 
@@ -60,7 +60,7 @@ enum Command {
     Search(SearchArgs),
     /// Emit a markdown bundle for the given files plus their import closure.
     Bundle(BundleArgs),
-    /// Print the import closure of a single file.
+    /// Print the import closure of one file or unit, one row per file or per unit.
     Deps(DepsArgs),
     /// List the callers of one unit, nearest first.
     Callers(CallersArgs),
@@ -129,12 +129,16 @@ struct BundleArgs {
 
 #[derive(Args)]
 struct DepsArgs {
-    /// File to inspect, relative to the root (or absolute).
-    #[arg(value_name = "FILE")]
+    /// File or unit to inspect: `path`, `path::Symbol` or `path::Class.method`.
+    #[arg(value_name = "UNIT")]
     file: String,
-    /// Import hops to follow.
+    /// Import/call hops to follow.
     #[arg(long, default_value_t = 2)]
     depth: u32,
+    /// List one row per unit (`path::Symbol`, `path::Class.method`) instead of
+    /// collapsing the same closure to files.
+    #[arg(long)]
+    unit: bool,
 }
 
 #[derive(Args)]
@@ -754,7 +758,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         }
     }
 
-    let resolved = closure_units(
+    let graph = build_graph(
         &index,
         &seeds,
         ResolveOptions {
@@ -763,6 +767,8 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
             minimal: true,
         },
     );
+    let resolved = graph.closure(&seeds);
+    let diagnostics = graph.diagnostics;
     let fresh = resolved.len();
 
     let mut merged = previous;
@@ -903,7 +909,9 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         appendix,
         ..Default::default()
     };
-    let rendered = bundle::describe(&index, &files, &bundle_options);
+    let mut rendered = bundle::describe(&index, &files, &bundle_options);
+    rendered.diagnostics = diagnostics;
+    rendered.coverage = coverage(&index);
 
     if let (Some(path), Some(bundle)) = (&state_path, branch_bundle) {
         let mut doc = doc.unwrap_or_else(|| StateDoc::new(&root));
@@ -920,6 +928,13 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         }
         value.to_string()
     } else {
+        // Markdown cannot carry the list; at least say the slice is incomplete.
+        if !rendered.diagnostics.is_empty() {
+            context.warn(format!(
+                "{} diagnostics: the bundle is an incomplete slice (see --json)",
+                rendered.diagnostics.len()
+            ));
+        }
         rendered.markdown
     };
 
@@ -945,6 +960,17 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
     }
 
     Ok(())
+}
+
+/// Index-wide completeness counters for the `bundle --json`/`show --json`
+/// envelope. `imports_unresolved` counts across the index, not only the units
+/// in the bundle; the per-unit list lives in `diagnostics`.
+fn coverage(index: &Index) -> bundle::Coverage {
+    bundle::Coverage {
+        files_indexed: index.files.len(),
+        files_skipped: index.files_skipped,
+        imports_unresolved: resolve::unresolved_import_count(index),
+    }
 }
 
 /// `path::symbol` (Windows drive letters do not contain `::`).
@@ -1018,71 +1044,133 @@ fn offset_of_line(source: &str, line: usize) -> usize {
 fn deps(root: &Path, args: DepsArgs, context: &Context) -> Result<(), FilerError> {
     let index = Index::build(root);
     let root = index.root.clone();
-    let Some(rel) = locate(&index, &root, &args.file) else {
-        return Err(FilerError::file_not_found(format!(
-            "{} is not inside {}",
-            args.file,
-            root.display()
-        )));
-    };
-    let Some(&position) = index.by_rel.get(&rel) else {
-        return Err(FilerError::not_indexed(format!(
-            "{rel} is not indexed (binary, skipped directory or unsupported language?)"
-        ))
-        .with_hint("run `filer index` to see what the index contains"));
-    };
+    let seed = resolve_unit(&index, &root, &args.file)?;
+    let seeds = [seed.clone()];
 
-    let order = resolve::closure_detailed(
+    // File mode and `--unit` mode share one traversal; file mode only collapses
+    // it to one row per file. A member seed therefore shows its files in file
+    // mode and its exact method closure with `--unit`.
+    let graph = build_graph(
         &index,
-        &[position],
+        &seeds,
         ResolveOptions {
             depth: args.depth,
             same_package: false,
             minimal: false,
         },
     );
+    let units = graph.units(&seeds);
+    let order = if args.unit {
+        units
+    } else {
+        collapse_to_files(units)
+    };
 
     if context.json {
-        let value: Vec<_> = order
+        let rows: Vec<_> = order
             .iter()
-            .map(|&(position, depth, reason)| {
-                let file = &index.files[position];
-                serde_json::json!({
+            .map(|(unit, depth, reason)| {
+                let file = &index.files[unit.file()];
+                let mut row = serde_json::json!({
                     "path": file.rel,
                     "fqn": file.primary_fqn(),
                     "depth": depth,
                     "reason": reason.as_str(),
+                });
+                if let Some(object) = row.as_object_mut() {
+                    object.insert(
+                        "unit".to_string(),
+                        serde_json::json!(unit_label(&index, unit)),
+                    );
+                    object.insert("scope".to_string(), serde_json::json!(unit_scope(unit)));
+                    object.insert("symbol".to_string(), serde_json::json!(unit.symbol()));
+                    object.insert("member".to_string(), serde_json::json!(unit.member()));
+                }
+                row
+            })
+            .collect();
+
+        // Every materialized edge, so a consumer can redraw the graph instead
+        // of inferring it from depths. Labels are canonical unit labels.
+        let mut edges: Vec<(String, String, u32, &'static str)> = Vec::new();
+        for (from, outgoing) in &graph.out {
+            for edge in outgoing {
+                edges.push((
+                    unit_label(&index, from),
+                    unit_label(&index, &edge.to),
+                    edge.line,
+                    edge.reason.as_str(),
+                ));
+            }
+        }
+        edges.sort();
+        edges.dedup();
+        let edges: Vec<_> = edges
+            .iter()
+            .map(|(from, to, line, reason)| {
+                serde_json::json!({
+                    "from": from,
+                    "to": to,
+                    "reason": reason,
+                    "line": (*line != 0).then_some(*line),
                 })
             })
             .collect();
+
+        let diagnostics: Vec<_> = graph.diagnostics.iter().map(|d| d.to_json()).collect();
         println!(
             "{}",
             serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
-                "deps": value,
+                "seed": unit_label(&index, &seed),
+                "granularity": if args.unit { "unit" } else { "file" },
+                "deps": rows,
+                "edges": edges,
+                "diagnostics": diagnostics,
             })
         );
         return Ok(());
     }
 
-    for &(position, depth, reason) in &order {
+    for (unit, depth, reason) in &order {
         let suffix = match (depth, reason) {
             (0, _) => String::new(),
             (_, reason) => format!(" ({})", reason.as_str()),
         };
-        println!(
-            "{}{}{}",
-            "  ".repeat(depth as usize),
-            index.files[position].rel,
-            suffix
-        );
+        let label = if args.unit {
+            unit_label(&index, unit)
+        } else {
+            index.files[unit.file()].rel.clone()
+        };
+        println!("{}{}{}", "  ".repeat(*depth as usize), label, suffix);
     }
 
-    for import in resolve::unresolved_imports(&index, position) {
-        context.warn(format!("unresolved (probably JDK/third-party): {import}"));
+    for diagnostic in &graph.diagnostics {
+        context.warn(diagnostic.to_line());
     }
 
     Ok(())
+}
+
+/// Collapse a unit closure to one row per file, keeping discovery order and
+/// the smallest depth seen. This is the default `deps` granularity.
+fn collapse_to_files(units: Vec<(Unit, u32, Reason)>) -> Vec<(Unit, u32, Reason)> {
+    let mut slots: HashMap<usize, usize> = HashMap::new();
+    let mut collapsed: Vec<(Unit, u32, Reason)> = Vec::new();
+    for (unit, depth, reason) in units {
+        match slots.get(&unit.file()).copied() {
+            Some(slot) => {
+                if depth < collapsed[slot].1 {
+                    collapsed[slot].1 = depth;
+                }
+            }
+            None => {
+                slots.insert(unit.file(), collapsed.len());
+                collapsed.push((Unit::File(unit.file()), depth, reason));
+            }
+        }
+    }
+    collapsed
 }
 
 /// Resolve a CLI unit argument (`path`, `path::Symbol`, `path::Class.method`)
@@ -1585,7 +1673,10 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
         appendix: Some(appendix),
         ..Default::default()
     };
-    let rendered = bundle::describe(&index, &files, &bundle_options);
+    let mut rendered = bundle::describe(&index, &files, &bundle_options);
+    // `show` re-renders stored units without resolving, so there is no
+    // traversal to report; coverage still describes the index behind it.
+    rendered.coverage = coverage(&index);
 
     let output = if context.json {
         let mut value = rendered.to_json();

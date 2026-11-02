@@ -631,25 +631,130 @@ pub struct Edge {
     pub line: u32,
 }
 
-/// Something filer declined to include. Collected during the graph build;
-/// rendered by issue #10, not by this ticket.
+/// Something filer declined to include. Collected during the graph build and
+/// rendered by `bundle --json` / `deps --json`.
+///
+/// This is a closed enum: the JSON surface emits exactly these kinds, and each
+/// one carries a fixed payload field beyond `kind` and `path`:
+///
+/// | kind | payload |
+/// | --- | --- |
+/// | `unresolved-import` | `import` |
+/// | `unknown-receiver` | `line`, `call` |
+/// | `unresolved-call` | `line`, `name` |
+/// | `method-not-found` | `line`, `name` |
+/// | `type-only-skipped` | `symbol` |
+/// | `ambiguous` | `line`, `name` |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiagnosticKind {
-    UnresolvedCall,
+    /// An import no indexed file provides (JDK, stdlib, npm, NuGet, ...).
+    UnresolvedImport,
+    /// A call through a receiver whose type is unknown (chained expressions).
     UnknownReceiver,
+    /// A call whose name matched no method, even through supertypes.
+    UnresolvedCall,
+    /// The receiver class is known but declares no such method.
     MethodNotFound,
+    /// A type in scope that a minimal (call-path) bundle deliberately skips.
     TypeOnlySkipped,
+    /// The simple name matched more than one candidate, so it was not guessed.
     Ambiguous,
 }
 
+impl DiagnosticKind {
+    /// The wire name, also the documented list for consumers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiagnosticKind::UnresolvedImport => "unresolved-import",
+            DiagnosticKind::UnknownReceiver => "unknown-receiver",
+            DiagnosticKind::UnresolvedCall => "unresolved-call",
+            DiagnosticKind::MethodNotFound => "method-not-found",
+            DiagnosticKind::TypeOnlySkipped => "type-only-skipped",
+            DiagnosticKind::Ambiguous => "ambiguous",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // read by #10; built here so it is not discarded
 pub struct Diagnostic {
     pub kind: DiagnosticKind,
     pub path: String,
+    /// Call/declaration line, 0 when the diagnostic has no single line.
     pub line: u32,
+    /// The payload name: import path, call name or symbol name.
     pub name: String,
+}
+
+impl Diagnostic {
+    /// The versioned wire form: `kind`, `path` and the kind's payload field.
+    pub fn to_json(&self) -> serde_json::Value {
+        let kind = self.kind.as_str();
+        let path = &self.path;
+        match self.kind {
+            DiagnosticKind::UnresolvedImport => serde_json::json!({
+                "kind": kind,
+                "path": path,
+                "import": self.name,
+            }),
+            // The parsers record only the call name when the receiver is an
+            // arbitrary expression (`a.b().c()`), not the expression's type.
+            DiagnosticKind::UnknownReceiver => serde_json::json!({
+                "kind": kind,
+                "path": path,
+                "line": self.line,
+                "call": self.name,
+            }),
+            DiagnosticKind::TypeOnlySkipped => serde_json::json!({
+                "kind": kind,
+                "path": path,
+                "symbol": self.name,
+            }),
+            DiagnosticKind::UnresolvedCall
+            | DiagnosticKind::MethodNotFound
+            | DiagnosticKind::Ambiguous => serde_json::json!({
+                "kind": kind,
+                "path": path,
+                "line": self.line,
+                "name": self.name,
+            }),
+        }
+    }
+
+    /// One human line for stderr, so text mode is as honest as JSON mode.
+    pub fn to_line(&self) -> String {
+        let location = if self.line == 0 {
+            self.path.clone()
+        } else {
+            format!("{}:{}", self.path, self.line)
+        };
+        match self.kind {
+            DiagnosticKind::UnresolvedImport => format!(
+                "unresolved import {} ({}): probably JDK/third-party",
+                self.name, location
+            ),
+            DiagnosticKind::UnknownReceiver => {
+                format!("unknown receiver for {}() ({location})", self.name)
+            }
+            DiagnosticKind::UnresolvedCall => {
+                format!("unresolved call {}() ({location})", self.name)
+            }
+            DiagnosticKind::MethodNotFound => {
+                format!(
+                    "method {}() not found on the receiver ({location})",
+                    self.name
+                )
+            }
+            DiagnosticKind::TypeOnlySkipped => format!(
+                "type-only dependency {} skipped ({}): not on the call path",
+                self.name, location
+            ),
+            DiagnosticKind::Ambiguous => format!(
+                "ambiguous name {} ({location}): matched several files, not guessed",
+                self.name
+            ),
+        }
+    }
 }
 
 /// One incoming call edge found by [`callers`]. `line` is the call site in
@@ -734,9 +839,9 @@ impl Graph {
         self.reverse().get(unit).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// BFS over the materialized `out` edges. This is the traversal
-    /// `closure_units` used to perform while resolving.
-    fn closure(&self, seeds: &[Unit]) -> Vec<(Unit, u32, Reason)> {
+    /// BFS over the materialized `out` edges, one row per discovered unit.
+    /// This is the traversal `closure_units` used to perform while resolving.
+    fn walk(&self, seeds: &[Unit]) -> Vec<(Unit, u32, Reason)> {
         let mut depth_of: HashMap<Unit, u32> = HashMap::new();
         let mut order: Vec<(Unit, u32, Reason)> = Vec::new();
         let mut queue: VecDeque<Unit> = VecDeque::new();
@@ -758,7 +863,47 @@ impl Graph {
                 queue.push_back(edge.to.clone());
             }
         }
-        drop_covered_symbols(order)
+        order
+    }
+
+    /// Closure as units, keeping excerpts of a file that is also bundled whole.
+    /// `deps --unit` renders this so a method closure is inspectable.
+    pub fn units(&self, seeds: &[Unit]) -> Vec<(Unit, u32, Reason)> {
+        self.walk(seeds)
+    }
+
+    /// Closure as bundling units: a whole-file unit supersedes excerpts of the
+    /// same file. This is what the bundle surface renders.
+    pub fn closure(&self, seeds: &[Unit]) -> Vec<(Unit, u32, Reason)> {
+        drop_covered_symbols(self.walk(seeds))
+    }
+
+    /// Imports of every file the closure touched that no indexed file provides.
+    /// Collected after the walk so leaf seeds (depth 0) report them too.
+    fn note_unresolved_imports(&mut self, index: &Index) {
+        let mut positions: Vec<usize> = self
+            .out
+            .keys()
+            .map(Unit::file)
+            .chain(self.out.values().flatten().map(|edge| edge.to.file()))
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        for position in positions {
+            let Some(file) = index.files.get(position) else {
+                continue;
+            };
+            for import in &file.imports {
+                if resolve_import(index, file, import).is_empty() {
+                    self.diagnostics.push(Diagnostic {
+                        kind: DiagnosticKind::UnresolvedImport,
+                        path: file.rel.clone(),
+                        line: 0,
+                        name: import.path.clone(),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1868,12 +2013,34 @@ pub fn build_graph(index: &Index, seeds: &[Unit], options: ResolveOptions) -> Gr
             }
         }
     }
+    graph.note_unresolved_imports(index);
+    // Stable order and no duplicates: the same unit can be expanded once but
+    // contribute the same note from several seeds.
+    graph.diagnostics.sort_by(|left, right| {
+        (
+            left.path.as_str(),
+            left.line,
+            left.kind.as_str(),
+            left.name.as_str(),
+        )
+            .cmp(&(
+                right.path.as_str(),
+                right.line,
+                right.kind.as_str(),
+                right.name.as_str(),
+            ))
+    });
+    graph.diagnostics.dedup();
     graph
 }
 
 /// Breadth-first closure over units, keeping track of why each one was pulled
 /// in. Returns units in discovery order, seeds first (depth 0), duplicates
 /// removed. A whole-file unit supersedes symbol units of the same file.
+///
+/// Production callers use [`build_graph`] directly so they also get the
+/// diagnostics; this shorthand stays for the tests.
+#[cfg(test)]
 pub fn closure_units(
     index: &Index,
     seeds: &[Unit],
@@ -1914,6 +2081,7 @@ pub fn drop_covered_symbols(units: Vec<(Unit, u32, Reason)>) -> Vec<(Unit, u32, 
 /// Breadth-first closure over imports and type usages, keeping track of why
 /// each file was pulled in. Returns `(file index, depth, reason)` in discovery
 /// order, seeds first (depth 0), duplicates removed.
+#[cfg(test)]
 pub fn closure_detailed(
     index: &Index,
     seeds: &[usize],
@@ -1936,6 +2104,14 @@ pub fn closure(index: &Index, seeds: &[usize], options: ResolveOptions) -> Vec<(
         .into_iter()
         .map(|(position, depth, _)| (position, depth))
         .collect()
+}
+
+/// How many import statements in the whole index no indexed file provides.
+/// This is `coverage.imports_unresolved` in the bundle JSON.
+pub fn unresolved_import_count(index: &Index) -> usize {
+    (0..index.files.len())
+        .map(|position| unresolved_imports(index, position).len())
+        .sum()
 }
 
 /// All imports of `file` that could not be resolved inside the project (JDK,
@@ -3289,6 +3465,89 @@ mod tests {
             "{:?}",
             graph.diagnostics
         );
+    }
+
+    #[test]
+    fn unresolved_imports_are_diagnostics_even_at_depth_zero() {
+        let index = index_from(vec![entry(
+            "app/Pricing.java",
+            Some("app"),
+            &["Pricing"],
+            vec![import("com.acme.Tax", ImportKind::Type)],
+        )]);
+        let graph = build_graph(
+            &index,
+            &[Unit::File(0)],
+            ResolveOptions {
+                depth: 0,
+                same_package: false,
+                minimal: false,
+            },
+        );
+        let diagnostic = graph
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.kind == DiagnosticKind::UnresolvedImport)
+            .unwrap_or_else(|| panic!("no unresolved import: {:?}", graph.diagnostics));
+        assert_eq!(diagnostic.path, "app/Pricing.java");
+        assert_eq!(diagnostic.name, "com.acme.Tax");
+        assert_eq!(
+            diagnostic.to_json(),
+            serde_json::json!({
+                "kind": "unresolved-import",
+                "path": "app/Pricing.java",
+                "import": "com.acme.Tax",
+            })
+        );
+        assert_eq!(unresolved_import_count(&index), 1);
+    }
+
+    #[test]
+    fn every_diagnostic_kind_has_one_documented_wire_field() {
+        let cases = [
+            (DiagnosticKind::UnresolvedImport, "import"),
+            (DiagnosticKind::UnknownReceiver, "call"),
+            (DiagnosticKind::UnresolvedCall, "name"),
+            (DiagnosticKind::MethodNotFound, "name"),
+            (DiagnosticKind::TypeOnlySkipped, "symbol"),
+            (DiagnosticKind::Ambiguous, "name"),
+        ];
+        for (kind, field) in cases {
+            let diagnostic = Diagnostic {
+                kind,
+                path: "app/Service.java".to_string(),
+                line: 7,
+                name: "thing".to_string(),
+            };
+            let json = diagnostic.to_json();
+            assert_eq!(json["kind"], kind.as_str(), "{json}");
+            assert_eq!(json["path"], "app/Service.java", "{json}");
+            assert!(
+                !json[field].is_null(),
+                "{kind:?} must carry {field}: {json}"
+            );
+            assert!(!diagnostic.to_line().is_empty());
+        }
+    }
+
+    #[test]
+    fn unit_closure_keeps_excerpts_a_file_unit_would_supersede() {
+        let index = java_fixture();
+        let seed = member_seed(0, "Service", "used");
+        let seeds = [Unit::File(0), seed.clone()];
+        let graph = build_graph(
+            &index,
+            &seeds,
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(graph
+            .units(&seeds)
+            .contains(&(seed.clone(), 0, Reason::Seed)));
+        assert!(!graph.closure(&seeds).contains(&(seed, 0, Reason::Seed)));
     }
 
     fn callers_fixture(name: &str) -> (std::path::PathBuf, Index) {

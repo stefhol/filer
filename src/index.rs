@@ -123,6 +123,9 @@ pub struct Index {
     /// Number of files re-parsed on this run (for `filer index` stats).
     pub parsed_count: usize,
     pub reused_count: usize,
+    /// Source files (supported extension) that could not be read or parsed and
+    /// therefore are not in the index. Reported as `coverage.files_skipped`.
+    pub files_skipped: usize,
 }
 
 impl Index {
@@ -148,6 +151,8 @@ impl Index {
         };
         index.parsed_count = parsed.iter().filter(|(from_cache, _)| !from_cache).count();
         index.reused_count = parsed.len() - index.parsed_count;
+        // Candidate source files that got no entry: unreadable or unparsable.
+        index.files_skipped = paths.len() - parsed.len();
 
         for (position, file) in index.files.iter().enumerate() {
             index.by_rel.insert(file.rel.clone(), position);
