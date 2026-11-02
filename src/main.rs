@@ -4,14 +4,17 @@ mod bundle;
 mod index;
 mod java;
 mod resolve;
+mod state;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
 use bundle::{BundleFile, BundleOptions};
 use index::{FileEntry, Index};
-use resolve::ResolveOptions;
+use resolve::{Reason, ResolveOptions};
+use state::{BundleState, StateFile};
 
 #[derive(Parser)]
 #[command(
@@ -38,6 +41,8 @@ enum Command {
     Deps(DepsArgs),
     /// Build the index cache and print stats.
     Index,
+    /// Show or clear the saved bundle state.
+    State(StateArgs),
 }
 
 #[derive(Args)]
@@ -51,6 +56,9 @@ struct SearchArgs {
     /// Human-readable output instead of JSON lines.
     #[arg(long)]
     plain: bool,
+    /// Mark files already in the bundle at this state file.
+    #[arg(long, value_name = "FILE")]
+    state: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -73,6 +81,12 @@ struct BundleArgs {
     /// Write the bundle to a file instead of stdout.
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
+    /// Carry the previous bundle over from this state file and update it.
+    #[arg(long, value_name = "FILE")]
+    state: Option<PathBuf>,
+    /// Start from an empty bundle instead of the saved state.
+    #[arg(long)]
+    reset: bool,
 }
 
 #[derive(Args)]
@@ -88,6 +102,16 @@ struct DepsArgs {
     json: bool,
 }
 
+#[derive(Args)]
+struct StateArgs {
+    /// Delete the state file.
+    #[arg(long)]
+    clear: bool,
+    /// State file. Defaults to <root>/.filer/bundle.toml.
+    #[arg(long, value_name = "FILE")]
+    file: Option<PathBuf>,
+}
+
 fn main() {
     let cli = Cli::parse();
     let root = cli
@@ -100,11 +124,26 @@ fn main() {
         Command::Bundle(args) => bundle_cmd(&root, args),
         Command::Deps(args) => deps(&root, args),
         Command::Index => index_cmd(&root),
+        Command::State(args) => state_cmd(&root, args),
     }
 }
 
 fn search(root: &Path, args: SearchArgs) {
     let index = Index::build(root);
+    let included = args
+        .state
+        .as_ref()
+        .and_then(|path| state::load(path))
+        .filter(|saved| !saved.is_stale(&index.root))
+        .map(|saved| {
+            saved
+                .files
+                .into_iter()
+                .map(|file| (file.path, (file.depth, Reason::from_str(&file.reason))))
+                .collect::<HashMap<String, (u32, Reason)>>()
+        })
+        .unwrap_or_default();
+
     let query = args.query.trim().to_lowercase();
     let tokens: Vec<&str> = query.split_whitespace().collect();
 
@@ -120,14 +159,19 @@ fn search(root: &Path, args: SearchArgs) {
     });
 
     for (_, file) in matches.into_iter().take(args.limit) {
+        let bundled = included.get(&file.rel).copied();
         if args.plain {
-            println!("{}\t{}", file.label(), file.rel);
+            let marker = if bundled.is_some() { "*" } else { " " };
+            println!("{marker}\t{}\t{}", file.label(), file.rel);
         } else {
             let value = serde_json::json!({
                 "path": file.rel,
                 "fqn": file.primary_fqn(),
                 "package": file.package,
                 "types": file.types,
+                "included": bundled.is_some(),
+                "depth": bundled.map(|(depth, _)| depth),
+                "reason": bundled.map(|(_, reason)| reason.as_str()),
             });
             println!("{value}");
         }
@@ -164,6 +208,29 @@ fn score(file: &FileEntry, query: &str, tokens: &[&str]) -> Option<u8> {
 fn bundle_cmd(root: &Path, args: BundleArgs) {
     let index = Index::build(root);
     let root = index.root.clone();
+    let state_path = args.state.clone();
+
+    // Files carried over from the previous bundle, unless the branch changed.
+    let mut previous: HashMap<usize, (u32, Reason)> = HashMap::new();
+    if let Some(path) = &state_path {
+        if !args.reset {
+            if let Some(saved) = state::load(path) {
+                if saved.is_stale(&root) {
+                    eprintln!(
+                        "filer: dropping bundle from branch {} (now {})",
+                        saved.branch,
+                        state::current_branch(&root)
+                    );
+                } else {
+                    for file in saved.files {
+                        if let Some(&position) = index.by_rel.get(&file.path) {
+                            previous.insert(position, (file.depth, Reason::from_str(&file.reason)));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let mut seeds: Vec<usize> = Vec::new();
     let mut extras: Vec<BundleFile> = Vec::new();
@@ -180,31 +247,43 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                     rel: rel.clone(),
                     abs: root.join(&rel),
                     depth: 0,
-                    note: Some("not indexed, no imports followed".to_string()),
+                    reason: Reason::External,
                 }),
             },
             None => eprintln!("filer: skipping {input}: not inside {}", root.display()),
         }
     }
 
-    let options = ResolveOptions {
-        depth: args.depth,
-        same_package: args.with_same_package,
-    };
-    let order = resolve::closure(&index, &seeds, options);
+    let resolved = resolve::closure_detailed(
+        &index,
+        &seeds,
+        ResolveOptions {
+            depth: args.depth,
+            same_package: args.with_same_package,
+        },
+    );
+    let fresh = resolved.len();
 
-    let mut files: Vec<BundleFile> = order
-        .iter()
-        .map(|&(position, depth)| {
-            let entry = &index.files[position];
-            BundleFile {
-                rel: entry.rel.clone(),
-                abs: entry.abs.clone(),
-                depth,
-                note: None,
+    let mut merged = previous.clone();
+    for &(position, depth, reason) in &resolved {
+        match merged.get(&position) {
+            Some(&(existing_depth, _)) if existing_depth <= depth => {}
+            _ => {
+                merged.insert(position, (depth, reason));
             }
+        }
+    }
+
+    let mut files: Vec<BundleFile> = merged
+        .into_iter()
+        .map(|(position, (depth, reason))| BundleFile {
+            rel: index.files[position].rel.clone(),
+            abs: index.files[position].abs.clone(),
+            depth,
+            reason,
         })
         .collect();
+    files.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.rel.cmp(&b.rel)));
 
     if args.with_config {
         files.extend(config_files(&root));
@@ -216,12 +295,34 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
         std::process::exit(1);
     }
 
+    let saved_state = if state_path.is_some() {
+        let mut saved = BundleState::new(&root, args.depth);
+        saved.files = files
+            .iter()
+            .map(|file| StateFile {
+                path: file.rel.clone(),
+                depth: file.depth,
+                reason: file.reason.as_str().to_string(),
+            })
+            .collect();
+        Some(saved)
+    } else {
+        None
+    };
+
     let bundle_options = BundleOptions {
         title: args.title,
         depth: args.depth,
+        appendix: saved_state.as_ref().map(state::to_toml),
         ..Default::default()
     };
     let markdown = bundle::render(&index, &files, &bundle_options);
+
+    if let (Some(path), Some(saved)) = (&state_path, &saved_state) {
+        if let Err(error) = state::save(path, saved) {
+            eprintln!("filer: cannot write state {}: {error}", path.display());
+        }
+    }
 
     match args.out {
         Some(path) => {
@@ -229,9 +330,17 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                 eprintln!("filer: cannot write {}: {error}", path.display());
                 std::process::exit(1);
             }
-            eprintln!("filer: wrote {} ({} files)", path.display(), files.len());
+            eprintln!(
+                "filer: wrote {} ({} files, {} new)",
+                path.display(),
+                files.len(),
+                fresh
+            );
         }
-        None => print!("{markdown}"),
+        None => {
+            print!("{markdown}");
+            eprintln!("filer: {} files, {} new on this run", files.len(), fresh);
+        }
     }
 }
 
@@ -247,7 +356,7 @@ fn deps(root: &Path, args: DepsArgs) {
         std::process::exit(1);
     };
 
-    let order = resolve::closure(
+    let order = resolve::closure_detailed(
         &index,
         &[position],
         ResolveOptions {
@@ -259,20 +368,30 @@ fn deps(root: &Path, args: DepsArgs) {
     if args.json {
         let value: Vec<_> = order
             .iter()
-            .map(|&(position, depth)| {
+            .map(|&(position, depth, reason)| {
                 let file = &index.files[position];
-                serde_json::json!({ "path": file.rel, "fqn": file.primary_fqn(), "depth": depth })
+                serde_json::json!({
+                    "path": file.rel,
+                    "fqn": file.primary_fqn(),
+                    "depth": depth,
+                    "reason": reason.as_str(),
+                })
             })
             .collect();
         println!("{}", serde_json::json!(value));
         return;
     }
 
-    for &(position, depth) in &order {
+    for &(position, depth, reason) in &order {
+        let suffix = match (depth, reason) {
+            (0, _) => String::new(),
+            (_, reason) => format!(" ({})", reason.as_str()),
+        };
         println!(
-            "{}{}",
+            "{}{}{}",
             "  ".repeat(depth as usize),
-            index.files[position].rel
+            index.files[position].rel,
+            suffix
         );
     }
 
@@ -283,7 +402,7 @@ fn deps(root: &Path, args: DepsArgs) {
 
 fn index_cmd(root: &Path) {
     let index = Index::build(root);
-    println!("root:      {}", index.root.display());
+    println!("root:       {}", index.root.display());
     println!("java files: {}", index.files.len());
     println!("packages:   {}", index.by_package.len());
     println!("types:      {}", index.by_fqn.len());
@@ -291,6 +410,68 @@ fn index_cmd(root: &Path) {
         "cache:      {} reused, {} parsed",
         index.reused_count, index.parsed_count
     );
+
+    let path = state::default_path(&index.root);
+    match state::load(&path) {
+        Some(saved) => println!(
+            "state:      {} files, branch {}, {}",
+            saved.files.len(),
+            if saved.branch.is_empty() {
+                "none"
+            } else {
+                &saved.branch
+            },
+            if saved.is_stale(&index.root) {
+                "STALE (branch changed)"
+            } else {
+                "current"
+            }
+        ),
+        None => println!("state:      none at {}", path.display()),
+    }
+}
+
+fn state_cmd(root: &Path, args: StateArgs) {
+    let path = args.file.unwrap_or_else(|| {
+        state::default_path(&root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
+    });
+
+    if args.clear {
+        match state::clear(&path) {
+            Ok(true) => println!("filer: cleared {}", path.display()),
+            Ok(false) => println!("filer: no state at {}", path.display()),
+            Err(error) => {
+                eprintln!("filer: cannot remove {}: {error}", path.display());
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let Some(saved) = state::load(&path) else {
+        println!("filer: no state at {}", path.display());
+        return;
+    };
+    println!("state:  {}", path.display());
+    println!(
+        "branch: {}",
+        if saved.branch.is_empty() {
+            "(not a git repo)"
+        } else {
+            &saved.branch
+        }
+    );
+    if saved.is_stale(root) {
+        println!(
+            "note:   written on {}, now on {} — next bundle starts fresh",
+            saved.branch,
+            state::current_branch(root)
+        );
+    }
+    println!("files:  {}", saved.files.len());
+    for file in &saved.files {
+        println!("  {} (depth {}, {})", file.path, file.depth, file.reason);
+    }
 }
 
 fn locate(index: &Index, root: &Path, input: &str) -> Option<String> {
@@ -331,7 +512,7 @@ fn config_files(root: &Path) -> Vec<BundleFile> {
                 rel: name.to_string(),
                 abs: path,
                 depth: 0,
-                note: Some("build config".to_string()),
+                reason: Reason::Config,
             })
         })
         .collect()

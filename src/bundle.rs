@@ -4,11 +4,14 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::index::Index;
+use crate::resolve::Reason;
 
 pub struct BundleOptions {
     pub title: Option<String>,
     pub depth: u32,
     pub max_file_bytes: u64,
+    /// Machine-readable TOML listing the bundled files, appended to the bundle.
+    pub appendix: Option<String>,
 }
 
 impl Default for BundleOptions {
@@ -17,6 +20,7 @@ impl Default for BundleOptions {
             title: None,
             depth: 2,
             max_file_bytes: 1024 * 1024,
+            appendix: None,
         }
     }
 }
@@ -25,8 +29,8 @@ pub struct BundleFile {
     pub rel: String,
     pub abs: PathBuf,
     pub depth: u32,
-    /// Extra qualifier shown in the file list, e.g. `build config`.
-    pub note: Option<String>,
+    /// Why the file is in the bundle; shown in the file list.
+    pub reason: Reason,
 }
 
 pub fn render(index: &Index, files: &[BundleFile], options: &BundleOptions) -> String {
@@ -45,19 +49,27 @@ pub fn render(index: &Index, files: &[BundleFile], options: &BundleOptions) -> S
 
     out.push_str("## Files\n\n");
     for file in files {
-        match file.depth {
-            0 => out.push_str(&format!("- `{}`\n", file.rel)),
-            depth => out.push_str(&format!("- `{}` (import depth {depth})\n", file.rel)),
-        }
+        let detail = match (file.depth, file.reason) {
+            (0, Reason::Seed) => String::new(),
+            (0, reason) => format!(" ({})", reason.as_str()),
+            (depth, reason) => format!(" (depth {depth}, {})", reason.as_str()),
+        };
+        out.push_str(&format!("- `{}`{detail}\n", file.rel));
     }
     out.push_str("\n## Contents\n");
 
     for file in files {
         out.push_str(&format!("\n### `{}`\n\n", file.rel));
-        if let Some(note) = &file.note {
-            out.push_str(&format!("_{note}_\n\n"));
-        }
         out.push_str(&file_body(file, options));
+    }
+
+    if let Some(appendix) = &options.appendix {
+        out.push_str("\n## Bundle state\n\n");
+        out.push_str("Machine-readable list of what this bundle contains. ");
+        out.push_str("`:FilerReset` (or `filer state --clear`) drops it.\n\n");
+        out.push_str("```toml\n");
+        out.push_str(appendix.trim_end());
+        out.push_str("\n```\n");
     }
 
     out

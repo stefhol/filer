@@ -15,6 +15,10 @@ vim.api.nvim_create_user_command("FilerHere", function()
   filer().here()
 end, { desc = "filer: bundle current file with its imports" })
 
+vim.api.nvim_create_user_command("FilerReset", function()
+  filer().reset()
+end, { desc = "filer: forget the current bundle state" })
+
 vim.api.nvim_create_user_command("FilerBundle", function(args)
   local paths = args.fargs
   if #paths == 1 and paths[1] == "%" then

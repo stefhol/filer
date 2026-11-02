@@ -2,10 +2,62 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::index::{FileEntry, Index};
-use crate::java::Import;
-#[cfg(test)]
-use crate::java::ImportKind;
+use crate::java::{Import, ImportKind};
+
+/// Why a file ended up in a bundle. Serialized as a kebab-case string in the
+/// state file, e.g. `reason = "same-package"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Reason {
+    /// Picked explicitly.
+    Seed,
+    Import,
+    StaticImport,
+    WildcardImport,
+    /// Referenced by name without an import, in the same package.
+    SamePackage,
+    /// Referenced by name and unique in the repo.
+    Usage,
+    /// Pulled in by `--with-same-package`.
+    Package,
+    /// Build file (pom.xml, build.gradle).
+    Config,
+    /// Handed in but not part of the index.
+    External,
+}
+
+impl Reason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reason::Seed => "seed",
+            Reason::Import => "import",
+            Reason::StaticImport => "static-import",
+            Reason::WildcardImport => "wildcard-import",
+            Reason::SamePackage => "same-package",
+            Reason::Usage => "usage",
+            Reason::Package => "package",
+            Reason::Config => "config",
+            Reason::External => "external",
+        }
+    }
+
+    pub fn from_str(text: &str) -> Reason {
+        match text {
+            "seed" => Reason::Seed,
+            "import" => Reason::Import,
+            "static-import" => Reason::StaticImport,
+            "wildcard-import" => Reason::WildcardImport,
+            "same-package" => Reason::SamePackage,
+            "package" => Reason::Package,
+            "config" => Reason::Config,
+            "external" => Reason::External,
+            _ => Reason::Usage,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveOptions {
@@ -77,7 +129,7 @@ pub fn resolve_import(index: &Index, import: &Import) -> Vec<usize> {
 ///
 /// Explicitly imported names are skipped (the import resolution handles those),
 /// and ambiguous simple names are left out rather than guessed wrong.
-pub fn resolve_uses(index: &Index, file: &FileEntry) -> Vec<usize> {
+pub fn resolve_uses(index: &Index, file: &FileEntry) -> Vec<(usize, Reason)> {
     let imported: HashSet<&str> = file
         .imports
         .iter()
@@ -99,25 +151,29 @@ pub fn resolve_uses(index: &Index, file: &FileEntry) -> Vec<usize> {
             .filter(|&position| index.files[position].package == file.package)
             .collect();
         match same_package.len() {
-            1 => resolved.push(same_package[0]),
-            0 if candidates.len() == 1 => resolved.push(candidates[0]),
+            1 => resolved.push((same_package[0], Reason::SamePackage)),
+            0 if candidates.len() == 1 => resolved.push((candidates[0], Reason::Usage)),
             _ => {}
         }
     }
     resolved
 }
 
-/// Breadth-first closure over imports and type usages. Returns
-/// `(file index, depth)` pairs in
-/// discovery order, seeds first (depth 0), duplicates removed.
-pub fn closure(index: &Index, seeds: &[usize], options: ResolveOptions) -> Vec<(usize, u32)> {
+/// Breadth-first closure over imports and type usages, keeping track of why
+/// each file was pulled in. Returns `(file index, depth, reason)` in discovery
+/// order, seeds first (depth 0), duplicates removed.
+pub fn closure_detailed(
+    index: &Index,
+    seeds: &[usize],
+    options: ResolveOptions,
+) -> Vec<(usize, u32, Reason)> {
     let mut depth_of: HashMap<usize, u32> = HashMap::new();
-    let mut order: Vec<(usize, u32)> = Vec::new();
+    let mut order: Vec<(usize, u32, Reason)> = Vec::new();
     let mut queue: VecDeque<usize> = VecDeque::new();
 
     for &seed in seeds {
         if depth_of.insert(seed, 0).is_none() {
-            order.push((seed, 0));
+            order.push((seed, 0, Reason::Seed));
             queue.push_back(seed);
         }
     }
@@ -131,33 +187,50 @@ pub fn closure(index: &Index, seeds: &[usize], options: ResolveOptions) -> Vec<(
             continue;
         };
 
-        let mut neighbours: Vec<usize> = file
-            .imports
-            .iter()
-            .flat_map(|import| resolve_import(index, import))
-            .chain(resolve_uses(index, file))
-            .collect();
+        let mut neighbours: Vec<(usize, Reason)> = Vec::new();
+        for import in &file.imports {
+            let reason = match import.kind {
+                ImportKind::Type => Reason::Import,
+                ImportKind::Static => Reason::StaticImport,
+                ImportKind::Wildcard => Reason::WildcardImport,
+            };
+            neighbours.extend(
+                resolve_import(index, import)
+                    .into_iter()
+                    .map(|p| (p, reason)),
+            );
+        }
+        neighbours.extend(resolve_uses(index, file));
 
         if options.same_package {
             if let Some(package) = &file.package {
                 if let Some(siblings) = index.by_package.get(package) {
-                    neighbours.extend(siblings.iter().copied());
+                    neighbours.extend(siblings.iter().copied().map(|p| (p, Reason::Package)));
                 }
             }
         }
 
-        for neighbour in neighbours {
+        for (neighbour, reason) in neighbours {
             if depth_of.contains_key(&neighbour) {
                 continue;
             }
             let depth = current_depth + 1;
             depth_of.insert(neighbour, depth);
-            order.push((neighbour, depth));
+            order.push((neighbour, depth, reason));
             queue.push_back(neighbour);
         }
     }
 
     order
+}
+
+/// Closure without provenance, for plain listings.
+#[cfg(test)]
+pub fn closure(index: &Index, seeds: &[usize], options: ResolveOptions) -> Vec<(usize, u32)> {
+    closure_detailed(index, seeds, options)
+        .into_iter()
+        .map(|(position, depth, _)| (position, depth))
+        .collect()
 }
 
 /// All imports of `file` that could not be resolved inside the project (JDK,
@@ -284,11 +357,11 @@ mod tests {
     #[test]
     fn resolves_same_package_references_without_imports() {
         let mut index = fixture();
-        // RunService references Unused (same package) with no import at all.
+        // RunService references Unused in its own package, with no import at all.
         index.files.push(FileEntry {
-            rel: "src/main/java/app/RunService.java".to_string(),
-            abs: PathBuf::from("/repo/src/main/java/app/RunService.java"),
-            package: Some("app".to_string()),
+            rel: "src/main/java/app/model/RunService.java".to_string(),
+            abs: PathBuf::from("/repo/src/main/java/app/model/RunService.java"),
+            package: Some("app.model".to_string()),
             types: vec!["RunService".to_string()],
             imports: vec![],
             uses: vec!["Unused".to_string(), "String".to_string()],
@@ -298,7 +371,7 @@ mod tests {
         let resolved = resolve_uses(&index, &index.files[position]);
         assert_eq!(
             resolved,
-            vec![3],
+            vec![(3, Reason::SamePackage)],
             "Unused is found by name, String is not in the repo"
         );
         assert_eq!(index.files[3].rel, "src/main/java/app/model/Unused.java");
@@ -316,7 +389,7 @@ mod tests {
         let resolved = resolve_uses(&index, &index.files[0]);
         // Imported names are left to resolve_import; only the self reference is
         // inferred here (and deduplicated by the closure).
-        assert_eq!(resolved, vec![0]);
+        assert_eq!(resolved, vec![(0, Reason::SamePackage)]);
     }
 
     #[test]

@@ -16,9 +16,20 @@ M.config = {
   split = "vsplit",
   -- Also put the bundle into the system clipboard.
   copy = false,
+  -- Remember what is already bundled in a TOML state file, and mark those
+  -- files in the picker.
+  state = true,
+  -- State file path. nil = <root>/.filer/bundle.toml
+  state_file = nil,
 }
 
 local bin_cache = nil
+
+--- Notifies without doubling the binary's own "filer: " prefix.
+local function notify(message, level)
+  local text = vim.trim(message or ""):gsub("^filer:%s*", "")
+  vim.notify("filer: " .. (text ~= "" and text or "failed"), level or vim.log.levels.INFO)
+end
 
 local function config_root()
   local root = M.config.root
@@ -45,6 +56,14 @@ function M.root()
     "mvnw",
   }
   return vim.fs.root(0, markers) or vim.fn.getcwd()
+end
+
+--- Where the bundle state lives for `root`.
+function M.state_path(root)
+  if M.config.state_file then
+    return (M.config.state_file:gsub("^~", vim.env.HOME or "~"))
+  end
+  return (root or M.root()) .. "/.filer/bundle.toml"
 end
 
 --- Absolute path (or bare command) of the filer binary.
@@ -90,7 +109,7 @@ function M.search(opts)
   opts = opts or {}
   local ok, pickers = pcall(require, "telescope.pickers")
   if not ok then
-    vim.notify("filer: Telescope is required for :FilerSearch", vim.log.levels.ERROR)
+    notify("Telescope is required for :FilerSearch", vim.log.levels.ERROR)
     return
   end
   local finders = require("telescope.finders")
@@ -100,6 +119,10 @@ function M.search(opts)
 
   local root = opts.root or M.root()
   local depth = opts.depth or M.config.depth
+  local use_state = opts.state
+  if use_state == nil then
+    use_state = M.config.state
+  end
 
   local entry_maker = function(line)
     local decoded_ok, item = pcall(vim.json.decode, line)
@@ -107,13 +130,23 @@ function M.search(opts)
       return nil
     end
     local fqn = item.fqn or ""
+    local label = fqn ~= "" and fqn or item.path
+    local included = item.included == true
+    if included then
+      local detail = item.reason or (item.depth and ("depth " .. item.depth)) or nil
+      if item.depth and item.reason then
+        detail = "depth " .. item.depth .. ", " .. item.reason
+      end
+      label = "✓ " .. label .. (detail and ("  (" .. detail .. ")") or "")
+    end
     return {
       value = item,
       path = item.path,
       fqn = fqn,
+      included = included,
       filename = root .. "/" .. item.path,
       ordinal = (fqn ~= "" and (fqn .. " ") or "") .. item.path,
-      display = fqn ~= "" and fqn or item.path,
+      display = label,
     }
   end
 
@@ -121,7 +154,12 @@ function M.search(opts)
     prompt_title = "filer: Java types (" .. vim.fn.fnamemodify(root, ":t") .. ")",
     results_title = "files · <Tab> to multi-select",
     finder = finders.new_job(function(prompt)
-      return { M.bin(), "search", "--root", root, "--query", prompt or "" }
+      local args = { M.bin(), "search", "--root", root, "--query", prompt or "" }
+      if use_state then
+        table.insert(args, "--state")
+        table.insert(args, M.state_path(root))
+      end
+      return args
     end, entry_maker, 5000),
     previewer = conf.file_previewer({}),
     sorter = conf.generic_sorter({}),
@@ -129,20 +167,24 @@ function M.search(opts)
       actions.select_default:replace(function()
         local current = action_state.get_current_picker(prompt_bufnr)
         local selected = current:get_multi_selection()
-        local paths = {}
         if #selected == 0 then
           local entry = action_state.get_selected_entry()
-          if not entry then
-            actions.close(prompt_bufnr)
-            return
-          end
-          paths[1] = entry.path
-        else
-          for _, entry in ipairs(selected) do
+          selected = entry and { entry } or {}
+        end
+        local paths = {}
+        local already = 0
+        for _, entry in ipairs(selected) do
+          if entry.included then
+            already = already + 1
+          else
             paths[#paths + 1] = entry.path
           end
         end
         actions.close(prompt_bufnr)
+        if #paths == 0 then
+          notify(already > 0 and "already in the bundle — :FilerReset to start over" or "nothing selected")
+          return
+        end
         M.bundle(paths, { root = root, depth = depth })
       end)
       return true
@@ -158,7 +200,7 @@ function M.bundle(paths, opts)
     paths = { paths }
   end
   if #paths == 0 then
-    vim.notify("filer: no files selected", vim.log.levels.WARN)
+    notify("no files selected", vim.log.levels.WARN)
     return
   end
 
@@ -166,6 +208,10 @@ function M.bundle(paths, opts)
   local depth = opts.depth or M.config.depth
   local same_package = opts.same_package == nil and M.config.same_package or opts.same_package
   local with_config = opts.with_config == nil and M.config.with_config or opts.with_config
+  local use_state = opts.state
+  if use_state == nil then
+    use_state = M.config.state
+  end
 
   local args = { "bundle", "--root", root, "--depth", tostring(depth) }
   if same_package then
@@ -174,12 +220,22 @@ function M.bundle(paths, opts)
   if with_config then
     table.insert(args, "--with-config")
   end
+  if use_state then
+    table.insert(args, "--state")
+    table.insert(args, M.state_path(root))
+    if opts.reset then
+      table.insert(args, "--reset")
+    end
+  end
   table.insert(args, "--")
 
   local stdout, stderr, code = run(vim.list_extend(args, paths), root)
   if code ~= 0 then
-    vim.notify("filer: " .. (stderr ~= "" and vim.trim(stderr) or "bundle failed"), vim.log.levels.ERROR)
+    notify(stderr ~= "" and stderr or "bundle failed", vim.log.levels.ERROR)
     return
+  end
+  if stderr ~= "" then
+    notify((stderr:gsub("\n", " ")))
   end
   M.open(stdout, opts)
 end
@@ -189,10 +245,22 @@ function M.here(opts)
   opts = opts or {}
   local name = vim.api.nvim_buf_get_name(0)
   if name == "" then
-    vim.notify("filer: current buffer is not a file", vim.log.levels.WARN)
+    notify("current buffer is not a file", vim.log.levels.WARN)
     return
   end
   M.bundle({ name }, opts)
+end
+
+--- Drops the saved bundle state, so the next bundle starts empty.
+function M.reset(opts)
+  opts = opts or {}
+  local root = opts.root or M.root()
+  local stdout, stderr, code = run({ "state", "--clear", "--file", M.state_path(root), "--root", root }, root)
+  if code ~= 0 then
+    notify(stderr ~= "" and stderr or "reset failed", vim.log.levels.ERROR)
+    return
+  end
+  notify(stdout ~= "" and stdout or "bundle state cleared")
 end
 
 --- Opens markdown text in a scratch split.
@@ -222,7 +290,7 @@ function M.open(text, opts)
 
   if (opts.copy ~= nil and opts.copy) or (opts.copy == nil and M.config.copy) then
     vim.fn.setreg("+", text)
-    vim.notify("filer: bundle copied to clipboard")
+    notify("bundle copied to clipboard")
   end
 end
 

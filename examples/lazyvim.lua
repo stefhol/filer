@@ -34,6 +34,12 @@ return {
       split = "vsplit",
       -- true = also copy the bundle to the system clipboard.
       copy = false,
+      -- Remember what is bundled in <root>/.filer/bundle.toml and mark it in
+      -- the picker. Reset with :FilerReset. Branch changes reset it
+      -- automatically.
+      state = true,
+      -- State file path. nil = <root>/.filer/bundle.toml
+      state_file = nil,
     },
   },
 }

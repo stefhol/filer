@@ -31,6 +31,9 @@ whole picture instead of a fragment.
 - Follows type *usages* too, so a class that references a sibling in its own package — which
   Java needs no import for, e.g. `indexOps(DemoDocument.class)` — still pulls that file in.
 - Walks the resulting graph to a configurable depth.
+- Remembers what is already bundled in a TOML state file, marks those files with `✓` in the
+  picker, and grows the bundle instead of replacing it. Switching git branch kills the old
+  state automatically.
 - Renders the selection as markdown: header, file list with import depths, then one fenced
   block per file. Fences grow automatically if a file already contains backticks.
 - Caches the index in `~/.cache/filer/`, keyed by root path and invalidated per file by
@@ -80,6 +83,8 @@ cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
     with_config = false,  -- also add pom.xml / build.gradle
     split = "vsplit",     -- or "split", "tabnew"
     copy = false,         -- true = also copy the bundle to the system clipboard
+    state = true,         -- remember the bundle and mark it in the picker
+    state_file = nil,     -- nil = <root>/.filer/bundle.toml
   },
 }
 ```
@@ -94,12 +99,60 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 | `:FilerSearch` | Telescope picker. `<Tab>` multi-selects, `<CR>` bundles. |
 | `:FilerHere` | Bundles the current buffer's file with its imports. |
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute). |
+| `:FilerReset` | Forgets the current bundle state; the next bundle starts empty. |
 
 In the bundle buffer: `y` yanks, `q` closes. The buffer is `nofile`, not written to disk,
 and not added to `:ls` history beyond its split.
 
 Root detection uses `vim.fs.root` with markers `.git`, `pom.xml`, `build.gradle(.kts)`,
 `settings.gradle(.kts)`, `gradlew`, `mvnw`. Override with `opts.root` (string or function).
+
+## Bundle state
+
+With `state = true` (the default) the binary writes `.filer/bundle.toml` next to the project:
+
+```toml
+# filer bundle state — `:FilerReset` or `filer state --clear` removes it
+root = "/home/me/code/demo"
+branch = "feature/checkout"
+created = 1793618434
+depth = 2
+
+[[files]]
+path = "demo/src/main/java/com/example/demo/RunService.java"
+depth = 0
+reason = "seed"
+
+[[files]]
+path = "demo/src/main/java/com/example/demo/DemoDocument.java"
+depth = 1
+reason = "same-package"
+```
+
+What that buys you:
+
+- The picker shows bundled files as `✓ com.example.demo.DemoDocument  (depth 1, same-package)`.
+  Selecting one is a no-op instead of a duplicate.
+- The next bundle is a **superset**: previous files are kept, new picks are added, depths are
+  the minimum over both runs. Bundle `Application`, then `RunService`, and you get all of it.
+- The bundle itself ends with a `## Bundle state` section holding the same TOML, so the model
+  and you can see exactly what came in and why. Escaping is handled (longer fences when a
+  file contains backticks).
+- `reason` is one of `seed`, `import`, `static-import`, `wildcard-import`, `same-package`,
+  `usage`, `package`, `config`, `external`.
+
+Cleaning up:
+
+| Situation | What to do |
+| --- | --- |
+| New ticket, fresh bundle | `:FilerReset` (or `filer state --clear`) |
+| Switched branch | Nothing — a branch mismatch is detected and the old bundle is dropped, with a notice |
+| Want a one-off bundle, no state | `:FilerBundle` with `opts.state = false`, or `filer bundle` without `--state` |
+| See what is stored | `filer state` |
+
+`.filer/.gitignore` containing `*` is created automatically, so the state never shows up in
+`git status` and your own `.gitignore` is left alone. Detached HEADs are recorded as
+`detached@<sha>`; repos without git simply store an empty branch and never go stale.
 
 ## CLI
 
@@ -110,6 +163,13 @@ filer --root ~/code/demo deps src/main/java/com/example/app/Application.java
 filer --root ~/code/demo bundle --depth 2 --with-config \
       src/main/java/com/example/app/Application.java > bundle.md
 filer --root ~/code/demo index                         # cache stats
+filer --root ~/code/demo state                         # what is in the bundle?
+filer --root ~/code/demo state --clear                 # forget it
+
+# stateful bundling: bundle twice, get the union
+filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml A.java > a.md
+filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml B.java > ab.md
+filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C.java > c.md
 ```
 
 `bundle` flags: `--depth N` (0 = only the given files), `--with-same-package`,
@@ -147,10 +207,12 @@ src/java.rs     tree-sitter-java parsing + tests
 src/index.rs    tree walk, parallelism, disk cache
 src/resolve.rs  import resolution, closure, tests
 src/bundle.rs   markdown rendering, tests
+src/state.rs    TOML bundle state, branch detection, tests
 lua/filer/      Neovim plugin: picker, bundling, bundle buffer
 plugin/filer.lua user commands
 examples/lazyvim.lua  copy-paste LazyVim spec with the defaults above
 ```
 
 `cargo test` covers parsing, static/wildcard imports, name inference without imports,
-closure depth, same-package expansion and fence selection.
+closure depth, same-package expansion, fence selection, TOML round-trips and branch
+staleness.
