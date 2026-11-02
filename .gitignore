@@ -1,2 +1,4 @@
 /target
 *.bundle.md
+node_modules/
+bun.lockb
