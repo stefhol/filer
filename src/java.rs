@@ -3,8 +3,8 @@
 use tree_sitter::{Node, Parser};
 
 use crate::lang::{
-    finish_symbols, line_of, symbol_from_node, Call, Import, ImportKind, Member, MemberKind,
-    Receiver, Source, Symbol, SymbolKind,
+    end_line_of, finish_symbols, line_of, symbol_from_node, Call, Import, ImportKind, Member,
+    MemberKind, Receiver, Source, Symbol, SymbolKind,
 };
 
 pub struct JavaParser {
@@ -156,6 +156,7 @@ fn collect_members(class: Node<'_>, src: &str, symbol: &mut Symbol) {
                         start,
                         end: member.end_byte(),
                         line: line_of(src, start),
+                        end_line: end_line_of(src, start, member.end_byte()),
                         body_start,
                         params: parameter_names(member, src),
                         locals: local_names(member, src),
@@ -315,6 +316,7 @@ fn calls_in(member: Node<'_>, src: &str) -> Vec<Call> {
                     out.push(Call {
                         name: text_of(name, src),
                         receiver,
+                        line: line_of(src, node.start_byte()),
                     });
                 }
             }
@@ -327,6 +329,7 @@ fn calls_in(member: Node<'_>, src: &str) -> Vec<Call> {
                         out.push(Call {
                             name,
                             receiver: receiver_of(*first, src),
+                            line: line_of(src, node.start_byte()),
                         });
                     }
                 }

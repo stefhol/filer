@@ -741,7 +741,12 @@ fn symbol_neighbours(
         .filter_map(|import| import.path.rsplit('.').next())
         .collect();
 
-    for name in symbol.calls.iter().chain(symbol.uses.iter()) {
+    for name in symbol
+        .calls
+        .iter()
+        .map(|call| &call.name)
+        .chain(symbol.uses.iter())
+    {
         if name == symbol_name || imported.contains(name.as_str()) {
             continue;
         }
@@ -1216,7 +1221,7 @@ fn class_calls(
     // Rust free functions are top-level symbols with no members. Their calls
     // are recorded by name, so resolve them directly.
     if family == Some(Family::Rust) {
-        for name in &class.calls {
+        for name in class.calls.iter().map(|call| &call.name) {
             for unit in rust_function_units(index, name, family, Some(position)) {
                 out.push((unit, Reason::Call));
             }
@@ -1413,8 +1418,16 @@ mod tests {
             start,
             end,
             line: 1,
+            end_line: 1,
             uses: uses.iter().map(|name| name.to_string()).collect(),
-            calls: calls.iter().map(|name| name.to_string()).collect(),
+            calls: calls
+                .iter()
+                .map(|name| crate::lang::Call {
+                    name: name.to_string(),
+                    receiver: Receiver::Bare,
+                    line: 1,
+                })
+                .collect(),
             members: Vec::new(),
             fields: Vec::new(),
             supertypes: Vec::new(),
@@ -1449,6 +1462,7 @@ mod tests {
             start: 0,
             end: 10,
             line: 1,
+            end_line: 1,
             body_start: Some(5),
             params: params
                 .iter()
@@ -1463,6 +1477,7 @@ mod tests {
                 .map(|(name, receiver)| crate::lang::Call {
                     name: name.to_string(),
                     receiver: receiver.clone(),
+                    line: 1,
                 })
                 .collect(),
         }
@@ -1480,6 +1495,7 @@ mod tests {
             start: 0,
             end: 100,
             line: 1,
+            end_line: 1,
             uses: Vec::new(),
             calls: Vec::new(),
             members,
@@ -2213,6 +2229,7 @@ mod tests {
         index.files[0].symbols[0].members[0].calls = vec![crate::lang::Call {
             name: "notThere".to_string(),
             receiver: Receiver::Name("repo".to_string()),
+            line: 1,
         }];
         let order = closure_units(
             &index,

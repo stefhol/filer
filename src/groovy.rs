@@ -4,8 +4,8 @@
 use tree_sitter::{Node, Parser};
 
 use crate::lang::{
-    finish_symbols, leading_comment_start, line_of, symbol_from_node, Call, Import, ImportKind,
-    Member, MemberKind, Receiver, Source, Symbol, SymbolKind,
+    end_line_of, finish_symbols, leading_comment_start, line_of, symbol_from_node, Call, Import,
+    ImportKind, Member, MemberKind, Receiver, Source, Symbol, SymbolKind,
 };
 
 const COMMENTS: &[&str] = &["comment", "line_comment", "block_comment"];
@@ -132,6 +132,7 @@ fn collect_members(class: Node<'_>, src: &str, symbol: &mut Symbol) {
                     start,
                     end: member.end_byte(),
                     line: line_of(src, start),
+                    end_line: end_line_of(src, start, member.end_byte()),
                     body_start,
                     params: parameter_names(member.child_by_field_name("parameters"), src),
                     locals: local_names(member, src),
@@ -153,6 +154,7 @@ fn collect_members(class: Node<'_>, src: &str, symbol: &mut Symbol) {
                     start,
                     end: member.end_byte(),
                     line: line_of(src, start),
+                    end_line: end_line_of(src, start, member.end_byte()),
                     body_start,
                     params: parameter_names(member.child_by_field_name("parameters"), src),
                     locals: Vec::new(),
@@ -171,6 +173,7 @@ fn collect_members(class: Node<'_>, src: &str, symbol: &mut Symbol) {
                     start,
                     end: member.end_byte(),
                     line: line_of(src, start),
+                    end_line: end_line_of(src, start, member.end_byte()),
                     body_start,
                     params: Vec::new(),
                     locals: Vec::new(),
@@ -319,7 +322,7 @@ fn calls_in(member: Node<'_>, src: &str) -> Vec<Call> {
     while let Some(node) = stack.pop() {
         if node.kind() == "method_invocation" {
             if let Some(function) = node.child_by_field_name("function") {
-                if let Some(call) = call_of(function, src) {
+                if let Some(call) = call_of(function, src, line_of(src, node.start_byte())) {
                     out.push(call);
                 }
             }
@@ -332,13 +335,14 @@ fn calls_in(member: Node<'_>, src: &str) -> Vec<Call> {
     out
 }
 
-fn call_of(function: Node<'_>, src: &str) -> Option<Call> {
+fn call_of(function: Node<'_>, src: &str, line: usize) -> Option<Call> {
     match function.kind() {
         "identifier" => {
             let name = text_of(function, src);
             (!name.is_empty()).then_some(Call {
                 name,
                 receiver: Receiver::Bare,
+                line,
             })
         }
         "field_access" => {
@@ -349,7 +353,11 @@ fn call_of(function: Node<'_>, src: &str) -> Option<Call> {
                 .child_by_field_name("object")
                 .map(|object| receiver_of(object, src))
                 .unwrap_or(Receiver::Unknown);
-            (!name.is_empty()).then_some(Call { name, receiver })
+            (!name.is_empty()).then_some(Call {
+                name,
+                receiver,
+                line,
+            })
         }
         // `new Repo().size()`.
         "object_creation_expression" => None,
