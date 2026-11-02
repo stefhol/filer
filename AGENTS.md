@@ -71,6 +71,7 @@ cargo build --release          # binary at target/release/filer
 cargo test --all-targets       # unit + integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+cd pi-extension && bun install # once; the tools import typebox and pi-tui
 cd pi-extension && bun test    # extension tests; spawns target/release/filer
 ```
 
@@ -78,7 +79,9 @@ Rust 1.89+ and a C compiler (tree-sitter grammars) are required. The `tree-sitte
 CLI must be installed at runtime, not for building. The pi extension needs Bun; run
 `cargo build --release` first, because its integration tests spawn
 `target/release/filer`; they are skipped when it is missing, which is why the
-`extension` CI job builds it first.
+`extension` CI job builds it first. It also runs `bun install --frozen-lockfile`:
+`src/tools.ts` imports `typebox` and `@earendil-works/pi-tui` at runtime, so the
+suite fails without the dev dependencies. `pi-extension/bun.lock` is committed.
 
 Integration tests live in `tests/` (`atomic_writes.rs`, `diagnostics.rs`,
 `json_surface.rs`) with fixture corpora under `tests/fixtures/`.
