@@ -500,12 +500,20 @@ filer --root ~/code/demo state --clear --all           # forget everything
 filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml A.java > a.md
 filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml B.java > ab.md
 filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C.java > c.md
+
+# seeds from a list instead of argv: one path per line, `#` comments and blank
+# lines skipped, so long lists never hit the argv limit
+rg -l 'discount' | filer --root ~/code/demo bundle --seeds-from - --depth 1 > found.md
+filer --root ~/code/demo bundle --seeds-from @seeds.txt --depth 2 > seeds.md
 ```
 
 `bundle` flags: `--depth N` (0 = only the given units), `--with-same-package`,
-`--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`, `--at-line N`,
+`--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`,
+`--seeds-from -|@FILE` (repeatable), `--at-line N`,
 `--max-bytes N`, `--max-tokens N` (see [Order and budget](#order-and-budget)). `show`
-takes the same two budget flags.
+takes the same two budget flags. With `--seeds-from` the positional files become optional
+and both sources are combined; reading that list is a plain file read — filer never runs
+`git`, so `git diff --name-only | filer bundle --seeds-from -` is your own pipeline.
 Default depth is 2. Global flags: `--json`, `--quiet`, `--include GLOB`, `--exclude GLOB`,
 `--no-ignore` (see below). Add `::Symbol` for one declaration and `::Class.method` for a Java or
 Rust method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
