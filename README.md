@@ -1042,6 +1042,48 @@ the cache is left alone, so the next full walk reuses the result. It prints
 root, non-source files and unreadable files are skipped with a warning instead of failing the
 run. `filer index --update` never resolves, bundles or touches the bundle state.
 
+## pi extension
+
+`pi-extension/` is a thin adapter over the CLI: discovery, spawning, the `schema_version`
+guard and one typed operation per command. It indexes, resolves, slices and renders nothing
+itself — the binary is still the product, and the extension is versioned with it.
+
+```sh
+pi install ./pi-extension   # add a checkout to pi's package list
+pi -e ./pi-extension        # or load it for one invocation, without installing
+```
+
+The extension spawns `filer`, so the binary has to exist: `cargo install --path .` puts it on
+`PATH`, otherwise point at it with `--filer-bin` or `FILER_BIN` (table below).
+
+### Binary and root discovery
+
+| Setting | Flag | Environment | Fallback |
+| --- | --- | --- | --- |
+| binary | `--filer-bin PATH` | `FILER_BIN` | `filer` on `PATH` |
+| project root | `--filer-root DIR` | `FILER_ROOT` | `git rev-parse --show-toplevel`, then the session's working directory |
+
+Both flags are global to pi (`pi --filer-bin /opt/filer/filer`), and the root is what the CLI
+receives as `--root`. The git lookup runs at most once per working directory per session.
+
+### Cap and timeout
+
+Every call is one short-lived `filer` process — no shell, no watcher — capped at 60 s and
+killed on expiry. `FILER_TIMEOUT_MS` (a positive integer, milliseconds) overrides the cap.
+Tool results are cut at 32 KiB or 2000 lines, whichever comes first, and say so in the text
+and in the structured `truncation` field. Discovery is lazy: no process starts until the
+first tool call, so loading the extension in a session-less `pi` invocation costs nothing.
+
+### Version compatibility
+
+The extension parses the JSON surface directly, so it expects `schema_version` 1
+(`src/schema.rs`) and refuses to parse anything else, telling you to update the extension and
+the binary together. Extension and binary ship as one version: a binary from a different
+release is a mismatch error, not half-parsed data.
+
+The tool set and the `/filer` commands are not registered in this installment (#41, #42);
+loading the extension today adds the two flags above.
+
 ## How resolution works
 
 1. Walk the tree, skipping `.git`, `.gradle`, `.idea`, `.filer`, `.venv`, `.next`, `.nuxt`,

@@ -71,10 +71,14 @@ cargo build --release          # binary at target/release/filer
 cargo test --all-targets       # unit + integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+cd pi-extension && bun test    # extension tests; spawns target/release/filer
 ```
 
 Rust 1.89+ and a C compiler (tree-sitter grammars) are required. The `tree-sitter`
-CLI must be installed at runtime, not for building.
+CLI must be installed at runtime, not for building. The pi extension needs Bun; run
+`cargo build --release` first, because its integration tests spawn
+`target/release/filer`; they are skipped when it is missing, which is why the
+`extension` CI job builds it first.
 
 Integration tests live in `tests/` (`atomic_writes.rs`, `diagnostics.rs`,
 `json_surface.rs`) with fixture corpora under `tests/fixtures/`.
@@ -93,6 +97,7 @@ Integration tests live in `tests/` (`atomic_writes.rs`, `diagnostics.rs`,
 | `src/atomic.rs` | atomic + locked file writes |
 | `src/error.rs` | machine-readable errors, exit codes |
 | `src/schema.rs` | JSON `schema_version` |
+| `pi-extension/` | pi extension: adapter over the CLI (spawn, discovery, schema guard, operations) |
 | `lua/filer/`, `plugin/` | Neovim plugin |
 
 ## Conventions
