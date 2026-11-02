@@ -49,6 +49,10 @@ pub struct StateFile {
     /// (`path::symbol`). `None` means the whole file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
+    /// Method kept on the call path, when the entry is a pruned class
+    /// (`path::Class.method`). `None` with a `symbol` means the whole class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
     #[serde(default)]
     pub depth: u32,
     /// `seed`, `import`, `static-import`, `wildcard-import`, `same-package`,
@@ -226,6 +230,7 @@ mod tests {
         StateFile {
             path: path.to_string(),
             symbol: None,
+            member: None,
             depth,
             reason: reason.to_string(),
         }
@@ -262,6 +267,7 @@ mod tests {
                 StateFile {
                     path: "main.fe".to_string(),
                     symbol: Some("riskValue".to_string()),
+                    member: None,
                     depth: 0,
                     reason: "seed".to_string(),
                 },
@@ -275,6 +281,29 @@ mod tests {
         let files = &parsed.bundle("main").unwrap().files;
         assert_eq!(files[0].symbol.as_deref(), Some("riskValue"));
         assert_eq!(files[1].symbol, None);
+    }
+
+    #[test]
+    fn member_entries_round_trip() {
+        let mut doc = StateDoc::new(Path::new("/repo"));
+        doc.upsert(BranchBundle {
+            name: "main".to_string(),
+            created: 1,
+            depth: 2,
+            files: vec![StateFile {
+                path: "Service.java".to_string(),
+                symbol: Some("Service".to_string()),
+                member: Some("used".to_string()),
+                depth: 0,
+                reason: "seed".to_string(),
+            }],
+        });
+
+        let text = to_toml(&doc);
+        assert!(text.contains("member = \"used\""), "{text}");
+        let parsed: StateDoc = toml::from_str(&text).expect("valid toml");
+        let files = &parsed.bundle("main").unwrap().files;
+        assert_eq!(files[0].member.as_deref(), Some("used"));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::lang::{Import, Language, SourceParser, Symbol};
+use crate::lang::{Import, Language, Member, SourceParser, Symbol};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -33,7 +33,7 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 8;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -86,6 +86,17 @@ impl FileEntry {
     /// Symbol whose span contains `offset` (used by `--at-line`).
     pub fn symbol_at(&self, offset: usize) -> Option<&Symbol> {
         self.symbols.iter().find(|symbol| symbol.contains(offset))
+    }
+
+    /// Member (method) whose span contains `offset`, with its enclosing symbol.
+    pub fn member_at(&self, offset: usize) -> Option<(&Symbol, &Member)> {
+        self.symbols.iter().find_map(|symbol| {
+            symbol
+                .members
+                .iter()
+                .find(|member| (member.start..member.end).contains(&offset))
+                .map(|member| (symbol, member))
+        })
     }
 
     /// Name used as a single-line label in pickers.

@@ -270,6 +270,9 @@ fn parse_visibility_or_declaration<'a>(
         line: line_of(src, start),
         uses,
         calls,
+        members: Vec::new(),
+        fields: Vec::new(),
+        supertypes: Vec::new(),
     };
     Some((symbol, cursor))
 }
@@ -319,6 +322,9 @@ fn parse_function<'a>(
         line: line_of(src, start),
         uses,
         calls,
+        members: Vec::new(),
+        fields: Vec::new(),
+        supertypes: Vec::new(),
     };
     Some((symbol, body_end + 1))
 }

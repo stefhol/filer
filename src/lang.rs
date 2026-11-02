@@ -163,6 +163,64 @@ pub enum SymbolKind {
     Declaration,
 }
 
+/// What kind of member a [`Member`] is. Only methods are prunable; constructors
+/// and fields are always kept as class context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberKind {
+    Method,
+    Constructor,
+}
+
+/// How a method invocation names its receiver.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Receiver {
+    /// `helper()` — resolve in the enclosing class, supertypes, static imports.
+    #[default]
+    Bare,
+    /// `this.helper()`.
+    This,
+    /// `super.helper()`.
+    Super,
+    /// `repo.find()`, `Helpers.create()` — a local, parameter, field or type.
+    Name(String),
+    /// `a.b().c()` and anything else we cannot type without real inference.
+    Unknown,
+}
+
+/// One call site inside a member body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Call {
+    pub name: String,
+    #[serde(default)]
+    pub receiver: Receiver,
+}
+
+/// A prunable member of a top-level type (currently Java methods/constructors).
+/// Fields and other members stay implicit in the type's own byte span.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Member {
+    pub name: String,
+    pub kind: MemberKind,
+    /// Byte offset of the first byte (doc comment and annotations included).
+    pub start: usize,
+    pub end: usize,
+    pub line: usize,
+    /// Offset of the `{` that opens the body; `None` for abstract/interface
+    /// methods (there is no body to elide).
+    #[serde(default)]
+    pub body_start: Option<usize>,
+    /// Parameter name -> simple type name.
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
+    /// Local variable name -> simple type name.
+    #[serde(default)]
+    pub locals: Vec<(String, String)>,
+    #[serde(default)]
+    pub calls: Vec<Call>,
+}
+
 /// One bundlable excerpt of a file: a top-level declaration with its byte span.
 ///
 /// File-level bundling stays the default; a symbol is what `path::Name` and the
@@ -184,6 +242,15 @@ pub struct Symbol {
     /// Function names invoked from inside the symbol (Formula Engine).
     #[serde(default)]
     pub calls: Vec<String>,
+    /// Prunable members (Java methods/constructors) for call-path pruning.
+    #[serde(default)]
+    pub members: Vec<Member>,
+    /// Field name -> simple type name, for receiver typing.
+    #[serde(default)]
+    pub fields: Vec<(String, String)>,
+    /// Simple names from `extends` / `implements`.
+    #[serde(default)]
+    pub supertypes: Vec<String>,
 }
 
 impl Symbol {
@@ -248,6 +315,9 @@ pub fn symbol_from_node(
         line: line_of(src, start),
         uses: Vec::new(),
         calls: Vec::new(),
+        members: Vec::new(),
+        fields: Vec::new(),
+        supertypes: Vec::new(),
     }
 }
 

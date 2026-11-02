@@ -13,14 +13,14 @@ mod scala;
 mod state;
 mod web;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
 use bundle::{BundleFile, BundleOptions};
-use index::Index;
-use lang::SymbolKind;
+use index::{FileEntry, Index};
+use lang::{MemberKind, SymbolKind};
 use resolve::{closure_units, drop_covered_symbols, Reason, ResolveOptions, Unit};
 use state::{BranchBundle, StateDoc, StateFile};
 
@@ -168,6 +168,16 @@ fn main() {
     }
 }
 
+/// `(path, symbol, member)` identity of a bundle entry.
+type EntryKey = (String, Option<String>, Option<String>);
+
+struct SearchHit {
+    score: u8,
+    file: usize,
+    symbol: Option<usize>,
+    member: Option<usize>,
+}
+
 fn search(root: &Path, args: SearchArgs) {
     let index = Index::build(root);
     let branch = args
@@ -175,8 +185,8 @@ fn search(root: &Path, args: SearchArgs) {
         .clone()
         .unwrap_or_else(|| state::current_branch(&index.root));
 
-    // (path, symbol) -> (depth, reason); `None` symbol means the whole file.
-    let mut included: HashMap<(String, Option<String>), (u32, Reason)> = HashMap::new();
+    // (path, symbol, member) -> (depth, reason); both `None` means the file.
+    let mut included: HashMap<EntryKey, (u32, Reason)> = HashMap::new();
     if let Some(bundle) = args
         .state
         .as_ref()
@@ -185,7 +195,7 @@ fn search(root: &Path, args: SearchArgs) {
     {
         for file in bundle.files {
             included.insert(
-                (file.path, file.symbol),
+                (file.path, file.symbol, file.member),
                 (file.depth, Reason::from_str(&file.reason)),
             );
         }
@@ -194,13 +204,17 @@ fn search(root: &Path, args: SearchArgs) {
     let query = args.query.trim().to_lowercase();
     let tokens: Vec<&str> = query.split_whitespace().collect();
 
-    // (score, file position, symbol index)
-    let mut matches: Vec<(u8, usize, Option<usize>)> = Vec::new();
+    let mut hits: Vec<SearchHit> = Vec::new();
     for (position, file) in index.files.iter().enumerate() {
         if file.symbols.is_empty() {
             if let Some(score) = score(&file.primary_fqn(), &file.rel, &file.types, &query, &tokens)
             {
-                matches.push((score, position, None));
+                hits.push(SearchHit {
+                    score,
+                    file: position,
+                    symbol: None,
+                    member: None,
+                });
             }
             continue;
         }
@@ -212,44 +226,54 @@ fn search(root: &Path, args: SearchArgs) {
             {
                 continue;
             }
-            let fqn = match (&file.package, symbol.kind) {
-                (Some(package), SymbolKind::Type) => format!("{package}.{}", symbol.name),
-                _ => symbol.name.clone(),
-            };
+            let class_fqn = class_fqn(file, symbol);
             if let Some(score) = score(
-                &fqn,
+                &class_fqn,
                 &file.rel,
                 std::slice::from_ref(&symbol.name),
                 &query,
                 &tokens,
             ) {
-                matches.push((score, position, Some(symbol_index)));
+                hits.push(SearchHit {
+                    score,
+                    file: position,
+                    symbol: Some(symbol_index),
+                    member: None,
+                });
+            }
+            for (member_index, member) in symbol.members.iter().enumerate() {
+                if member.kind != MemberKind::Method {
+                    continue;
+                }
+                let fqn = format!("{class_fqn}.{}", member.name);
+                if let Some(score) = score(
+                    &fqn,
+                    &file.rel,
+                    std::slice::from_ref(&member.name),
+                    &query,
+                    &tokens,
+                ) {
+                    hits.push(SearchHit {
+                        score,
+                        file: position,
+                        symbol: Some(symbol_index),
+                        member: Some(member_index),
+                    });
+                }
             }
         }
     }
-    matches.sort_by(
-        |(score_a, position_a, symbol_a), (score_b, position_b, symbol_b)| {
-            score_a
-                .cmp(score_b)
-                .then_with(|| {
-                    index.files[*position_a]
-                        .rel
-                        .cmp(&index.files[*position_b].rel)
-                })
-                .then_with(|| {
-                    symbol_name(&index, *position_a, *symbol_a).cmp(symbol_name(
-                        &index,
-                        *position_b,
-                        *symbol_b,
-                    ))
-                })
-        },
-    );
+    hits.sort_by(|a, b| {
+        a.score
+            .cmp(&b.score)
+            .then_with(|| index.files[a.file].rel.cmp(&index.files[b.file].rel))
+            .then_with(|| hit_label(&index, a).cmp(&hit_label(&index, b)))
+    });
 
-    for (_, position, symbol_index) in matches.into_iter().take(args.limit) {
-        let file = &index.files[position];
-        let Some(symbol_index) = symbol_index else {
-            let bundled = included.get(&(file.rel.clone(), None)).copied();
+    for hit in hits.into_iter().take(args.limit) {
+        let file = &index.files[hit.file];
+        let Some(symbol_index) = hit.symbol else {
+            let bundled = included.get(&(file.rel.clone(), None, None)).copied();
             if args.plain {
                 let marker = if bundled.is_some() { "*" } else { " " };
                 println!("{marker}\t{}\t{}", file.label(), file.rel);
@@ -257,6 +281,7 @@ fn search(root: &Path, args: SearchArgs) {
                 let value = serde_json::json!({
                     "path": file.rel,
                     "symbol": serde_json::Value::Null,
+                    "member": serde_json::Value::Null,
                     "kind": serde_json::Value::Null,
                     "fqn": file.primary_fqn(),
                     "line": serde_json::Value::Null,
@@ -272,29 +297,41 @@ fn search(root: &Path, args: SearchArgs) {
         };
 
         let symbol = &file.symbols[symbol_index];
-        let fqn = match (&file.package, symbol.kind) {
-            (Some(package), SymbolKind::Type) => format!("{package}.{}", symbol.name),
-            _ => symbol.name.clone(),
+        let class_fqn = class_fqn(file, symbol);
+        let member = hit.member.map(|member| &symbol.members[member]);
+        let (kind, fqn, line) = match member {
+            Some(member) => (
+                "method",
+                format!("{class_fqn}.{}", member.name),
+                member.line,
+            ),
+            None => (symbol_kind(symbol.kind), class_fqn.clone(), symbol.line),
         };
+        let member_name = member.map(|member| member.name.clone());
         let bundled = included
-            .get(&(file.rel.clone(), Some(symbol.name.clone())))
-            .or_else(|| included.get(&(file.rel.clone(), None)))
+            .get(&(
+                file.rel.clone(),
+                Some(symbol.name.clone()),
+                member_name.clone(),
+            ))
+            .or_else(|| included.get(&(file.rel.clone(), Some(symbol.name.clone()), None)))
+            .or_else(|| included.get(&(file.rel.clone(), None, None)))
             .copied();
-        let kind = match symbol.kind {
-            SymbolKind::Function => "function",
-            SymbolKind::Type => "type",
-            SymbolKind::Declaration => "declaration",
-        };
         if args.plain {
             let marker = if bundled.is_some() { "*" } else { " " };
-            println!("{marker}\t{fqn}\t{}::{}", file.rel, symbol.name);
+            let target = match &member_name {
+                Some(member) => format!("{}::{}.{}", file.rel, symbol.name, member),
+                None => format!("{}::{}", file.rel, symbol.name),
+            };
+            println!("{marker}\t{fqn}\t{target}");
         } else {
             let value = serde_json::json!({
                 "path": file.rel,
                 "symbol": symbol.name,
+                "member": member_name,
                 "kind": kind,
                 "fqn": fqn,
-                "line": symbol.line,
+                "line": line,
                 "package": file.package,
                 "types": file.types,
                 "included": bundled.is_some(),
@@ -306,14 +343,29 @@ fn search(root: &Path, args: SearchArgs) {
     }
 }
 
-fn symbol_name(index: &Index, position: usize, symbol: Option<usize>) -> &str {
-    match symbol {
-        Some(symbol) => index.files[position]
-            .symbols
-            .get(symbol)
-            .map(|symbol| symbol.name.as_str())
-            .unwrap_or(""),
-        None => "",
+fn class_fqn(file: &FileEntry, symbol: &crate::lang::Symbol) -> String {
+    match (&file.package, symbol.kind) {
+        (Some(package), SymbolKind::Type) => format!("{package}.{}", symbol.name),
+        _ => symbol.name.clone(),
+    }
+}
+
+fn symbol_kind(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Function => "function",
+        SymbolKind::Type => "type",
+        SymbolKind::Declaration => "declaration",
+    }
+}
+
+fn hit_label(index: &Index, hit: &SearchHit) -> String {
+    let Some(symbol_index) = hit.symbol else {
+        return index.files[hit.file].rel.clone();
+    };
+    let symbol = &index.files[hit.file].symbols[symbol_index];
+    match hit.member {
+        Some(member) => format!("{}.{}", symbol.name, symbol.members[member].name),
+        None => symbol.name.clone(),
     }
 }
 
@@ -360,8 +412,31 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                 let Some(&position) = index.by_rel.get(&file.path) else {
                     continue;
                 };
-                match &file.symbol {
-                    Some(symbol) => {
+                match (&file.symbol, &file.member) {
+                    (Some(symbol), Some(member)) => {
+                        let exists = index.files[position].symbol(symbol).is_some_and(|class| {
+                            class.members.iter().any(|member_in_class| {
+                                member_in_class.kind == MemberKind::Method
+                                    && member_in_class.name == *member
+                            })
+                        });
+                        if exists {
+                            previous.insert(
+                                Unit::Member {
+                                    file: position,
+                                    class: symbol.clone(),
+                                    member: member.clone(),
+                                },
+                                (file.depth, Reason::from_str(&file.reason)),
+                            );
+                        } else {
+                            eprintln!(
+                                "filer: dropping {}::{symbol}.{member}: no longer in the file",
+                                file.path
+                            );
+                        }
+                    }
+                    (Some(symbol), None) => {
                         if index.files[position].symbol(symbol).is_some() {
                             previous.insert(
                                 Unit::Symbol {
@@ -377,7 +452,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                             );
                         }
                     }
-                    None => {
+                    (None, _) => {
                         previous.insert(
                             Unit::File(position),
                             (file.depth, Reason::from_str(&file.reason)),
@@ -389,6 +464,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
     }
 
     let mut seeds: Vec<Unit> = Vec::new();
+    let mut seed_files: HashSet<usize> = HashSet::new();
     let mut extras: Vec<BundleFile> = Vec::new();
     let mut at_line_used = false;
 
@@ -405,34 +481,31 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                 depth: 0,
                 reason: Reason::External,
                 symbol: None,
+                member: None,
             });
             continue;
         };
 
-        let symbol = match symbol {
-            Some(symbol) => Some(symbol.to_string()),
-            None if !at_line_used && args.at_line.is_some() => {
-                at_line_used = true;
-                let line = args.at_line.expect("checked");
-                symbol_at_line(&index, &root, position, line)
-            }
-            None => None,
-        };
-
         let unit = match symbol {
-            Some(symbol) if index.files[position].symbol(&symbol).is_some() => Unit::Symbol {
-                file: position,
-                symbol,
-            },
-            Some(symbol) => {
+            Some(symbol) => seed_unit(&index, position, symbol).unwrap_or_else(|| {
                 eprintln!(
                     "filer: {} has no symbol {symbol}; bundling the whole file",
                     index.files[position].rel
                 );
                 Unit::File(position)
+            }),
+            None if !at_line_used && args.at_line.is_some() => {
+                at_line_used = true;
+                let line = args.at_line.expect("checked");
+                seed_at_line(&index, &root, position, line).unwrap_or(Unit::File(position))
             }
             None => Unit::File(position),
         };
+        if let Unit::Member { file, .. } = &unit {
+            // The file you are working in is context; only the dependencies
+            // pulled in at depth 1+ are pruned to their call path.
+            seed_files.insert(*file);
+        }
         if !seeds.contains(&unit) {
             seeds.push(unit);
         }
@@ -458,6 +531,12 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
         }
     }
 
+    // A method seed renders its own file whole; `drop_covered_symbols` then
+    // drops the member units of that file and keeps the file entry.
+    for file in seed_files {
+        merged.insert(Unit::File(file), (0, Reason::Seed));
+    }
+
     let mut units: Vec<(Unit, u32, Reason)> = merged
         .into_iter()
         .map(|(unit, (depth, reason))| (unit, depth, reason))
@@ -477,6 +556,12 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                     .unwrap_or("")
                     .cmp(unit_b.symbol().unwrap_or(""))
             })
+            .then_with(|| {
+                unit_a
+                    .member()
+                    .unwrap_or("")
+                    .cmp(unit_b.member().unwrap_or(""))
+            })
     });
 
     let mut files: Vec<BundleFile> = units
@@ -489,6 +574,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                 depth,
                 reason,
                 symbol: unit.symbol().map(str::to_string),
+                member: unit.member().map(str::to_string),
             }
         })
         .collect();
@@ -513,6 +599,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                 .map(|file| StateFile {
                     path: file.rel.clone(),
                     symbol: file.symbol.clone(),
+                    member: file.member.clone(),
                     depth: file.depth,
                     reason: file.reason.as_str().to_string(),
                 })
@@ -573,11 +660,47 @@ fn split_symbol(input: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn symbol_at_line(index: &Index, root: &Path, position: usize, line: usize) -> Option<String> {
+/// `Class` -> whole class, `Class.method` -> pruned class, `function` -> FE.
+fn seed_unit(index: &Index, position: usize, symbol: &str) -> Option<Unit> {
+    let file = index.files.get(position)?;
+    if let Some((class, member)) = symbol.rsplit_once('.') {
+        if let Some(class_symbol) = file.symbol(class) {
+            if class_symbol
+                .members
+                .iter()
+                .any(|candidate| candidate.kind == MemberKind::Method && candidate.name == member)
+            {
+                return Some(Unit::Member {
+                    file: position,
+                    class: class.to_string(),
+                    member: member.to_string(),
+                });
+            }
+        }
+    }
+    file.symbol(symbol).map(|_| Unit::Symbol {
+        file: position,
+        symbol: symbol.to_string(),
+    })
+}
+
+fn seed_at_line(index: &Index, root: &Path, position: usize, line: usize) -> Option<Unit> {
     let file = index.files.get(position)?;
     let source = std::fs::read_to_string(root.join(&file.rel)).ok()?;
     let offset = offset_of_line(&source, line);
-    file.symbol_at(offset).map(|symbol| symbol.name.clone())
+    if let Some((class, member)) = file.member_at(offset) {
+        if member.kind == MemberKind::Method {
+            return Some(Unit::Member {
+                file: position,
+                class: class.name.clone(),
+                member: member.name.clone(),
+            });
+        }
+    }
+    file.symbol_at(offset).map(|symbol| Unit::Symbol {
+        file: position,
+        symbol: symbol.name.clone(),
+    })
 }
 
 fn offset_of_line(source: &str, line: usize) -> usize {
@@ -710,12 +833,23 @@ fn show_cmd(root: &Path, args: ShowArgs) {
             Some(&position) => {
                 let entry = &index.files[position];
                 if let Some(symbol) = &file.symbol {
-                    if entry.symbol(symbol).is_none() {
+                    let Some(class) = entry.symbol(symbol) else {
                         eprintln!(
                             "filer: dropping {}::{symbol}: no longer in the file",
                             file.path
                         );
                         continue;
+                    };
+                    if let Some(member) = &file.member {
+                        if !class.members.iter().any(|candidate| {
+                            candidate.kind == MemberKind::Method && candidate.name == *member
+                        }) {
+                            eprintln!(
+                                "filer: dropping {}::{symbol}.{member}: no longer in the file",
+                                file.path
+                            );
+                            continue;
+                        }
                     }
                 }
                 files.push(BundleFile {
@@ -724,6 +858,7 @@ fn show_cmd(root: &Path, args: ShowArgs) {
                     depth: file.depth,
                     reason,
                     symbol: file.symbol.clone(),
+                    member: file.member.clone(),
                 });
             }
             None if abs.is_file() => files.push(BundleFile {
@@ -732,6 +867,7 @@ fn show_cmd(root: &Path, args: ShowArgs) {
                 depth: file.depth,
                 reason,
                 symbol: None,
+                member: None,
             }),
             None => {
                 eprintln!("filer: dropping {}: no longer in the project", file.path);
@@ -925,9 +1061,10 @@ fn state_cmd(root: &Path, args: StateArgs) {
 }
 
 fn state_entry_label(file: &StateFile) -> String {
-    match &file.symbol {
-        Some(symbol) => format!("{}::{symbol}", file.path),
-        None => file.path.clone(),
+    match (&file.symbol, &file.member) {
+        (Some(symbol), Some(member)) => format!("{}::{symbol}.{member}", file.path),
+        (Some(symbol), None) => format!("{}::{symbol}", file.path),
+        _ => file.path.clone(),
     }
 }
 
@@ -1000,6 +1137,7 @@ fn config_file(root: &Path, name: &str) -> Option<BundleFile> {
         depth: 0,
         reason: Reason::Config,
         symbol: None,
+        member: None,
     })
 }
 

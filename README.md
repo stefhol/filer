@@ -4,9 +4,11 @@ Select Java, Scala, Kotlin, Groovy, C#, TypeScript, JavaScript, Vue or Asset Con
 Formula Engine (`.fe`) code in Neovim, get one pastable markdown blob for your chat LLM —
 with the files your selection imports, and the files those import, already included.
 
-For `.fe` files — and, on request, for any language — the unit is not the file but the
-**function or type** you picked: `main.fe::riskValue` pulls in that function and the
-functions it calls, not the whole 20 000-line file.
+For `.fe` files the unit is the **function** you picked: `main.fe::riskValue` pulls in that
+function and the functions it calls, not the whole 20 000-line file. For Java a method can be
+the entry point too: the **file you seed stays complete**, and every file pulled in at
+depth 1+ keeps its class shell (package, imports, fields, constructors) with only the methods
+on the call path; everything else becomes a signature stub.
 
 You have a chat interface but no agentic workflow. `filer` covers the boring part: finding
 the three or four files that belong together and formatting them so the model sees the
@@ -47,10 +49,11 @@ whole picture instead of a fragment.
   Java, Scala, Kotlin, Groovy or C# needs no import for, e.g. `indexOps(DemoDocument.class)`,
   `DemoDocument.create()` or `new DemoDocument()` — still pulls that file in. Module
   languages rely on their explicit imports instead of repo-wide name guessing.
-- Extracts **symbols** (top-level functions, classes, objects, global declarations) with
-  their byte spans, so a bundle can carry one function out of a huge file. `.fe` functions
-  are the primary use case: they call each other across a project-wide namespace, exactly
-  like the language's IntelliJ plugin resolves them.
+- Extracts **symbols** (top-level functions, classes, objects, global declarations, Java
+  methods) with their byte spans, so a bundle can carry one function out of a huge file.
+  `.fe` functions are the primary use case: they call each other across a project-wide
+  namespace, exactly like the language's IntelliJ plugin resolves them. Java methods add a
+  second one: class shell for context, call-path bodies for content.
 - Walks the resulting graph to a configurable depth.
 - Remembers what is already bundled in a TOML state file, marks those entries with `✓` in
   the picker, and grows the bundle instead of replacing it. Switching git branch kills the
@@ -173,8 +176,8 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 
 | Command | Effect |
 | --- | --- |
-| `:FilerSearch` | Telescope picker of symbols (functions for `.fe`, types elsewhere). `<Tab>` multi-selects, `<CR>` bundles. |
-| `:FilerHere` | Bundles the current buffer with its imports. In a `.fe` file, the function under the cursor is the seed. |
+| `:FilerSearch` | Telescope picker of symbols: `.fe` functions, Java classes **and methods**, types elsewhere. `<Tab>` multi-selects, `<CR>` bundles. |
+| `:FilerHere` | Bundles the current buffer with its imports. In a `.fe` file the function under the cursor is the seed; in Java, the method under the cursor (or its class). |
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute) or excerpts (`path::Symbol`). |
 | `:FilerShow [branch]` | Re-renders the saved bundle (current file contents) without re-resolving. |
 | `:FilerReset` | Forgets this branch's bundle; the next bundle starts empty. |
@@ -220,6 +223,52 @@ What that means in practice:
 The seed under the cursor is what `:FilerHere` uses in a `.fe` buffer: put the cursor in a
 function, the bundle contains that function and its calls.
 
+### Java methods: seed file complete, dependencies pruned
+
+A Java *class* row in the picker keeps its old meaning: that class as an excerpt. A *method*
+row (`app.Service.usedEverywhere`), `filer bundle 'app/Service.java::Service.usedEverywhere'`
+and `:FilerHere` inside a method all seed a call graph:
+
+- the **file you seeded is rendered complete** (all classes and methods in it),
+- every file at depth 1+ is rendered as a class shell — package, imports, fields,
+  constructors, annotations — with only the methods on the call path,
+- their other methods become signature stubs:
+  `int unrelatedHelper();   // body omitted`
+
+```
+### `app/Service.java`                    (depth 0, complete)
+
+### `app/Repo.java` :: `Repo` (line 3)    (depth 1)
+package app;
+
+public class Repo {
+    public int size() { return 0; }
+
+    public int unused();   // body omitted
+
+    public static void staticCall() { }
+}
+```
+
+Calls are resolved through:
+
+- bare `helper()` — the class, then superclasses/interfaces, then `import static` targets
+- `this.helper()` / `super.helper()`
+- `local.helper()`, `param.helper()`, `field.helper()` — using the declared type of the receiver
+- `Type.helper()` — static calls
+- `new Type().helper()`
+
+Everything the resolver cannot type (`a.b().c()`, interface dispatch, third-party types) adds
+no edge. If the receiver's class is known but the method is not found, the **whole class** is
+kept rather than stubbing a method that might be needed. Type-only dependencies (a field of
+type `Repo` that is never called) are not bundled; the import line and the field signature
+still give the reader the name. Nested classes are rendered inside their enclosing class.
+
+`--depth` counts method hops. In a `.java` buffer `:FilerHere` seeds the method under the
+cursor (or its class when the cursor is on a field, constructor or blank line); the picker and
+`filer bundle 'path/Service.java::Service.usedEverywhere'` do the same explicitly. A bare
+`filer bundle path/Service.java` still uses the file-level import closure, not the call graph.
+
 ## Bundle state
 
 With `state = true` (the default) the binary writes `.filer/bundle.toml` next to the project,
@@ -256,12 +305,20 @@ depth = 0
 reason = "seed"
 ```
 
-An excerpt entry also carries the declaration name; whole-file entries omit it:
+An excerpt entry also carries the declaration name; whole-file entries omit it. A pruned
+Java class adds `member` for each kept method:
 
 ```toml
 [[bundles.files]]
 path = "ac/main.fe"
 symbol = "riskValue"
+depth = 0
+reason = "seed"
+
+[[bundles.files]]
+path = "src/main/java/app/Service.java"
+symbol = "Service"
+member = "usedEverywhere"
 depth = 0
 reason = "seed"
 ```
@@ -307,6 +364,8 @@ filer --root ~/code/demo search --query user --plain   # fqn<TAB>path[::symbol]
 filer --root ~/code/demo deps src/main/java/com/example/app/Application.java
 filer --root ~/code/demo bundle --depth 2 --with-config \
       src/main/java/com/example/app/Application.java > bundle.md
+filer --root ~/code/demo bundle 'src/main/java/app/Service.java::Service.usedEverywhere'
+filer --root ~/code/demo bundle --at-line 120 src/main/java/app/Service.java
 filer --root ~/code/demo index                         # cache stats
 filer --root ~/code/demo show                          # re-render this branch's bundle
 filer --root ~/code/demo show --branch main            # ... another branch's
@@ -407,7 +466,7 @@ and filer only needs function boundaries, not statements.
 ```
 src/main.rs     CLI (search / bundle / deps / index)
 src/lang.rs     language detection, families, Source/Import model, parser dispatch
-src/java.rs     tree-sitter-java parsing + tests
+src/java.rs     tree-sitter-java parsing, members/calls for pruning + tests
 src/scala.rs    tree-sitter-scala parsing, import normalization + tests
 src/kotlin.rs   tree-sitter-kotlin parsing + tests
 src/groovy.rs   tree-sitter-groovy parsing + tests
@@ -416,7 +475,7 @@ src/web.rs      TypeScript/JavaScript parsing, Vue SFC extraction + tests
 src/fe.rs       Asset Control Formula Engine lexer/parser + tests
 src/index.rs    tree walk, parallelism, disk cache
 src/resolve.rs  import resolution, closure, tests
-src/bundle.rs   markdown rendering, tests
+src/bundle.rs   markdown rendering, class-shell pruning + tests
 src/state.rs    TOML bundle state, branch detection, tests
 lua/filer/      Neovim plugin: picker, bundling, bundle buffer
 plugin/filer.lua user commands

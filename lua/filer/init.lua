@@ -147,6 +147,10 @@ function M.search(opts)
     if symbol == vim.NIL then
       symbol = nil
     end
+    local member = item.member
+    if member == vim.NIL then
+      member = nil
+    end
     local line_number = item.line
     if line_number == vim.NIL then
       line_number = nil
@@ -177,13 +181,17 @@ function M.search(opts)
       value = item,
       path = item.path,
       symbol = symbol,
+      member = member,
       kind = item.kind,
       line = line_number,
       fqn = fqn,
       included = included,
       filename = root .. "/" .. item.path,
       lnum = line_number or 1,
-      ordinal = (fqn ~= "" and (fqn .. " ") or "") .. item.path .. (symbol and (" " .. symbol) or ""),
+      ordinal = (fqn ~= "" and (fqn .. " ") or "")
+        .. item.path
+        .. (symbol and (" " .. symbol) or "")
+        .. (member and (" " .. member) or ""),
       display = label,
     }
   end
@@ -214,6 +222,8 @@ function M.search(opts)
         for _, entry in ipairs(selected) do
           if entry.included then
             already = already + 1
+          elseif entry.member and entry.symbol then
+            paths[#paths + 1] = entry.path .. "::" .. entry.symbol .. "." .. entry.member
           elseif entry.symbol then
             paths[#paths + 1] = entry.path .. "::" .. entry.symbol
           else
@@ -294,10 +304,10 @@ function M.here(opts)
     return
   end
   -- `.fe` files are usually tens of thousands of lines: seed the function under
-  -- the cursor. Other languages keep whole-file `:FilerHere`; use the picker or
-  -- `:FilerBundle path::Type` for a single excerpt.
+  -- the cursor. Java seeds the method under the cursor (or the class when the
+  -- cursor is not in a method). Other languages keep whole-file `:FilerHere`.
   local options = opts
-  if options.at_line == nil and name:match("%.fe$") then
+  if options.at_line == nil and (name:match("%.fe$") or name:match("%.java$")) then
     options = vim.tbl_extend("force", { at_line = vim.api.nvim_win_get_cursor(0)[1] }, opts)
   end
   M.bundle({ name }, options)

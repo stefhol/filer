@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::index::{FileEntry, Index};
-use crate::lang::{Family, Import, ImportKind};
+use crate::lang::{Family, Import, ImportKind, Member, MemberKind, Receiver, Symbol};
 
 /// Extensions tried when resolving a TypeScript/JavaScript module specifier,
 /// in preference order (TS sources win over compiled JS next to them).
@@ -28,6 +28,8 @@ pub enum Reason {
     SamePackage,
     /// Referenced by name and unique in the repo.
     Usage,
+    /// A method call resolved to a member of another class.
+    Call,
     /// Pulled in by `--with-same-package`.
     Package,
     /// Build file (pom.xml, build.gradle, build.sbt, ...).
@@ -46,6 +48,7 @@ impl Reason {
             Reason::ModuleImport => "module-import",
             Reason::SamePackage => "same-package",
             Reason::Usage => "usage",
+            Reason::Call => "call",
             Reason::Package => "package",
             Reason::Config => "config",
             Reason::External => "external",
@@ -60,6 +63,7 @@ impl Reason {
             "wildcard-import" => Reason::WildcardImport,
             "module-import" => Reason::ModuleImport,
             "same-package" => Reason::SamePackage,
+            "call" => Reason::Call,
             "package" => Reason::Package,
             "config" => Reason::Config,
             "external" => Reason::External,
@@ -325,21 +329,38 @@ pub fn resolve_uses(index: &Index, file: &FileEntry) -> Vec<(usize, Reason)> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Unit {
     File(usize),
-    Symbol { file: usize, symbol: String },
+    Symbol {
+        file: usize,
+        symbol: String,
+    },
+    /// A class shell plus one method kept on the call path.
+    Member {
+        file: usize,
+        class: String,
+        member: String,
+    },
 }
 
 impl Unit {
     pub fn file(&self) -> usize {
         match self {
-            Unit::File(file) => *file,
-            Unit::Symbol { file, .. } => *file,
+            Unit::File(file) | Unit::Symbol { file, .. } | Unit::Member { file, .. } => *file,
         }
     }
 
+    /// The class or top-level symbol this unit belongs to.
     pub fn symbol(&self) -> Option<&str> {
         match self {
             Unit::File(_) => None,
             Unit::Symbol { symbol, .. } => Some(symbol),
+            Unit::Member { class, .. } => Some(class),
+        }
+    }
+
+    pub fn member(&self) -> Option<&str> {
+        match self {
+            Unit::Member { member, .. } => Some(member),
+            _ => None,
         }
     }
 }
@@ -537,6 +558,313 @@ fn symbol_neighbours(
     neighbours
 }
 
+/// Neighbours of one method excerpt: the class's own type dependencies and
+/// imports, plus the methods this member calls.
+fn member_neighbours(
+    index: &Index,
+    file_position: usize,
+    class_name: &str,
+    member_name: &str,
+    options: ResolveOptions,
+) -> Vec<(Unit, Reason)> {
+    let Some(file) = index.files.get(file_position) else {
+        return Vec::new();
+    };
+    let Some(class) = file.symbol(class_name) else {
+        return Vec::new();
+    };
+    let Some(member) = class
+        .members
+        .iter()
+        .find(|member| member.kind == MemberKind::Method && member.name == member_name)
+    else {
+        return Vec::new();
+    };
+    let family = family_of(file);
+    let _ = options;
+
+    // Member bundles are call-path driven: the class shell already carries the
+    // package, imports, fields and signatures, so only methods that are
+    // actually called pull in other files.
+    let mut neighbours = Vec::new();
+    for call in &member.calls {
+        for unit in resolve_call(index, file_position, file, class, member, call, family) {
+            neighbours.push((unit, Reason::Call));
+        }
+    }
+    neighbours
+}
+
+fn resolve_call(
+    index: &Index,
+    file_position: usize,
+    file: &FileEntry,
+    class: &Symbol,
+    member: &Member,
+    call: &crate::lang::Call,
+    family: Option<Family>,
+) -> Vec<Unit> {
+    match &call.receiver {
+        Receiver::Bare | Receiver::This => {
+            let mut visited = HashSet::new();
+            let mut found = find_methods(
+                index,
+                file_position,
+                class,
+                &call.name,
+                family,
+                &mut visited,
+            );
+            if found.is_empty() && call.receiver == Receiver::Bare {
+                found = static_import_methods(index, file, &call.name);
+            }
+            found
+        }
+        Receiver::Super => super_methods(index, file_position, class, &call.name, family),
+        Receiver::Name(name) => {
+            let type_name = member
+                .params
+                .iter()
+                .chain(member.locals.iter())
+                .find(|(local, _)| local == name)
+                .map(|(_, ty)| ty.clone())
+                .or_else(|| {
+                    class
+                        .fields
+                        .iter()
+                        .find(|(field, _)| field == name)
+                        .map(|(_, ty)| ty.clone())
+                })
+                .unwrap_or_else(|| name.clone());
+
+            if type_name == class.name {
+                let mut visited = HashSet::new();
+                return find_methods(
+                    index,
+                    file_position,
+                    class,
+                    &call.name,
+                    family,
+                    &mut visited,
+                );
+            }
+            let Some((target_file, target_index)) = resolve_class(index, file, &type_name, family)
+            else {
+                return Vec::new();
+            };
+            let target = &index.files[target_file].symbols[target_index];
+            let mut visited = HashSet::new();
+            let methods =
+                find_methods(index, target_file, target, &call.name, family, &mut visited);
+            if methods.is_empty() {
+                // We know the class but not the member: keep the whole class
+                // rather than silently dropping a method.
+                vec![Unit::Symbol {
+                    file: target_file,
+                    symbol: target.name.clone(),
+                }]
+            } else {
+                methods
+            }
+        }
+        Receiver::Unknown => Vec::new(),
+    }
+}
+
+fn methods_named<'a>(class: &'a Symbol, name: &str) -> Vec<&'a Member> {
+    class
+        .members
+        .iter()
+        .filter(|member| member.kind == MemberKind::Method && member.name == name)
+        .collect()
+}
+
+fn method_units(file: usize, class: &Symbol, name: &str) -> Vec<Unit> {
+    let mut seen = HashSet::new();
+    methods_named(class, name)
+        .into_iter()
+        .filter(|member| seen.insert(member.name.clone()))
+        .map(|member| Unit::Member {
+            file,
+            class: class.name.clone(),
+            member: member.name.clone(),
+        })
+        .collect()
+}
+
+/// Methods with `name` in `class` or its supertypes (resolved inside the repo).
+fn find_methods(
+    index: &Index,
+    file_position: usize,
+    class: &Symbol,
+    name: &str,
+    family: Option<Family>,
+    visited: &mut HashSet<(usize, String)>,
+) -> Vec<Unit> {
+    if !visited.insert((file_position, class.name.clone())) {
+        return Vec::new();
+    }
+    let direct = method_units(file_position, class, name);
+    if !direct.is_empty() {
+        return direct;
+    }
+    let Some(file) = index.files.get(file_position) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for supertype in &class.supertypes {
+        if let Some((target_file, target_index)) = resolve_class(index, file, supertype, family) {
+            let target = &index.files[target_file].symbols[target_index];
+            out.extend(find_methods(
+                index,
+                target_file,
+                target,
+                name,
+                family,
+                visited,
+            ));
+        }
+    }
+    out
+}
+
+fn super_methods(
+    index: &Index,
+    file_position: usize,
+    class: &Symbol,
+    name: &str,
+    family: Option<Family>,
+) -> Vec<Unit> {
+    let mut visited = HashSet::new();
+    visited.insert((file_position, class.name.clone()));
+    let Some(file) = index.files.get(file_position) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for supertype in &class.supertypes {
+        if let Some((target_file, target_index)) = resolve_class(index, file, supertype, family) {
+            let target = &index.files[target_file].symbols[target_index];
+            out.extend(find_methods(
+                index,
+                target_file,
+                target,
+                name,
+                family,
+                &mut visited,
+            ));
+        }
+    }
+    out
+}
+
+/// Bare call resolved through `import static pkg.Helpers.helper` or
+/// `import static pkg.Helpers.*`. Package wildcards are ignored: they import
+/// types, not methods.
+fn static_import_methods(index: &Index, file: &FileEntry, name: &str) -> Vec<Unit> {
+    let mut out = Vec::new();
+    for import in &file.imports {
+        let single =
+            import.kind == ImportKind::Static && import.path.rsplit('.').next() == Some(name);
+        if !single && import.kind != ImportKind::Wildcard {
+            continue;
+        }
+        let targets = resolve_import(index, file, import);
+        if import.kind == ImportKind::Wildcard && targets.len() != 1 {
+            continue;
+        }
+        for target in targets {
+            let target_file = &index.files[target];
+            for symbol in &target_file.symbols {
+                let units = method_units(target, symbol, name);
+                if !units.is_empty() {
+                    out.extend(units);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolves a simple type name to the top-level symbol that declares it, using
+/// the same precedence as Java: same file, explicit imports, same package,
+/// wildcard imports, unique in the project.
+fn resolve_class(
+    index: &Index,
+    file: &FileEntry,
+    name: &str,
+    family: Option<Family>,
+) -> Option<(usize, usize)> {
+    if name.is_empty() {
+        return None;
+    }
+    if file.symbol(name).is_some() {
+        let position = *index.by_rel.get(&file.rel)?;
+        let index_in_file = file.symbols.iter().position(|s| s.name == name)?;
+        return Some((position, index_in_file));
+    }
+
+    for import in &file.imports {
+        if import.kind == ImportKind::Module || import.is_wildcard() {
+            continue;
+        }
+        for target in resolve_import(index, file, import) {
+            if let Some(symbol_index) = index.files[target]
+                .symbols
+                .iter()
+                .position(|symbol| symbol.name == name)
+            {
+                return Some((target, symbol_index));
+            }
+        }
+    }
+
+    if let Some(package) = &file.package {
+        if let Some(files) = index.by_package.get(package) {
+            for target in files {
+                if !compatible(index, *target, family) {
+                    continue;
+                }
+                if let Some(symbol_index) = index.files[*target]
+                    .symbols
+                    .iter()
+                    .position(|symbol| symbol.name == name)
+                {
+                    return Some((*target, symbol_index));
+                }
+            }
+        }
+    }
+
+    for import in &file.imports {
+        if import.kind == ImportKind::Module || !import.is_wildcard() {
+            continue;
+        }
+        let targets = resolve_import(index, file, import);
+        if targets.len() != 1 {
+            continue;
+        }
+        for target in targets {
+            if let Some(symbol_index) = index.files[target]
+                .symbols
+                .iter()
+                .position(|symbol| symbol.name == name)
+            {
+                return Some((target, symbol_index));
+            }
+        }
+    }
+
+    let candidates = index
+        .by_symbol
+        .get(name)?
+        .iter()
+        .filter(|(position, _)| compatible(index, *position, family))
+        .collect::<Vec<_>>();
+    let mut by_file = candidates.clone();
+    by_file.dedup_by(|a, b| a.0 == b.0);
+    (by_file.len() == 1).then(|| (by_file[0].0, by_file[0].1))
+}
+
 /// Breadth-first closure over units, keeping track of why each one was pulled
 /// in. Returns units in discovery order, seeds first (depth 0), duplicates
 /// removed. A whole-file unit supersedes symbol units of the same file.
@@ -564,6 +892,11 @@ pub fn closure_units(
         let neighbours = match &current {
             Unit::File(position) => file_neighbours(index, *position, options),
             Unit::Symbol { file, symbol } => symbol_neighbours(index, *file, symbol, options),
+            Unit::Member {
+                file,
+                class,
+                member,
+            } => member_neighbours(index, *file, class, member, options),
         };
 
         for (neighbour, reason) in neighbours {
@@ -583,18 +916,28 @@ pub fn closure_units(
 /// A file that is bundled whole already contains its symbols, so keep only the
 /// file unit and drop the excerpts.
 pub fn drop_covered_symbols(units: Vec<(Unit, u32, Reason)>) -> Vec<(Unit, u32, Reason)> {
-    let whole: HashSet<usize> = units
+    let files: HashSet<usize> = units
         .iter()
         .filter_map(|(unit, _, _)| match unit {
             Unit::File(file) => Some(*file),
-            Unit::Symbol { .. } => None,
+            _ => None,
+        })
+        .collect();
+    let classes: HashSet<(usize, String)> = units
+        .iter()
+        .filter_map(|(unit, _, _)| match unit {
+            Unit::Symbol { file, symbol } => Some((*file, symbol.clone())),
+            _ => None,
         })
         .collect();
     units
         .into_iter()
         .filter(|(unit, _, _)| match unit {
-            Unit::Symbol { file, .. } => !whole.contains(file),
             Unit::File(_) => true,
+            Unit::Symbol { file, .. } => !files.contains(file),
+            Unit::Member { file, class, .. } => {
+                !files.contains(file) && !classes.contains(&(*file, class.clone()))
+            }
         })
         .collect()
 }
@@ -612,7 +955,7 @@ pub fn closure_detailed(
         .into_iter()
         .filter_map(|(unit, depth, reason)| match unit {
             Unit::File(position) => Some((position, depth, reason)),
-            Unit::Symbol { .. } => None,
+            Unit::Symbol { .. } | Unit::Member { .. } => None,
         })
         .collect()
 }
@@ -720,6 +1063,9 @@ mod tests {
             line: 1,
             uses: uses.iter().map(|name| name.to_string()).collect(),
             calls: calls.iter().map(|name| name.to_string()).collect(),
+            members: Vec::new(),
+            fields: Vec::new(),
+            supertypes: Vec::new(),
         }
     }
 
@@ -737,6 +1083,225 @@ mod tests {
             fe_symbol("unused", SymbolKind::Function, 15, 22, &[], &[]),
         ];
         index_from(vec![main, lib])
+    }
+
+    fn java_method(
+        name: &str,
+        params: &[(&str, &str)],
+        locals: &[(&str, &str)],
+        calls: &[(&str, Receiver)],
+    ) -> Member {
+        Member {
+            name: name.to_string(),
+            kind: MemberKind::Method,
+            start: 0,
+            end: 10,
+            line: 1,
+            body_start: Some(5),
+            params: params
+                .iter()
+                .map(|(name, ty)| (name.to_string(), ty.to_string()))
+                .collect(),
+            locals: locals
+                .iter()
+                .map(|(name, ty)| (name.to_string(), ty.to_string()))
+                .collect(),
+            calls: calls
+                .iter()
+                .map(|(name, receiver)| crate::lang::Call {
+                    name: name.to_string(),
+                    receiver: receiver.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn java_class(
+        name: &str,
+        members: Vec<Member>,
+        fields: &[(&str, &str)],
+        supertypes: &[&str],
+    ) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Type,
+            start: 0,
+            end: 100,
+            line: 1,
+            uses: Vec::new(),
+            calls: Vec::new(),
+            members,
+            fields: fields
+                .iter()
+                .map(|(name, ty)| (name.to_string(), ty.to_string()))
+                .collect(),
+            supertypes: supertypes.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    fn java_fixture() -> Index {
+        let mut service = entry("app/Service.java", Some("app"), &["Service"], vec![]);
+        service.symbols = vec![java_class(
+            "Service",
+            vec![
+                java_method(
+                    "used",
+                    &[("helper", "Helper"), ("local", "Local")],
+                    &[],
+                    &[
+                        ("internal", Receiver::Bare),
+                        ("pong", Receiver::Name("helper".to_string())),
+                        ("ping", Receiver::Name("local".to_string())),
+                        ("staticCall", Receiver::Name("Repo".to_string())),
+                        ("inherited", Receiver::Bare),
+                        ("parent", Receiver::Super),
+                        ("size", Receiver::Name("repo".to_string())),
+                    ],
+                ),
+                java_method("internal", &[], &[], &[]),
+                java_method("omitted", &[], &[], &[]),
+            ],
+            &[("repo", "Repo")],
+            &["Base"],
+        )];
+
+        let mut base = entry("app/Base.java", Some("app"), &["Base"], vec![]);
+        base.symbols = vec![java_class(
+            "Base",
+            vec![
+                java_method("inherited", &[], &[], &[]),
+                java_method("parent", &[], &[], &[]),
+                java_method("baseOnly", &[], &[], &[]),
+            ],
+            &[],
+            &[],
+        )];
+
+        let mut repo = entry("app/Repo.java", Some("app"), &["Repo"], vec![]);
+        repo.symbols = vec![java_class(
+            "Repo",
+            vec![
+                java_method("size", &[], &[], &[]),
+                java_method("unused", &[], &[], &[]),
+                java_method("staticCall", &[], &[], &[]),
+            ],
+            &[],
+            &[],
+        )];
+
+        let mut helper = entry("app/Helper.java", Some("app"), &["Helper"], vec![]);
+        helper.symbols = vec![java_class(
+            "Helper",
+            vec![java_method("pong", &[], &[], &[])],
+            &[],
+            &[],
+        )];
+
+        let mut local = entry("app/Local.java", Some("app"), &["Local"], vec![]);
+        local.symbols = vec![java_class(
+            "Local",
+            vec![java_method("ping", &[], &[], &[])],
+            &[],
+            &[],
+        )];
+
+        index_from(vec![service, base, repo, helper, local])
+    }
+
+    fn member_seed(file: usize, class: &str, member: &str) -> Unit {
+        Unit::Member {
+            file,
+            class: class.to_string(),
+            member: member.to_string(),
+        }
+    }
+
+    #[test]
+    fn java_member_closure_follows_calls_only() {
+        let index = java_fixture();
+        let order = closure_units(
+            &index,
+            &[member_seed(0, "Service", "used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+            },
+        );
+        let members: Vec<(String, String)> = order
+            .iter()
+            .filter_map(|(unit, _, _)| {
+                Some((unit.symbol()?.to_string(), unit.member()?.to_string()))
+            })
+            .collect();
+        for expected in [
+            ("Service", "used"),
+            ("Service", "internal"),
+            ("Helper", "pong"),
+            ("Local", "ping"),
+            ("Repo", "size"),
+            ("Repo", "staticCall"),
+            ("Base", "inherited"),
+            ("Base", "parent"),
+        ] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(class, member)| class == expected.0 && member == expected.1),
+                "missing {expected:?} in {members:?}"
+            );
+        }
+        for unexpected in [
+            ("Service", "omitted"),
+            ("Repo", "unused"),
+            ("Base", "baseOnly"),
+        ] {
+            assert!(
+                !members
+                    .iter()
+                    .any(|(class, member)| class == unexpected.0 && member == unexpected.1),
+                "unexpected {unexpected:?} in {members:?}"
+            );
+        }
+        assert!(order
+            .iter()
+            .all(|(unit, _, _)| matches!(unit, Unit::Member { .. })));
+        assert_eq!(order[0].0, member_seed(0, "Service", "used"));
+    }
+
+    #[test]
+    fn java_member_closure_respects_depth() {
+        let index = java_fixture();
+        let order = closure_units(
+            &index,
+            &[member_seed(0, "Service", "used")],
+            ResolveOptions {
+                depth: 0,
+                same_package: false,
+            },
+        );
+        assert_eq!(order.len(), 1);
+    }
+
+    #[test]
+    fn unknown_member_falls_back_to_the_whole_class() {
+        let mut index = java_fixture();
+        index.files[0].symbols[0].members[0].calls = vec![crate::lang::Call {
+            name: "notThere".to_string(),
+            receiver: Receiver::Name("repo".to_string()),
+        }];
+        let order = closure_units(
+            &index,
+            &[member_seed(0, "Service", "used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+            },
+        );
+        assert!(order.iter().any(|(unit, _, _)| *unit
+            == Unit::Symbol {
+                file: 2,
+                symbol: "Repo".to_string()
+            }));
     }
 
     #[test]
