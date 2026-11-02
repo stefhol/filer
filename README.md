@@ -501,6 +501,83 @@ the enclosing declaration's line because uses are stored per symbol, not per occ
 
 Empty results print `[]` with `--json` and exit `4`, like `search`.
 
+### JSON surface
+
+The JSON form is the stable product; markdown is one consumer of the same data. Every JSON
+output covered here (`search`, `deps`, `bundle`, `show`, `index`) carries `schema_version: 1`:
+
+```sh
+filer --root ~/code/demo --json search --query Service   # JSON lines, one row per unit
+filer --root ~/code/demo --json deps app/Service.java    # {"schema_version":1,"deps":[...]}
+filer --root ~/code/demo --json bundle --depth 2 app/Service.java
+filer --root ~/code/demo --json show
+filer --root ~/code/demo --json index
+```
+
+`bundle --json` and `show --json` emit one envelope per run:
+
+```json
+{
+  "schema_version": 1,
+  "root": "/repo",
+  "title": "demo",
+  "branch": "main",
+  "depth": 2,
+  "files": 2,
+  "excerpts": 2,
+  "methods": 1,
+  "budget": {"max_file_bytes": 1048576, "used_bytes": 4096, "used_tokens": 1024, "truncated": false},
+  "entries": [
+    {
+      "path": "app/Service.java",
+      "scope": "methods",
+      "symbol": "Service",
+      "methods": ["used"],
+      "depth": 0,
+      "reason": "seed",
+      "start_line": 3,
+      "end_line": 14,
+      "start_byte": 14,
+      "end_byte": 186,
+      "tokens": 43,
+      "rendered": true,
+      "label": "`app/Service.java` :: `Service` [used]",
+      "markdown": "\n### `app/Service.java` :: `Service` (line 3)\n\n```java\n...\n```\n"
+    }
+  ],
+  "omitted": [],
+  "diagnostics": [],
+  "state_toml": "version = 3\n..."
+}
+```
+
+- `entries` names exactly the units the markdown contains, in order; `label` is the
+  `## Files` line and `markdown` is the `## Contents` section, so a consumer can rebuild
+  the bundle from the JSON. `omitted` is the subset that could not be rendered
+  (`too_large`, `unreadable`, `symbol_missing`, `stale_span`, `not_indexed`).
+- Spans are 1-based lines and 0-based byte offsets. `tokens` is `bytes / 4` for the unit
+  span; there is no tokenizer dependency.
+- `state_toml` preserves the bundle-state appendix as TOML inside the JSON envelope, so
+  the semantic state stays readable in the format the sidecar uses.
+- `diagnostics` is reserved for the diagnostics work; it is an empty array for now.
+- `deps --json` deliberately **wraps** its array: it used to print a bare `[...]`, now it
+  prints `{"schema_version":1,"deps":[...]}` so the version is a top-level key. Update
+  consumers with `jq '.deps'`. `search` stays JSON lines and adds `schema_version` to each
+  row, which is additive for the Neovim picker.
+
+Rebuilding the markdown from the envelope:
+
+```sh
+jq -jr '"# Code bundle: \(.title)\n\n- root: `\(.root)`\n- files: \(.files)\n"
+  + (if .excerpts > 0 then "- excerpts: \(.excerpts)\n" else "" end)
+  + (if .methods > 0 then "- methods: \(.methods)\n" else "" end)
+  + "- import depth: \(.depth)\n\n## Files\n\n"
+  + ([.entries[] | "- " + .label] | join("\n"))
+  + "\n\n## Contents\n"
+  + ([.entries[] | .markdown] | join(""))
+  + (if .state_toml then "\n## Bundle state\n\n```toml\n" + (.state_toml | rtrimstr("\n")) + "\n```\n" else "" end)' bundle.json
+```
+
 ### Machine-readable errors and exit codes
 
 `--json` (global) prints a fatal error as one envelope on stderr instead of prose:
@@ -527,7 +604,7 @@ what the index does *not* look at:
 
 ```sh
 $ filer --root ~/code/demo search --query 'discount rounding' --json
-{"hint":"symbol/path index only; use text search for file contents","results":0}
+{"hint":"symbol/path index only; use text search for file contents","results":0,"schema_version":1}
 ```
 
 The picker scores FQN, relative path and symbol/member names only — never fields,
@@ -619,7 +696,8 @@ src/web.rs      TypeScript/JavaScript parsing, Vue SFC extraction + tests
 src/fe.rs       Asset Control Formula Engine lexer/parser + tests
 src/index.rs    tree walk, parallelism, disk cache
 src/resolve.rs  import resolution, closure, tests
-src/bundle.rs   markdown rendering, class-shell pruning + tests
+src/bundle.rs   markdown + JSON surface, class-shell pruning + tests
+src/schema.rs   wire-format version shared by every JSON output
 src/state.rs    TOML bundle state, branch detection, tests
 lua/filer/      Neovim plugin: picker, bundling, bundle buffer
 plugin/filer.lua user commands
