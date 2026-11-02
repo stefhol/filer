@@ -95,6 +95,9 @@ describe("extension factory", () => {
     expect(commands[0]).toMatchObject({ name: "filer" });
     expect(handlers.has("session_start")).toBe(true);
     expect(handlers.has("session_tree")).toBe(true);
+    // #61: steering hooks, registered but inert until `session_start` passes.
+    expect(handlers.has("before_agent_start")).toBe(true);
+    expect(handlers.has("tool_result")).toBe(true);
     // Registration is process-free; the session-start check runs later.
     expect(gitLookups).toBe(0);
   });
