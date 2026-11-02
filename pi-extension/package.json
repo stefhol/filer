@@ -1,0 +1,27 @@
+{
+  "name": "pi-filer",
+  "version": "0.1.0",
+  "description": "pi extension: bundle sources and their import closure through the filer CLI",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.0"
+  }
+}
