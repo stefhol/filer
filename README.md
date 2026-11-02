@@ -145,8 +145,9 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute). |
 | `:FilerReset` | Forgets the current bundle state; the next bundle starts empty. |
 
-In the bundle buffer: `y` yanks, `q` closes. The buffer is `nofile`, not written to disk,
-and not added to `:ls` history beyond its split.
+In the bundle buffer: `y` yanks, `q` closes. The buffer is `nofile` and never written to
+disk. Bundling again — picker or `:FilerHere` — refills that same window and buffer instead
+of opening another split; `q` closes it, and the next bundle opens a fresh one.
 
 Root detection uses `vim.fs.root` with markers `.git`, `pom.xml`, `build.gradle(.kts)`,
 `settings.gradle(.kts)`, `gradlew`, `mvnw`. Override with `opts.root` (string or function).

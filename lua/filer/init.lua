@@ -263,7 +263,35 @@ function M.reset(opts)
   notify(stdout ~= "" and stdout or "bundle state cleared")
 end
 
---- Opens markdown text in a scratch split.
+--- The bundle buffer, if one is still around.
+function M.find_bundle_buffer()
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) then
+      local name = vim.api.nvim_buf_get_name(buf)
+      if name:match("^filer://bundle") then
+        return buf
+      end
+    end
+  end
+  return nil
+end
+
+local function new_bundle_buffer()
+  local name = "filer://bundle"
+  local index = 1
+  while vim.fn.bufnr(name) ~= -1 do
+    index = index + 1
+    name = "filer://bundle-" .. index
+  end
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(buf, name)
+  vim.bo[buf].filetype = "markdown"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  return buf
+end
+
+--- Opens markdown text, reusing the bundle window and buffer when they exist.
 function M.open(text, opts)
   opts = opts or {}
   local lines = vim.split(text, "\n", { plain = true })
@@ -271,18 +299,29 @@ function M.open(text, opts)
     table.remove(lines)
   end
 
-  local split = opts.split or M.config.split
-  vim.cmd(split)
-  local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_win_set_buf(0, buf)
-  M._bundle_count = (M._bundle_count or 0) + 1
-  vim.api.nvim_buf_set_name(buf, "filer://bundle-" .. M._bundle_count)
+  local buf = M.find_bundle_buffer()
+  local win = buf and vim.fn.bufwinid(buf) or -1
+
+  if buf and win ~= -1 then
+    -- Reuse: focus the window that already shows the bundle and refill it.
+    if vim.api.nvim_get_current_win() ~= win then
+      vim.api.nvim_set_current_win(win)
+    end
+  else
+    vim.cmd(opts.split or M.config.split)
+    if buf then
+      vim.api.nvim_win_set_buf(0, buf)
+    else
+      buf = new_bundle_buffer()
+      vim.api.nvim_win_set_buf(0, buf)
+    end
+  end
+
+  vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].filetype = "markdown"
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].swapfile = false
   vim.bo[buf].modifiable = false
   vim.wo[0].wrap = true
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
 
   if opts.keymaps ~= false then
     vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = buf, desc = "Close filer bundle" })
@@ -292,6 +331,8 @@ function M.open(text, opts)
     vim.fn.setreg("+", text)
     notify("bundle copied to clipboard")
   end
+
+  return buf
 end
 
 return M
