@@ -7,7 +7,7 @@ return {
     dir = "~/Work/filer",
     name = "filer",
     -- Commands are defined by plugin/filer.lua, so lazy-loading on them is safe.
-    cmd = { "FilerSearch", "FilerHere", "FilerBundle", "FilerShow", "FilerReset" },
+    cmd = { "FilerSearch", "FilerHere", "FilerBundle", "FilerShow", "FilerReset", "FilerResetAll" },
     keys = {
       { "<leader>fc", function() require("filer").search() end, desc = "filer: bundle for chat" },
       { "<leader>fh", function() require("filer").here() end, desc = "filer: bundle current file" },

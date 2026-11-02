@@ -1,5 +1,5 @@
-//! Persistent bundle state: which files are already in the bundle, why, and for
-//! which branch. Stored as TOML next to the project (`.filer/bundle.toml`).
+//! Per-branch bundle state: which files are already bundled on each git branch,
+//! why, and when. Stored as TOML next to the project (`.filer/bundle.toml`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,12 +7,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BundleState {
+const VERSION: u32 = 2;
+
+/// The whole state file: one bundle per branch.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StateDoc {
     pub root: String,
-    /// Git branch the state was written on. Empty when not in a git repo.
     #[serde(default)]
-    pub branch: String,
+    pub version: u32,
+    /// One entry per git branch. An empty `name` means "not a git repo".
+    #[serde(default)]
+    pub bundles: Vec<BranchBundle>,
+
+    // Legacy single-bundle layout (version 1), read and migrated on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    depth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<StateFile>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BranchBundle {
+    pub name: String,
     /// Unix seconds.
     #[serde(default)]
     pub created: u64,
@@ -33,37 +53,85 @@ pub struct StateFile {
     pub reason: String,
 }
 
-impl BundleState {
-    pub fn new(root: &Path, depth: u32) -> Self {
+impl StateDoc {
+    pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_string_lossy().to_string(),
-            branch: current_branch(root),
-            created: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0),
-            depth,
-            files: Vec::new(),
+            version: VERSION,
+            bundles: Vec::new(),
+            ..Default::default()
         }
     }
 
-    /// True when the state was written on a different branch than the current
-    /// one, i.e. after switching branches the old bundle is meaningless.
-    pub fn is_stale(&self, root: &Path) -> bool {
-        !self.branch.is_empty() && self.branch != current_branch(root)
+    pub fn bundle(&self, branch: &str) -> Option<&BranchBundle> {
+        self.bundles.iter().find(|bundle| bundle.name == branch)
     }
+
+    /// Inserts or replaces the bundle for its branch, keeping branches sorted.
+    pub fn upsert(&mut self, bundle: BranchBundle) {
+        match self
+            .bundles
+            .iter()
+            .position(|existing| existing.name == bundle.name)
+        {
+            Some(position) => self.bundles[position] = bundle,
+            None => self.bundles.push(bundle),
+        }
+        self.bundles.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    pub fn remove(&mut self, branch: &str) -> bool {
+        let before = self.bundles.len();
+        self.bundles.retain(|bundle| bundle.name != branch);
+        self.bundles.len() != before
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bundles.is_empty()
+    }
+
+    /// Converts a version 1 state file (single branch at the top level).
+    fn migrate(&mut self) {
+        self.version = VERSION;
+        if let Some(files) = self.files.take() {
+            if !files.is_empty() || self.branch.is_some() {
+                let bundle = BranchBundle {
+                    name: self.branch.take().unwrap_or_default(),
+                    created: self.created.take().unwrap_or(0),
+                    depth: self.depth.take().unwrap_or(0),
+                    files,
+                };
+                self.upsert(bundle);
+            }
+        }
+        self.branch = None;
+        self.created = None;
+        self.depth = None;
+    }
+}
+
+pub fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn default_path(root: &Path) -> PathBuf {
     root.join(".filer").join("bundle.toml")
 }
 
-pub fn load(path: &Path) -> Option<BundleState> {
+pub fn load(path: &Path) -> Option<StateDoc> {
     let text = fs::read_to_string(path).ok()?;
-    toml::from_str(&text).ok()
+    let mut doc: StateDoc = toml::from_str(&text).ok()?;
+    doc.migrate();
+    Some(doc)
 }
 
-pub fn save(path: &Path, state: &BundleState) -> std::io::Result<()> {
+pub fn save(path: &Path, doc: &StateDoc) -> std::io::Result<()> {
+    if doc.is_empty() {
+        return clear(path).map(|_| ());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         // Keep the state out of `git status` without touching the user's
@@ -73,7 +141,7 @@ pub fn save(path: &Path, state: &BundleState) -> std::io::Result<()> {
             let _ = fs::write(ignore, "*\n");
         }
     }
-    fs::write(path, to_toml(state))
+    fs::write(path, to_toml(doc))
 }
 
 pub fn clear(path: &Path) -> std::io::Result<bool> {
@@ -84,12 +152,15 @@ pub fn clear(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-pub fn to_toml(state: &BundleState) -> String {
-    let body = toml::to_string_pretty(state).unwrap_or_default();
-    format!("# filer bundle state — `:FilerReset` or `filer state --clear` removes it\n{body}")
+pub fn to_toml(doc: &StateDoc) -> String {
+    let body = toml::to_string_pretty(doc).unwrap_or_default();
+    format!(
+        "# filer bundle state — `:FilerReset` clears the current branch, `:FilerResetAll` everything\n{body}"
+    )
 }
 
-/// Reads `.git/HEAD` by walking up from `root`, without spawning git.
+/// Branch name for the project at `root`, read from `.git/HEAD` (no subprocess).
+/// Returns an empty string outside a git repository or on a read error.
 pub fn current_branch(root: &Path) -> String {
     let Some(head) = head_file(root) else {
         return String::new();
@@ -101,6 +172,15 @@ pub fn current_branch(root: &Path) -> String {
     match text.strip_prefix("ref: ") {
         Some(reference) => reference.rsplit('/').next().unwrap_or_default().to_string(),
         None => format!("detached@{}", &text[..text.len().min(7)]),
+    }
+}
+
+/// Human-readable branch label, also used as the TOML key.
+pub fn branch_label(branch: &str) -> &str {
+    if branch.is_empty() {
+        "(no branch)"
+    } else {
+        branch
     }
 }
 
@@ -131,26 +211,75 @@ fn head_file(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn round_trips_through_toml() {
-        let mut state = BundleState::new(Path::new("/repo"), 2);
-        state.branch = "feature/x".to_string();
-        state.files.push(StateFile {
-            path: "src/main/java/app/A.java".to_string(),
-            depth: 0,
-            reason: "seed".to_string(),
-        });
-        state.files.push(StateFile {
-            path: "src/main/java/app/B.java".to_string(),
-            depth: 1,
-            reason: "same-package".to_string(),
-        });
+    fn file(path: &str, depth: u32, reason: &str) -> StateFile {
+        StateFile {
+            path: path.to_string(),
+            depth,
+            reason: reason.to_string(),
+        }
+    }
 
-        let parsed: BundleState = toml::from_str(&to_toml(&state)).expect("valid toml");
-        assert_eq!(parsed.branch, "feature/x");
-        assert_eq!(parsed.depth, 2);
-        assert_eq!(parsed.files.len(), 2);
-        assert_eq!(parsed.files[1].reason, "same-package");
+    #[test]
+    fn keeps_one_bundle_per_branch() {
+        let mut doc = StateDoc::new(Path::new("/repo"));
+        for (branch, path) in [("main", "A.java"), ("ticket-42", "B.java")] {
+            doc.upsert(BranchBundle {
+                name: branch.to_string(),
+                created: 7,
+                depth: 2,
+                files: vec![file(path, 0, "seed")],
+            });
+        }
+
+        let parsed: StateDoc = toml::from_str(&to_toml(&doc)).expect("valid toml");
+        assert_eq!(parsed.version, VERSION);
+        assert_eq!(parsed.bundles.len(), 2);
+        assert_eq!(parsed.bundle("main").unwrap().files[0].path, "A.java");
+        assert_eq!(parsed.bundle("ticket-42").unwrap().files[0].path, "B.java");
+        assert!(parsed.bundle("other").is_none());
+    }
+
+    #[test]
+    fn reset_only_touches_one_branch() {
+        let mut doc = StateDoc::new(Path::new("/repo"));
+        for branch in ["main", "ticket-42"] {
+            doc.upsert(BranchBundle {
+                name: branch.to_string(),
+                depth: 1,
+                files: vec![file("A.java", 0, "seed")],
+                ..Default::default()
+            });
+        }
+
+        assert!(doc.remove("ticket-42"));
+        assert!(!doc.remove("ticket-42"));
+        assert!(doc.bundle("main").is_some());
+        assert_eq!(doc.bundles.len(), 1);
+    }
+
+    #[test]
+    fn migrates_version_one_state() {
+        let legacy = r#"
+            root = "/repo"
+            branch = "main"
+            created = 11
+            depth = 2
+
+            [[files]]
+            path = "A.java"
+            depth = 0
+            reason = "seed"
+        "#;
+        let mut doc: StateDoc = toml::from_str(legacy).expect("legacy toml");
+        doc.migrate();
+        assert_eq!(doc.version, VERSION);
+        assert_eq!(doc.bundles.len(), 1);
+        assert_eq!(doc.bundles[0].name, "main");
+        assert_eq!(doc.bundles[0].created, 11);
+        assert_eq!(doc.bundles[0].files[0].path, "A.java");
+        // Re-serializing must not write the legacy fields again.
+        let text = to_toml(&doc);
+        assert!(!text.contains("branch = "), "legacy field leaked: {text}");
     }
 
     #[test]
@@ -167,22 +296,6 @@ mod tests {
         )
         .unwrap();
         assert!(current_branch(&temporary).starts_with("detached@0123456"));
-
-        let _ = fs::remove_dir_all(&temporary);
-    }
-
-    #[test]
-    fn stale_after_branch_change() {
-        let temporary = std::env::temp_dir().join(format!("filer-stale-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temporary);
-        fs::create_dir_all(temporary.join(".git")).unwrap();
-        fs::write(temporary.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-
-        let state = BundleState::new(&temporary, 2);
-        assert!(!state.is_stale(&temporary));
-
-        fs::write(temporary.join(".git/HEAD"), "ref: refs/heads/other\n").unwrap();
-        assert!(state.is_stale(&temporary));
 
         let _ = fs::remove_dir_all(&temporary);
     }

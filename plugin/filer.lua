@@ -15,13 +15,18 @@ vim.api.nvim_create_user_command("FilerHere", function()
   filer().here()
 end, { desc = "filer: bundle current file with its imports" })
 
-vim.api.nvim_create_user_command("FilerShow", function()
-  filer().show()
-end, { desc = "filer: reopen the saved bundle" })
+vim.api.nvim_create_user_command("FilerShow", function(args)
+  local branch = args.args ~= "" and args.args or nil
+  filer().show({ branch = branch })
+end, { nargs = "?", desc = "filer: reopen the saved bundle (optionally for another branch)" })
 
 vim.api.nvim_create_user_command("FilerReset", function()
   filer().reset()
-end, { desc = "filer: forget the current bundle state" })
+end, { desc = "filer: forget this branch's bundle" })
+
+vim.api.nvim_create_user_command("FilerResetAll", function()
+  filer().reset_all()
+end, { desc = "filer: forget every branch's bundle" })
 
 vim.api.nvim_create_user_command("FilerBundle", function(args)
   local paths = args.fargs

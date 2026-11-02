@@ -14,7 +14,7 @@ use clap::{Args, Parser, Subcommand};
 use bundle::{BundleFile, BundleOptions};
 use index::{FileEntry, Index};
 use resolve::{Reason, ResolveOptions};
-use state::{BundleState, StateFile};
+use state::{BranchBundle, StateDoc, StateFile};
 
 #[derive(Parser)]
 #[command(
@@ -61,6 +61,9 @@ struct SearchArgs {
     /// Mark files already in the bundle at this state file.
     #[arg(long, value_name = "FILE")]
     state: Option<PathBuf>,
+    /// Branch whose bundle is marked. Defaults to the current branch.
+    #[arg(long, value_name = "BRANCH")]
+    branch: Option<String>,
 }
 
 #[derive(Args)]
@@ -109,6 +112,9 @@ struct ShowArgs {
     /// State file. Defaults to <root>/.filer/bundle.toml.
     #[arg(long, value_name = "FILE")]
     state: Option<PathBuf>,
+    /// Branch to show. Defaults to the current branch.
+    #[arg(long, value_name = "BRANCH")]
+    branch: Option<String>,
     /// Bundle title shown in the header.
     #[arg(long)]
     title: Option<String>,
@@ -119,9 +125,15 @@ struct ShowArgs {
 
 #[derive(Args)]
 struct StateArgs {
-    /// Delete the state file.
+    /// Delete the bundle for one branch (see --branch).
     #[arg(long)]
     clear: bool,
+    /// Delete every branch's bundle.
+    #[arg(long)]
+    all: bool,
+    /// Branch to clear or list. Defaults to the current branch.
+    #[arg(long, value_name = "BRANCH")]
+    branch: Option<String>,
     /// State file. Defaults to <root>/.filer/bundle.toml.
     #[arg(long, value_name = "FILE")]
     file: Option<PathBuf>,
@@ -146,13 +158,17 @@ fn main() {
 
 fn search(root: &Path, args: SearchArgs) {
     let index = Index::build(root);
+    let branch = args
+        .branch
+        .clone()
+        .unwrap_or_else(|| state::current_branch(&index.root));
     let included = args
         .state
         .as_ref()
         .and_then(|path| state::load(path))
-        .filter(|saved| !saved.is_stale(&index.root))
-        .map(|saved| {
-            saved
+        .and_then(|doc| doc.bundle(&branch).cloned())
+        .map(|bundle| {
+            bundle
                 .files
                 .into_iter()
                 .map(|file| (file.path, (file.depth, Reason::from_str(&file.reason))))
@@ -226,22 +242,17 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
     let root = index.root.clone();
     let state_path = args.state.clone();
 
-    // Files carried over from the previous bundle, unless the branch changed.
+    let branch = state::current_branch(&root);
+
+    // Files carried over from this branch's previous bundle.
     let mut previous: HashMap<usize, (u32, Reason)> = HashMap::new();
-    if let Some(path) = &state_path {
+    let doc = state_path.as_ref().and_then(|path| state::load(path));
+    if let Some(saved) = doc.as_ref() {
         if !args.reset {
-            if let Some(saved) = state::load(path) {
-                if saved.is_stale(&root) {
-                    eprintln!(
-                        "filer: dropping bundle from branch {} (now {})",
-                        saved.branch,
-                        state::current_branch(&root)
-                    );
-                } else {
-                    for file in saved.files {
-                        if let Some(&position) = index.by_rel.get(&file.path) {
-                            previous.insert(position, (file.depth, Reason::from_str(&file.reason)));
-                        }
+            if let Some(bundle) = saved.bundle(&branch) {
+                for file in &bundle.files {
+                    if let Some(&position) = index.by_rel.get(&file.path) {
+                        previous.insert(position, (file.depth, Reason::from_str(&file.reason)));
                     }
                 }
             }
@@ -311,31 +322,43 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
         std::process::exit(1);
     }
 
-    let saved_state = if state_path.is_some() {
-        let mut saved = BundleState::new(&root, args.depth);
-        saved.files = files
-            .iter()
-            .map(|file| StateFile {
-                path: file.rel.clone(),
-                depth: file.depth,
-                reason: file.reason.as_str().to_string(),
-            })
-            .collect();
-        Some(saved)
+    let branch_bundle = if state_path.is_some() {
+        Some(BranchBundle {
+            name: branch.clone(),
+            created: state::now(),
+            depth: args.depth,
+            files: files
+                .iter()
+                .map(|file| StateFile {
+                    path: file.rel.clone(),
+                    depth: file.depth,
+                    reason: file.reason.as_str().to_string(),
+                })
+                .collect(),
+        })
     } else {
         None
     };
 
+    // The appendix of a bundle carries only the branch it was built for.
+    let appendix = branch_bundle.as_ref().map(|bundle| {
+        let mut shown = StateDoc::new(&root);
+        shown.upsert(bundle.clone());
+        state::to_toml(&shown)
+    });
+
     let bundle_options = BundleOptions {
         title: args.title,
         depth: args.depth,
-        appendix: saved_state.as_ref().map(state::to_toml),
+        appendix,
         ..Default::default()
     };
     let markdown = bundle::render(&index, &files, &bundle_options);
 
-    if let (Some(path), Some(saved)) = (&state_path, &saved_state) {
-        if let Err(error) = state::save(path, saved) {
+    if let (Some(path), Some(bundle)) = (&state_path, branch_bundle) {
+        let mut doc = doc.unwrap_or_else(|| StateDoc::new(&root));
+        doc.upsert(bundle);
+        if let Err(error) = state::save(path, &doc) {
             eprintln!("filer: cannot write state {}: {error}", path.display());
         }
     }
@@ -416,8 +439,8 @@ fn deps(root: &Path, args: DepsArgs) {
     }
 }
 
-/// Re-renders the bundle from the state file: same files, same depths and
-/// reasons, current file contents.
+/// Re-renders one branch's bundle from the state file: same files, same depths
+/// and reasons, current file contents.
 fn show_cmd(root: &Path, args: ShowArgs) {
     let index = Index::build(root);
     let root = index.root.clone();
@@ -426,7 +449,7 @@ fn show_cmd(root: &Path, args: ShowArgs) {
         .clone()
         .unwrap_or_else(|| state::default_path(&root));
 
-    let Some(saved) = state::load(&path) else {
+    let Some(doc) = state::load(&path) else {
         eprintln!(
             "filer: no bundle state at {} — bundle something first",
             path.display()
@@ -434,19 +457,40 @@ fn show_cmd(root: &Path, args: ShowArgs) {
         std::process::exit(1);
     };
 
-    if saved.is_stale(&root) {
+    let branch = args
+        .branch
+        .clone()
+        .unwrap_or_else(|| state::current_branch(&root));
+
+    let Some(bundle) = doc.bundle(&branch).cloned() else {
+        let available: Vec<String> = doc
+            .bundles
+            .iter()
+            .map(|bundle| {
+                format!(
+                    "{} ({})",
+                    state::branch_label(&bundle.name),
+                    bundle.files.len()
+                )
+            })
+            .collect();
         eprintln!(
-            "filer: state is from branch {} (now {}), showing it anyway",
-            saved.branch,
-            state::current_branch(&root)
+            "filer: no bundle for branch {} (have: {})",
+            state::branch_label(&branch),
+            if available.is_empty() {
+                "none".to_string()
+            } else {
+                available.join(", ")
+            }
         );
-    }
+        std::process::exit(1);
+    };
 
     let mut files: Vec<BundleFile> = Vec::new();
-    let mut shown = saved.clone();
+    let mut shown = bundle.clone();
     shown.files.clear();
 
-    for file in &saved.files {
+    for file in &bundle.files {
         let abs = root.join(&file.path);
         let reason = Reason::from_str(&file.reason);
         match index.by_rel.get(&file.path) {
@@ -475,10 +519,16 @@ fn show_cmd(root: &Path, args: ShowArgs) {
         std::process::exit(1);
     }
 
+    let appendix = {
+        let mut single = StateDoc::new(&root);
+        single.upsert(shown);
+        state::to_toml(&single)
+    };
+
     let bundle_options = BundleOptions {
         title: args.title,
-        depth: saved.depth,
-        appendix: Some(state::to_toml(&shown)),
+        depth: bundle.depth,
+        appendix: Some(appendix),
         ..Default::default()
     };
     let markdown = bundle::render(&index, &files, &bundle_options);
@@ -490,23 +540,20 @@ fn show_cmd(root: &Path, args: ShowArgs) {
                 std::process::exit(1);
             }
             eprintln!(
-                "filer: wrote {} ({} files from {})",
+                "filer: wrote {} ({} files for branch {} from {})",
                 out.display(),
                 files.len(),
+                state::branch_label(&branch),
                 path.display()
             );
         }
         None => {
             print!("{markdown}");
             eprintln!(
-                "filer: {} files from {} (branch {})",
+                "filer: {} files for branch {} from {}",
                 files.len(),
-                path.display(),
-                if shown.branch.is_empty() {
-                    "none"
-                } else {
-                    &shown.branch
-                }
+                state::branch_label(&branch),
+                path.display()
             );
         }
     }
@@ -524,33 +571,44 @@ fn index_cmd(root: &Path) {
     );
 
     let path = state::default_path(&index.root);
+    let branch = state::current_branch(&index.root);
     match state::load(&path) {
-        Some(saved) => println!(
-            "state:      {} files, branch {}, {}",
-            saved.files.len(),
-            if saved.branch.is_empty() {
-                "none"
-            } else {
-                &saved.branch
-            },
-            if saved.is_stale(&index.root) {
-                "STALE (branch changed)"
-            } else {
-                "current"
+        Some(doc) => {
+            let current = doc.bundle(&branch).map_or(0, |bundle| bundle.files.len());
+            println!(
+                "bundle:     {} files on {}",
+                current,
+                state::branch_label(&branch)
+            );
+            let others: Vec<String> = doc
+                .bundles
+                .iter()
+                .filter(|bundle| bundle.name != branch)
+                .map(|bundle| {
+                    format!(
+                        "{} ({})",
+                        state::branch_label(&bundle.name),
+                        bundle.files.len()
+                    )
+                })
+                .collect();
+            if !others.is_empty() {
+                println!("other branches: {}", others.join(", "));
             }
-        ),
-        None => println!("state:      none at {}", path.display()),
+        }
+        None => println!("bundle:     none at {}", path.display()),
     }
 }
 
 fn state_cmd(root: &Path, args: StateArgs) {
-    let path = args.file.unwrap_or_else(|| {
+    let path = args.file.clone().unwrap_or_else(|| {
         state::default_path(&root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
     });
+    let current = state::current_branch(root);
 
-    if args.clear {
+    if args.all {
         match state::clear(&path) {
-            Ok(true) => println!("filer: cleared {}", path.display()),
+            Ok(true) => println!("filer: cleared every branch ({})", path.display()),
             Ok(false) => println!("filer: no state at {}", path.display()),
             Err(error) => {
                 eprintln!("filer: cannot remove {}: {error}", path.display());
@@ -560,28 +618,65 @@ fn state_cmd(root: &Path, args: StateArgs) {
         return;
     }
 
-    let Some(saved) = state::load(&path) else {
+    if args.clear {
+        let target = args.branch.clone().unwrap_or_else(|| current.clone());
+        let Some(mut doc) = state::load(&path) else {
+            println!("filer: no state at {}", path.display());
+            return;
+        };
+        if !doc.remove(&target) {
+            println!(
+                "filer: no bundle for {} in {}",
+                state::branch_label(&target),
+                path.display()
+            );
+            return;
+        }
+        if let Err(error) = state::save(&path, &doc) {
+            eprintln!("filer: cannot write {}: {error}", path.display());
+            std::process::exit(1);
+        }
+        println!(
+            "filer: cleared bundle for {} ({})",
+            state::branch_label(&target),
+            path.display()
+        );
+        return;
+    }
+
+    let Some(doc) = state::load(&path) else {
         println!("filer: no state at {}", path.display());
         return;
     };
-    println!("state:  {}", path.display());
-    println!(
-        "branch: {}",
-        if saved.branch.is_empty() {
-            "(not a git repo)"
-        } else {
-            &saved.branch
-        }
-    );
-    if saved.is_stale(root) {
+    println!("state:    {}", path.display());
+    println!("current:  {}", state::branch_label(&current));
+    println!("branches: {}", doc.bundles.len());
+
+    let target = args.branch.clone().unwrap_or_else(|| current.clone());
+    let Some(bundle) = doc.bundle(&target) else {
         println!(
-            "note:   written on {}, now on {} — next bundle starts fresh",
-            saved.branch,
-            state::current_branch(root)
+            "filer: no bundle for {} — stored: {}",
+            state::branch_label(&target),
+            doc.bundles
+                .iter()
+                .map(|bundle| format!(
+                    "{} ({})",
+                    state::branch_label(&bundle.name),
+                    bundle.files.len()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-    }
-    println!("files:  {}", saved.files.len());
-    for file in &saved.files {
+        return;
+    };
+
+    println!(
+        "bundle:   {} files, depth {}, created {}",
+        bundle.files.len(),
+        bundle.depth,
+        bundle.created
+    );
+    for file in &bundle.files {
         println!("  {} (depth {}, {})", file.path, file.depth, file.reason);
     }
 }

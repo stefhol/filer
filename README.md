@@ -143,8 +143,9 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 | `:FilerSearch` | Telescope picker. `<Tab>` multi-selects, `<CR>` bundles. |
 | `:FilerHere` | Bundles the current buffer's file with its imports. |
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute). |
-| `:FilerShow` | Re-renders the saved bundle (current file contents) without re-resolving. |
-| `:FilerReset` | Forgets the current bundle state; the next bundle starts empty. |
+| `:FilerShow [branch]` | Re-renders the saved bundle (current file contents) without re-resolving. |
+| `:FilerReset` | Forgets this branch's bundle; the next bundle starts empty. |
+| `:FilerResetAll` | Forgets every branch's bundle. |
 
 In the bundle buffer: `y` yanks, `q` closes. The buffer is `nofile` and never written to
 disk. Bundling again — picker or `:FilerHere` — refills that same window and buffer instead
@@ -155,35 +156,51 @@ Root detection uses `vim.fs.root` with markers `.git`, `pom.xml`, `build.gradle(
 
 ## Bundle state
 
-With `state = true` (the default) the binary writes `.filer/bundle.toml` next to the project:
+With `state = true` (the default) the binary writes `.filer/bundle.toml` next to the project,
+keeping **one bundle per git branch** (`version = 2`):
 
 ```toml
-# filer bundle state — `:FilerReset` or `filer state --clear` removes it
+# filer bundle state — `:FilerReset` clears the current branch, `:FilerResetAll` everything
 root = "/home/me/code/demo"
-branch = "feature/checkout"
+version = 2
+
+[[bundles]]
+name = "feature/checkout"
 created = 1793618434
 depth = 2
 
-[[files]]
+[[bundles.files]]
 path = "demo/src/main/java/com/example/demo/RunService.java"
 depth = 0
 reason = "seed"
 
-[[files]]
+[[bundles.files]]
 path = "demo/src/main/java/com/example/demo/DemoDocument.java"
 depth = 1
 reason = "same-package"
+
+[[bundles]]
+name = "main"
+created = 1793617000
+depth = 2
+
+[[bundles.files]]
+path = "demo/src/main/java/com/example/demo/DemoApplication.java"
+depth = 0
+reason = "seed"
 ```
 
 What that buys you:
 
-- The picker shows bundled files as `✓ com.example.demo.DemoDocument  (depth 1, same-package)`.
-  Selecting one is a no-op instead of a duplicate.
-- The next bundle is a **superset**: previous files are kept, new picks are added, depths are
-  the minimum over both runs. Bundle `Application`, then `RunService`, and you get all of it.
-- The bundle itself ends with a `## Bundle state` section holding the same TOML, so the model
-  and you can see exactly what came in and why. Escaping is handled (longer fences when a
-  file contains backticks).
+- The picker shows the **current branch's** bundled files as
+  `✓ com.example.demo.DemoDocument  (depth 1, same-package)`. Selecting one is a no-op
+  instead of a duplicate.
+- The next bundle is a **superset**: this branch's previous files are kept, new picks are
+  added, depths are the minimum over both runs.
+- Switching branches keeps everything: each branch picks up its own bundle where it left
+  off, instead of losing it.
+- The bundle ends with a `## Bundle state` section holding the same TOML for just that
+  branch, so the model and you can see what came in and why.
 - `reason` is one of `seed`, `import`, `static-import`, `wildcard-import`, `same-package`,
   `usage`, `package`, `config`, `external`.
 
@@ -191,15 +208,18 @@ Cleaning up:
 
 | Situation | What to do |
 | --- | --- |
-| New ticket, fresh bundle | `:FilerReset` (or `filer state --clear`) |
-| Switched branch | Nothing — a branch mismatch is detected and the old bundle is dropped, with a notice |
-| Want a one-off bundle, no state | `:FilerBundle` with `opts.state = false`, or `filer bundle` without `--state` |
-| See what is stored | `filer state` |
-| Reopen what you bundled yesterday | `:FilerShow` (or `filer show`) |
+| New ticket, fresh bundle | `:FilerReset` — clears the current branch only |
+| Nuke every branch | `:FilerResetAll` (or `filer state --clear --all`) |
+| Clear a different branch | `filer state --clear --branch main` |
+| Want a one-off bundle, no state | `opts.state = false`, or `filer bundle` without `--state` |
+| See what is stored | `filer state` (add `--branch NAME` for another branch) |
+| Reopen yesterday's bundle | `:FilerShow` / `:FilerShow main` / `filer show --branch main` |
 
 `.filer/.gitignore` containing `*` is created automatically, so the state never shows up in
-`git status` and your own `.gitignore` is left alone. Detached HEADs are recorded as
-`detached@<sha>`; repos without git simply store an empty branch and never go stale.
+`git status` and your own `.gitignore` is left alone. Branch names come straight from
+`.git/HEAD` (no git subprocess); detached HEADs are stored as `detached@<sha>`, and repos
+without git use a single `(no branch)` bundle. Older single-branch state files are migrated
+on load.
 
 ## CLI
 
@@ -210,10 +230,12 @@ filer --root ~/code/demo deps src/main/java/com/example/app/Application.java
 filer --root ~/code/demo bundle --depth 2 --with-config \
       src/main/java/com/example/app/Application.java > bundle.md
 filer --root ~/code/demo index                         # cache stats
-filer --root ~/code/demo show                          # re-render the saved bundle
+filer --root ~/code/demo show                          # re-render this branch's bundle
+filer --root ~/code/demo show --branch main            # ... another branch's
 filer --root ~/code/demo show --out bundle.md           # ... into a file
-filer --root ~/code/demo state                         # what is in the bundle?
-filer --root ~/code/demo state --clear                 # forget it
+filer --root ~/code/demo state                         # what is stored per branch?
+filer --root ~/code/demo state --clear                 # forget this branch
+filer --root ~/code/demo state --clear --all           # forget everything
 
 # stateful bundling: bundle twice, get the union
 filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml A.java > a.md
@@ -224,10 +246,11 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C
 `bundle` flags: `--depth N` (0 = only the given files), `--with-same-package`,
 `--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`. Default depth is 2.
 
-`show` takes no files: it reads the state file (default `<root>/.filer/bundle.toml`), re-reads
-the files from disk and renders the same bundle again — useful after a restart, or to pipe a
-bundle into another tool. Files that vanished since are dropped with a notice; state from a
-different branch is shown with a warning.
+`show` takes no files: it reads the state file (default `<root>/.filer/bundle.toml`), picks the
+current branch's bundle (`--branch` overrides), re-reads the files from disk and renders it
+again — useful after a restart, or to pipe a bundle into another tool. Files that vanished
+since are dropped with a notice; asking for a branch that has no bundle lists the ones that
+do.
 
 ## How resolution works
 

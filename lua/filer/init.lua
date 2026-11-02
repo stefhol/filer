@@ -258,6 +258,10 @@ function M.show(opts)
   opts = opts or {}
   local root = opts.root or M.root()
   local args = { "show", "--root", root, "--state", M.state_path(root) }
+  if opts.branch then
+    table.insert(args, "--branch")
+    table.insert(args, opts.branch)
+  end
   if opts.title then
     table.insert(args, "--title")
     table.insert(args, opts.title)
@@ -274,7 +278,20 @@ function M.show(opts)
   M.open(stdout, vim.tbl_extend("force", opts, { root = root }))
 end
 
---- Drops the saved bundle state, so the next bundle starts empty.
+--- Drops every branch's bundle, not just the current one.
+function M.reset_all(opts)
+  opts = opts or {}
+  local root = opts.root or M.root()
+  local stdout, stderr, code =
+    run({ "state", "--clear", "--all", "--file", M.state_path(root), "--root", root }, root)
+  if code ~= 0 then
+    notify(stderr ~= "" and stderr or "reset failed", vim.log.levels.ERROR)
+    return
+  end
+  notify(stdout ~= "" and stdout or "all bundles cleared")
+end
+
+--- Drops the saved bundle state for the current branch, so it starts empty.
 function M.reset(opts)
   opts = opts or {}
   local root = opts.root or M.root()
