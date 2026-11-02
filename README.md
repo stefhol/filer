@@ -510,6 +510,51 @@ filer --root ~/code/demo show --max-tokens 2000                     # re-render 
 A budget does not fight the per-file safety valve: a single file above 1 MiB is still
 reported as `too_large` instead of being cut.
 
+### Sessions: one state file per agent
+
+The default state is per repo and per branch (`.filer/bundle.toml`). Two agents — or one
+agent and your editor — sharing a checkout would then clobber each other's context, so each
+can take a session instead:
+
+```sh
+filer --root ~/code/demo bundle --session s1 --depth 2 'app/Service.java::Service.used'
+filer --root ~/code/demo show   --session s1
+filer --root ~/code/demo state  --session s1
+FILER_SESSION=s1 filer --root ~/code/demo bundle --depth 2 app/Service.java   # same thing
+```
+
+- A session lives in `.filer/sessions/<id>.toml` — **repo-local**, so it travels with the
+  checkout and dies with it, but never shows up in `git status`: the state writer drops the
+  same `*` `.gitignore` into `.filer/` that keeps `bundle.toml` out of git.
+- `--session` (global) switches the state file for `bundle`, `show`, `state`, `why` and
+  `search --state`; an explicit `--state` still wins. `$FILER_SESSION` is used when the flag
+  is absent, so a harness can export `PI_SESSION_ID` (or any id) once instead of threading a
+  flag through every call.
+- Ids are file names: letters, digits, `.`, `-`, `_` only, no `/`, no `.`/`..`. Anything else
+  exits `1` with a hint, so a session id can never escape `.filer/sessions/`.
+- Branches still work inside a session: the file holds one bundle per git branch, like the
+  default state. `--from-state` refreshes a session's seeds the same way.
+- `filer state` keeps working unchanged for the default file — sessions are additive.
+
+### `context list` / `context clear`
+
+What is saved on disk, without reading TOML by hand:
+
+```sh
+filer --root ~/code/demo context list
+# default           2 entries on main  .filer/bundle.toml
+# s1                7 entries on main  .filer/sessions/s1.toml
+
+filer --root ~/code/demo --json context list
+filer --root ~/code/demo context clear s1      # forget one session
+filer --root ~/code/demo context clear --all   # forget every session and the default state
+```
+
+`--json` returns one object with `schema_version`, the current `branch`, a `default` entry and
+a `sessions` array; each carries `path`, `exists`, `entries` (for the current branch),
+`modified` (unix seconds) and a `branches` array with per-branch `entries`/`depth`/`created`.
+`context clear` prints what it removed and is a no-op (exit `0`) when there was nothing.
+
 ## CLI
 
 ```sh
@@ -554,7 +599,7 @@ the same two budget flags. With `--seeds-from` the positional files become optio
 sources are combined; reading that list is a plain file read — filer never runs `git`, so
 `git diff --name-only | filer bundle --seeds-from -` is your own pipeline.
 Default depth is 2. Global flags: `--json`, `--quiet`, `--include GLOB`, `--exclude GLOB`,
-`--no-ignore` (see below). Add `::Symbol` for one declaration and `::Class.method` for a Java or
+`--no-ignore`, `--session ID` (see below and [Sessions](#sessions-one-state-file-per-agent)). Add `::Symbol` for one declaration and `::Class.method` for a Java or
 Rust method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
 `filer --root ~/code/demo bundle 'app/Service.java::Service.used'`,
 `filer --root ~/code/demo bundle 'src/app/service.rs::Service.used'`.

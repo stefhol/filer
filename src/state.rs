@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic;
+use crate::error::FilerError;
 
 const VERSION: u32 = 3;
 
@@ -327,6 +328,56 @@ pub fn now() -> u64 {
 
 pub fn default_path(root: &Path) -> PathBuf {
     root.join(".filer").join("bundle.toml")
+}
+
+/// Directory of per-session state files. `state::save` puts a `*` `.gitignore`
+/// in `.filer/`, so sessions are repo-local but never committed.
+pub fn sessions_dir(root: &Path) -> PathBuf {
+    root.join(".filer").join("sessions")
+}
+
+/// `.filer/sessions/<id>.toml`.
+pub fn session_path(root: &Path, id: &str) -> PathBuf {
+    sessions_dir(root).join(format!("{id}.toml"))
+}
+
+/// A session id becomes a file name, so only a safe alphabet is accepted: no
+/// separators, no `.`/`..`, nothing that leaves the sessions directory.
+pub fn validate_session(id: &str) -> Result<(), FilerError> {
+    let safe = !id.is_empty()
+        && id.len() <= 128
+        && id != "."
+        && id != ".."
+        && id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        });
+    if safe {
+        Ok(())
+    } else {
+        Err(FilerError::internal(format!("invalid session id {id:?}"))
+            .with_hint("session ids may contain letters, digits, '.', '-' and '_'"))
+    }
+}
+
+/// Saved session files as `(id, path)`, sorted by id.
+pub fn session_files(root: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = fs::read_dir(sessions_dir(root)) else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "toml")
+        })
+        .filter_map(|path| {
+            let id = path.file_stem()?.to_str()?.to_string();
+            Some((id, path))
+        })
+        .collect();
+    sessions.sort();
+    sessions
 }
 
 /// Read the state file. A missing file is `None`; a corrupt or unreadable one

@@ -65,6 +65,12 @@ struct Cli {
     #[arg(long, global = true)]
     no_ignore: bool,
 
+    /// Use `.filer/sessions/<id>.toml` instead of `.filer/bundle.toml`, so
+    /// several agents or editor sessions keep separate bundles. Also read from
+    /// `$FILER_SESSION` when the flag is absent.
+    #[arg(long, global = true, value_name = "ID")]
+    session: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -93,6 +99,8 @@ enum Command {
     Index(IndexArgs),
     /// Show or clear the saved bundle state.
     State(StateArgs),
+    /// List or clear saved bundles: the default branch state and every session.
+    Context(ContextArgs),
 }
 
 #[derive(Args)]
@@ -264,6 +272,30 @@ struct ShowArgs {
 }
 
 #[derive(Args)]
+struct ContextArgs {
+    #[command(subcommand)]
+    command: ContextCommand,
+}
+
+#[derive(Subcommand)]
+enum ContextCommand {
+    /// List the saved bundles: the default branch state, then every session.
+    List,
+    /// Delete one session's bundle, or every saved bundle.
+    Clear(ContextClearArgs),
+}
+
+#[derive(Args)]
+struct ContextClearArgs {
+    /// Session id to delete. Not needed with `--all`.
+    #[arg(value_name = "ID", required_unless_present = "all")]
+    id: Option<String>,
+    /// Delete every session and the default branch state.
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Args)]
 struct StateArgs {
     /// Delete the bundle for one branch (see --branch).
     #[arg(long)]
@@ -302,9 +334,24 @@ fn main() {
             std::process::exit(error.code.exit_code());
         }
     };
+    let session = match cli.session.clone().or_else(|| {
+        std::env::var("FILER_SESSION")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    }) {
+        Some(id) => {
+            if let Err(error) = state::validate_session(&id) {
+                error.emit(cli.json);
+                std::process::exit(error.code.exit_code());
+            }
+            Some(id)
+        }
+        None => None,
+    };
     let context = Context {
         json: cli.json,
         quiet: cli.quiet,
+        session,
         filter,
     };
     match run(&context, cli.root, cli.command) {
@@ -326,6 +373,8 @@ struct Context {
     quiet: bool,
     /// `--include`/`--exclude`/`--no-ignore`: which files exist for this run.
     filter: Filter,
+    /// `--session`/`$FILER_SESSION`: per-session state instead of the branch one.
+    session: Option<String>,
 }
 
 impl Context {
@@ -369,7 +418,8 @@ fn run(context: &Context, root: Option<PathBuf>, command: Command) -> Result<boo
             index_cmd(&root, args, context)?;
             Ok(false)
         }
-        Command::State(args) => state_cmd(&root, args).map(|()| false),
+        Command::State(args) => state_cmd(&root, args, context).map(|()| false),
+        Command::Context(args) => context_cmd(&root, args, context).map(|()| false),
     }
 }
 
@@ -453,8 +503,14 @@ fn search(root: &Path, args: SearchArgs, context: &Context) -> Result<bool, File
         .clone()
         .unwrap_or_else(|| state::current_branch(&index.root));
 
+    let state_path = args.state.clone().or_else(|| {
+        context
+            .session
+            .as_deref()
+            .map(|id| state::session_path(&index.root, id))
+    });
     let included = included_from(
-        args.state
+        state_path
             .as_ref()
             .and_then(|path| state::load(path))
             .and_then(|doc| doc.bundle(&branch).cloned()),
@@ -900,7 +956,13 @@ fn score(fqn: &str, rel: &str, names: &[String], query: &str, tokens: &[&str]) -
 fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), FilerError> {
     let index = Index::build_with(root, &context.filter);
     let root = index.root.clone();
-    let state_path = args.state.clone();
+    // `--session` (or `$FILER_SESSION`) switches the state file; `--state` wins.
+    let state_path = args.state.clone().or_else(|| {
+        context
+            .session
+            .as_deref()
+            .map(|id| state::session_path(&root, id))
+    });
 
     let branch = state::current_branch(&root);
     let doc = state_path.as_ref().and_then(|path| state::load(path));
@@ -1852,6 +1914,12 @@ fn why_cmd(root: &Path, args: WhyArgs, context: &Context) -> Result<bool, FilerE
     let path = args
         .state
         .clone()
+        .or_else(|| {
+            context
+                .session
+                .as_deref()
+                .map(|id| state::session_path(&root, id))
+        })
         .unwrap_or_else(|| state::default_path(&root));
     let Some(doc) = state::load(&path) else {
         return Err(FilerError::new(
@@ -2054,6 +2122,12 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
     let path = args
         .state
         .clone()
+        .or_else(|| {
+            context
+                .session
+                .as_deref()
+                .map(|id| state::session_path(&root, id))
+        })
         .unwrap_or_else(|| state::default_path(&root));
 
     let Some(doc) = state::load(&path) else {
@@ -2432,10 +2506,18 @@ fn update_cmd(root: &Path, inputs: &[String], context: &Context) -> Result<(), F
     Ok(())
 }
 
-fn state_cmd(root: &Path, args: StateArgs) -> Result<(), FilerError> {
-    let path = args.file.clone().unwrap_or_else(|| {
-        state::default_path(&root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
-    });
+fn state_cmd(root: &Path, args: StateArgs, context: &Context) -> Result<(), FilerError> {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let path = args
+        .file
+        .clone()
+        .or_else(|| {
+            context
+                .session
+                .as_deref()
+                .map(|id| state::session_path(&canonical, id))
+        })
+        .unwrap_or_else(|| state::default_path(&canonical));
     let current = state::current_branch(root);
 
     if args.all {
@@ -2516,6 +2598,140 @@ fn state_cmd(root: &Path, args: StateArgs) -> Result<(), FilerError> {
         println!("  {} (depth {}, {})", file.label(), file.depth, file.reason);
     }
 
+    Ok(())
+}
+
+/// One saved bundle file described for `context list`: which branches it holds,
+/// how many entries each has, and when it was last written.
+fn saved_bundle_json(root: &Path, path: &Path, branch: &str) -> serde_json::Value {
+    let doc = state::load(path);
+    let modified = std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let branches: Vec<serde_json::Value> = doc
+        .iter()
+        .flat_map(|doc| doc.bundles.iter())
+        .map(|bundle| {
+            serde_json::json!({
+                "branch": bundle.name,
+                "label": state::branch_label(&bundle.name),
+                "entries": bundle.files.len(),
+                "depth": bundle.depth,
+                "created": bundle.created,
+            })
+        })
+        .collect();
+    let entries = doc
+        .as_ref()
+        .and_then(|doc| doc.bundle(branch))
+        .map(|bundle| bundle.files.len())
+        .unwrap_or(0);
+    serde_json::json!({
+        "path": index::relative(root, path),
+        "exists": path.exists(),
+        "modified": modified,
+        "entries": entries,
+        "branches": branches,
+    })
+}
+
+/// `filer context list|clear`: what bundles exist on disk and how to forget one.
+fn context_cmd(root: &Path, args: ContextArgs, context: &Context) -> Result<(), FilerError> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let branch = state::current_branch(&root);
+
+    match args.command {
+        ContextCommand::List => {
+            let default = saved_bundle_json(&root, &state::default_path(&root), &branch);
+            let sessions: Vec<serde_json::Value> = state::session_files(&root)
+                .into_iter()
+                .map(|(id, path)| {
+                    let mut value = saved_bundle_json(&root, &path, &branch);
+                    value["id"] = serde_json::json!(id);
+                    value
+                })
+                .collect();
+
+            if context.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "root": root.to_string_lossy(),
+                        "branch": branch,
+                        "label": state::branch_label(&branch),
+                        "default": default,
+                        "sessions": sessions,
+                    })
+                );
+                return Ok(());
+            }
+
+            let describe = |id: &str, value: &serde_json::Value| {
+                println!(
+                    "{id:14} {:>4} entries on {}  {}",
+                    value["entries"],
+                    state::branch_label(&branch),
+                    if value["exists"].as_bool().unwrap_or(false) {
+                        value["path"].as_str().unwrap_or_default().to_string()
+                    } else {
+                        "(none)".to_string()
+                    }
+                );
+            };
+            describe("default", &default);
+            for session in &sessions {
+                describe(session["id"].as_str().unwrap_or_default(), session);
+            }
+        }
+        ContextCommand::Clear(args) => {
+            let mut cleared: Vec<PathBuf> = Vec::new();
+            if args.all {
+                let paths = std::iter::once(state::default_path(&root)).chain(
+                    state::session_files(&root)
+                        .into_iter()
+                        .map(|(_, path)| path),
+                );
+                for path in paths {
+                    if state::clear(&path).unwrap_or(false) {
+                        cleared.push(path);
+                    }
+                }
+            } else {
+                let id = args.id.unwrap_or_default();
+                state::validate_session(&id)?;
+                let path = state::session_path(&root, &id);
+                if state::clear(&path).unwrap_or(false) {
+                    cleared.push(path);
+                }
+            }
+
+            if context.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": SCHEMA_VERSION,
+                        "root": root.to_string_lossy(),
+                        "cleared": cleared
+                            .iter()
+                            .map(|path| index::relative(&root, path))
+                            .collect::<Vec<_>>(),
+                        "count": cleared.len(),
+                    })
+                );
+                return Ok(());
+            }
+            if cleared.is_empty() {
+                println!("filer: nothing to clear");
+            }
+            for path in &cleared {
+                println!("filer: cleared {}", index::relative(&root, path));
+            }
+        }
+    }
     Ok(())
 }
 
