@@ -860,11 +860,13 @@ fn render_member_group(
             let signature = String::from_utf8_lossy(&bytes[member.start..body_start])
                 .trim_end()
                 .to_string();
-            Some((
-                member.start - class.start,
-                member.end - class.start,
-                format!("{signature};   // body omitted"),
-            ))
+            let stub = if language == "python" {
+                // `def x(self) -> int: ...` stays valid Python.
+                format!("{signature} ...  # body omitted")
+            } else {
+                format!("{signature};   // body omitted")
+            };
+            Some((member.start - class.start, member.end - class.start, stub))
         })
         .collect();
     splices.sort_by_key(|(start, _, _)| *start);

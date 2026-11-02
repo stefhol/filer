@@ -90,6 +90,8 @@ impl RustParser {
                                 members: Vec::new(),
                                 fields: Vec::new(),
                                 supertypes: Vec::new(),
+                                params: Vec::new(),
+                                locals: Vec::new(),
                             };
                             if child.kind() == "struct_item" || child.kind() == "union_item" {
                                 symbol.fields = fields_of(child, src);
@@ -214,6 +216,8 @@ fn merge_symbol<'a>(
         members: Vec::new(),
         fields: Vec::new(),
         supertypes: Vec::new(),
+        params: Vec::new(),
+        locals: Vec::new(),
     });
     out.symbols.last_mut().expect("just pushed")
 }

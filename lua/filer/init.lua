@@ -63,6 +63,9 @@ function M.root()
     "tsconfig.json",
     "jsconfig.json",
     "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
     "Cargo.toml",
     "gradlew",
     "mvnw",
@@ -351,14 +354,16 @@ function M.here(opts)
     return
   end
   -- `.fe` files are usually tens of thousands of lines: seed the function under
-  -- the cursor. Java, Kotlin, Scala, Groovy, C#, Rust and TS/JS seed the method
-  -- under the cursor (or the class when the cursor is not in a method). Other
-  -- languages keep whole-file `:FilerHere`.
+  -- the cursor. Python, Java, Kotlin, Scala, Groovy, C#, Rust and TS/JS seed the
+  -- method under the cursor (or the class when the cursor is not in a method).
+  -- Other languages keep whole-file `:FilerHere`.
   local options = opts
   if
     options.at_line == nil
     and (
       name:match("%.fe$")
+      or name:match("%.py$")
+      or name:match("%.pyi$")
       or name:match("%.java$")
       or name:match("%.kt$")
       or name:match("%.kts$")

@@ -38,7 +38,7 @@ pub const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 16;
+const CACHE_VERSION: u32 = 17;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -453,7 +453,7 @@ fn load_one(
     let language = Language::from_path(path)?;
     let bytes = fs::read(path).ok()?;
     let source = String::from_utf8_lossy(&bytes);
-    let parsed = parser.parse(language, &source)?;
+    let parsed = parser.parse(language, &source, &rel)?;
     Some((
         false,
         FileEntry {
@@ -662,6 +662,8 @@ mod tests {
             ),
             ("I.fe", "function i() { return 1; }"),
             ("J.rs", "pub struct J;"),
+            ("K.py", "class K:\n    pass\n"),
+            ("L.pyi", "class L: ...\n"),
         ];
         for (name, source) in files {
             fs::write(root.join(name), source).unwrap();

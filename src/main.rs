@@ -12,6 +12,7 @@ mod index;
 mod java;
 mod kotlin;
 mod lang;
+mod python;
 mod resolve;
 mod rust;
 mod scala;
@@ -958,14 +959,15 @@ fn class_fqn(file: &FileEntry, symbol: &crate::lang::Symbol) -> String {
     }
 }
 
-/// Picker row kind, which is also the `[kind]` label prefix.
+/// Picker row kind, which is also the `[kind]` label prefix. Only languages
+/// with `member` granularity have class rows; their functions and declarations
+/// (Python module functions, Rust free functions and constants) stay symbols.
 fn row_kind(granularity: Granularity, kind: SymbolKind) -> &'static str {
-    match (granularity, kind) {
-        (Granularity::Member, _) => "class",
-        (Granularity::Function, _) => "function",
-        (_, SymbolKind::Type) => "type",
-        (_, SymbolKind::Function) => "function",
-        (_, SymbolKind::Declaration) => "declaration",
+    match kind {
+        SymbolKind::Type if granularity == Granularity::Member => "class",
+        SymbolKind::Type => "type",
+        SymbolKind::Function => "function",
+        SymbolKind::Declaration => "declaration",
     }
 }
 
@@ -1856,9 +1858,16 @@ fn deps(root: &Path, args: DepsArgs, context: &Context) -> Result<(), FilerError
             .iter()
             .map(|(unit, depth, reason)| {
                 let file = &index.files[unit.file()];
+                // A file can declare several types (Java side classes, Python
+                // modules with many classes); the unit's own type is its FQN.
+                let fqn = unit
+                    .symbol()
+                    .and_then(|name| file.symbol(name))
+                    .map(|symbol| class_fqn(file, symbol))
+                    .unwrap_or_else(|| file.primary_fqn());
                 let mut row = serde_json::json!({
                     "path": file.rel,
-                    "fqn": file.primary_fqn(),
+                    "fqn": fqn,
                     "depth": depth,
                     "reason": reason.as_str(),
                 });

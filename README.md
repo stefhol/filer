@@ -27,13 +27,13 @@ being pasted to.
 
 ## What it does
 
-Supported languages: Java, Scala, Kotlin, Groovy, C#, Rust, TypeScript, JavaScript, Vue and
-`.fe`. Parsing is tree-sitter based (no LSP, no classpath, no compiler). Three tiers of
-support:
+Supported languages: Python, Java, Scala, Kotlin, Groovy, C#, Rust, TypeScript, JavaScript,
+Vue and `.fe`. Parsing is tree-sitter based (no LSP, no classpath, no compiler). Three tiers
+of support:
 
 | Tier | Languages | What you get |
 | --- | --- | --- |
-| Full | Java, Scala, Kotlin, Groovy, C#, Rust, TS/JS | import/`use`/module resolution, type-usage edges, call graph, `[file]`/`[class]`/`[method]` scopes |
+| Full | Python, Java, Scala, Kotlin, Groovy, C#, Rust, TS/JS | import/`use`/module resolution, type-usage edges, call graph, `[file]`/`[class]`/`[method]` scopes |
 | Whole-file | Vue | `<script>` blocks parsed as TS/JS; never sliced |
 | Function-level | `.fe` | one project-wide namespace; calls resolved by name; function seeds |
 
@@ -46,6 +46,12 @@ support:
   (`use crate::app::{Service, model::User}`), wildcards and aliases, plus `mod foo;`
   declarations. Rust modules resolve by Cargo directory layout (`foo.rs` or `foo/mod.rs`),
   not by package name.
+- Resolves Python module paths: `import a.b`, `import a.b as x`, `from a.b import C`,
+  `from a.b import C as D`, wildcards, `if TYPE_CHECKING:` blocks and relative imports
+  (`from . import x`, `from ..a import b` — the dot count walks up the package). A dotted
+  module is `a/b.py`, `a/b/__init__.py` or the `.pyi` stub of either, under the project root;
+  a `from` import prefers the file that declares the name, follows re-exports in an
+  `__init__.py`, and falls back to the `a/b/C.py` submodule.
 - Resolves TypeScript/JavaScript/Vue module specifiers: relative imports and re-exports
   (`./x`, `../y.js`), extensionless imports, directory `index` files, `.js` specifiers that
   point at a `.ts` source, dynamic `import()` and CommonJS `require()`. Vue `<script>` and
@@ -56,12 +62,14 @@ support:
 - Follows type *usages* too, so a class that references a sibling in its own package — which
   Java, Scala, Kotlin, Groovy or C# needs no import for, e.g. `indexOps(DemoDocument.class)`,
   `DemoDocument.create()` or `new DemoDocument()` — still pulls that file in. Rust type
-  positions and `Type::method()` receivers work the same way. Module languages rely on
-  their explicit imports instead of repo-wide name guessing.
+  positions and `Type::method()` receivers work the same way, and so do Python annotations
+  (`def f(x: Repo)`, `list[Foo]`, `Foo | None`) and constructor calls (`Repo()` is a type
+  use, not a call). Module languages rely on their explicit imports instead of repo-wide
+  name guessing.
 - Extracts **symbols** (top-level functions, classes, objects, global declarations, Rust
-  structs/enums/traits/functions, Java methods) with their byte spans, so a bundle can carry
-  one declaration out of a huge file. Class methods add a second granularity: class shell for
-  context, call-path bodies for content.
+  structs/enums/traits/functions, Python classes and module functions, Java methods) with
+  their byte spans, so a bundle can carry one declaration out of a huge file. Class methods
+  add a second granularity: class shell for context, call-path bodies for content.
 - Every entry has an explicit **scope** — `file`, `symbol` or `methods` — so the picker,
   the state file and the renderer agree on what was included and why.
 - Walks the resulting graph to a configurable depth, then sorts what it found into a
@@ -87,12 +95,13 @@ support:
   torn one; a corrupt file is reported and rebuilt instead of aborting.
 
 Things it deliberately does not do: compile your project, read `pom.xml` / `build.sbt` /
-`*.csproj` / `Cargo.toml` / `package.json` dependencies, or pretend to resolve libraries. JDK,
-Scala stdlib, npm packages, NuGet packages, Rust crates and other third-party imports are
-simply reported as unresolved; `node_modules`, package `exports`/`imports` and
-`moduleResolution` variants are not consulted. Imports only resolve
+`*.csproj` / `Cargo.toml` / `package.json` / `pyproject.toml` dependencies, or pretend to
+resolve libraries. JDK, Scala stdlib, npm packages, NuGet packages, Rust crates, the Python
+stdlib and site-packages, and other third-party imports are simply reported as unresolved;
+`node_modules`, package `exports`/`imports` and `moduleResolution` variants, and
+`sys.path`/virtualenv roots are not consulted. Imports only resolve
 within the same language family (JVM-ish languages with each other, TS/JS/Vue with each
-other, Rust with itself), never across.
+other, Rust with itself, Python with itself), never across.
 
 ## Build
 
@@ -228,8 +237,8 @@ of opening another split; `q` closes it, and the next bundle opens a fresh one.
 
 Root detection uses `vim.fs.root` with markers `.git`, `pom.xml`, `build.gradle(.kts)`,
 `settings.gradle(.kts)`, `build.sbt`, `Cargo.toml`, `gradlew`, `mvnw`, `tsconfig.json`,
-`jsconfig.json`, `package.json`, `*.csproj`, `*.sln`. Override with `opts.root` (string or
-function).
+`jsconfig.json`, `package.json`, `pyproject.toml`, `setup.py`, `setup.cfg`, `*.csproj`,
+`*.sln`. Override with `opts.root` (string or function).
 
 ## Bundle scopes: file, class, method
 
@@ -238,9 +247,9 @@ each language exposes only the ones it has.
 
 | Scope | Languages | Rendered | Closure |
 | --- | --- | --- | --- |
-| `file` | all but function-level languages | the whole file | Java/Rust: the calls of every method or function in the file; others: the import/type closure |
+| `file` | all but function-level languages | the whole file | Java/Rust/Python: the calls of every method or function in the file; others: the import/type closure |
 | `symbol` | all parsed languages (Vue stays whole-file) | one top-level declaration plus the file header | class/type: the calls of its methods; other symbols: the symbol closure |
-| `methods` | Java, Kotlin, Groovy, C#, Scala, Rust, TS/JS | class/type shell plus the listed methods; the rest as signature stubs | the seed method(s) and their calls |
+| `methods` | Python, Java, Kotlin, Groovy, C#, Scala, Rust, TS/JS | class/type shell plus the listed methods; the rest as signature stubs | the seed method(s) and their calls |
 
 Picker rows map 1:1 to scopes, and the CLI accepts the same targets:
 
@@ -266,11 +275,13 @@ row, so the whole file is always selectable explicitly.
 ### Member scopes: class shell + call path
 
 A method seed (`app.Service.used`, `filer bundle 'app/Service.java::Service.used'`, or
-`:FilerHere` inside a method) renders, in every language with classes or Rust `impl` blocks:
+`:FilerHere` inside a method) renders, in every class-based language (Python, Java, Kotlin,
+Scala, Groovy, C#, Rust `impl` blocks, TS/JS):
 
 - the seeded class as a **shell** — package, imports, fields, constructors, annotations —
   with only the methods on the call path in full,
-- every other method of that class as a signature stub: `int unused();   // body omitted`,
+- every other method of that class as a signature stub: `int unused();   // body omitted`
+  (`def unused(self) -> int: ...  # body omitted` in Python, so the stub stays valid Python),
 - the classes it calls at depth 1+ the same way.
 
 It does **not** force the whole file. The `[file]` row / a plain path does that.
@@ -303,6 +314,10 @@ Calls are resolved through:
 - `local.helper()`, `param.helper()`, `field.helper()` — using the declared type of the receiver
 - `Type.helper()` — static calls (including Rust `Self::helper()` and `Type::helper()`)
 - `new Type().helper()`
+- Python `obj.helper()` — parameter, local (annotated or `= Type()`) and `self.field`
+  receivers; `self.helper()` / `cls.helper()`; bare calls through imports
+  (`from utils import helper`) and unique repo-wide functions; builtins (`print`, `len`, ...)
+  stay quiet instead of being reported as unresolved
 - Rust bare `helper()` / `crate::module::helper()` — unique free functions in the repo
 - Scala nullary calls (`repo.size`, no parentheses) count as calls
 - Kotlin/C#/TS property access (`repo.Size`) is not treated as a method call, so getters are
@@ -315,8 +330,8 @@ type `Repo` that is never called) are not bundled; the import line and the field
 still give the reader the name. Nested classes are rendered inside their enclosing class.
 
 `--depth` counts method hops for method scopes, and unit hops for file/class seeds. A
-`[file]` or `[class]` seed uses the **same call graph** for Java, Kotlin, Groovy, C#, Scala,
-Rust, TS/JS — not the import/type closure:
+`[file]` or `[class]` seed uses the **same call graph** for Python, Java, Kotlin, Groovy, C#,
+Scala, Rust, TS/JS — not the import/type closure:
 you get the files that are actually called, nothing else. `--with-same-package` is a
 whole-class expansion and is not applied to that minimal path. A Java file without parsed
 symbols (and every other language) keeps the import/type closure.
@@ -332,6 +347,11 @@ symbols (and every other language) keeps the import/type closure.
 - Rust: methods from every `impl Type` block attach to the type; `self`, `self.field`,
   parameter and local types resolve receivers; `Self::`/`Type::` resolve associated calls;
   free functions resolve by unique name across the crate.
+- Python: class body annotations (`repo: Repo`) and `self.repo = repo` (the parameter's
+  annotation) type fields, so `self.repo.load(user)` follows the call. `Repo()` is a type
+  use, decorators stay inside the declaration's span, and `.pyi` stubs parse without bodies.
+  Module aliases (`import app.repo` then `app.repo.Repo`) are not tracked; the file is still
+  in the bundle through the import, and the call edge is reported as an unknown receiver.
 - Vue is never sliced: its script offsets are relative to the extracted `<script>` block, so
   it is always bundled whole.
 
@@ -983,13 +1003,14 @@ run. `filer index --update` never resolves, bundles or touches the bundle state.
    classes/interfaces/enums/records/annotations; Scala adds objects, traits and top-level
    type aliases; Kotlin adds objects and type aliases; Groovy adds traits; C# adds structs,
    records and delegates; Rust adds structs, enums, unions, traits, type aliases and free
-   functions, with `impl` methods attached to their type; TS/JS add interfaces, type aliases
-   and enums. Sequential and braced package/namespace clauses compose; `package object foo`
-   counts as package `a.foo`; C# file-scoped namespaces apply to the rest of the file.
+   functions, with `impl` methods attached to their type; Python adds classes with their
+   methods and module-level functions; TS/JS add interfaces, type aliases and enums.
+   Sequential and braced package/namespace clauses compose; `package object foo` counts as
+   package `a.foo`; C# file-scoped namespaces apply to the rest of the file.
 3. Build `fqn -> files`, `package -> files`, simple-name and `symbol -> (file, index)` maps.
    A name can exist in several languages, so lookups are filtered by language family:
    JVM-ish (Java, Scala, Kotlin, Groovy, C#) only resolve against each other, TS/JS/Vue only
-   against each other, and Rust only against Rust.
+   against each other, Rust only against Rust, and Python only against Python.
 4. For a package-style import, try the full name, then trim trailing segments one at a time
    (`a.b.C.member` → `a.b.C`), which also covers nested types like `a.b.C.Inner` and Scala
    selectors / `given` imports. Wildcards expand to the package, or to the object/type they
@@ -1003,14 +1024,19 @@ run. `filer index --update` never resolves, bundles or touches the bundle state.
    (`paths` aliases, then `baseUrl`; see
    [TypeScript config aliases](#typescript-config-aliases)); whatever the config does not map
    (`react`) is treated as third-party.
+   For a Python import, split the leading dots (relative depth), then probe
+   `<base>/<module>.py`, its `.pyi` stub and `<base>/<module>/__init__.py`. A `from a.b
+   import C` looks for the file that declares `C` in `a.b` (following `__init__.py`
+   re-exports), then for the `a/b/C.py` submodule. Unresolved module paths are stdlib,
+   site-packages or another third party.
    For a Rust import, expand the `use` tree, then resolve the longest module prefix against
    the Cargo layout: `crate::` starts at the nearest `src` directory, `self::` at the current
    module directory, `super::` one level up, and `mod foo;` uses the same relative lookup.
    Each module is `foo.rs` or `foo/mod.rs`; `lib.rs`/`main.rs`/`mod.rs` are the module root.
    Unresolved prefixed paths (`std::...`, third-party crates) stay external.
 6. For every type name used in the file (Java/Scala type positions, Kotlin user types,
-   Groovy/C# type positions, Rust type positions and `Type::method` paths, object receivers
-   like `DemoDocument.create`) look the name up in
+   Groovy/C# type positions, Rust type positions and `Type::method` paths, Python type
+   annotations, object receivers like `DemoDocument.create`) look the name up in
    the index. Names that are explicitly imported are left to step 4; a same-package match
    wins; otherwise the name is only used when it is unique in the repo. Ambiguous names are
    dropped rather than guessed.
@@ -1033,7 +1059,7 @@ run. `filer index --update` never resolves, bundles or touches the bundle state.
 an `ImportKind`, `uses`, `symbols` with byte spans, `preamble_end`), the `Language` →
 extension map, and the `Language::family` grouping that keeps resolution between compatible
 languages only. Each per-language module (`java`, `scala`, `kotlin`, `groovy`, `csharp`,
-`rust`, `web`) only translates its grammar into that struct.
+`rust`, `python`, `web`) only translates its grammar into that struct.
 
 To add another package+import language:
 
@@ -1042,8 +1068,11 @@ To add another package+import language:
 3. Pick the markdown fence string.
 
 Indexing, closure, state and rendering need no changes. A language with a different import
-model (TS/JS module paths, Rust's `crate`/`self`/`super` paths) needs its own resolver branch
-in `src/resolve.rs` — that is where `ImportKind::Module` and `Family::Rust` are handled.
+model (TS/JS module paths, Rust's `crate`/`self`/`super` paths, Python's dotted modules and
+relative dots) needs its own resolver branch in `src/resolve.rs` — that is where
+`ImportKind::Module`, `Family::Rust` and `Family::Python` are handled. A parser that derives
+something from the file itself (Python's package is its directory) gets the file's relative
+path as `SourceParser::parse`'s last argument.
 
 Populating `symbols` is optional: use `symbol_from_node` for a tree-sitter declaration (it
 extends the span over the doc comment and records the line) and `finish_symbols` to assign
