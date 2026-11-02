@@ -4,6 +4,9 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ES2022", "DOM"],
+    // typescript 7 no longer pulls `@types/*` in implicitly; the tests import
+    // `bun:test`, so the ambient bun types have to be listed.
+    "types": ["bun"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
