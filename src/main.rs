@@ -13,6 +13,7 @@ mod lang;
 mod resolve;
 mod rust;
 mod scala;
+mod schema;
 mod state;
 mod web;
 
@@ -26,6 +27,7 @@ use error::{FilerError, EXIT_EMPTY, EXIT_INTERNAL};
 use index::{FileEntry, Index};
 use lang::{Granularity, Language, MemberKind, SymbolKind};
 use resolve::{closure_units, drop_covered_symbols, Reason, ResolveOptions, Unit};
+use schema::SCHEMA_VERSION;
 use state::{BranchBundle, Selection, StateDoc, StateFile};
 
 #[derive(Parser)]
@@ -272,7 +274,7 @@ fn run(context: &Context, root: Option<PathBuf>, command: Command) -> Result<boo
         Command::Refs(args) => refs_cmd(&root, args, context),
         Command::Show(args) => show_cmd(&root, args, context).map(|()| false),
         Command::Index => {
-            index_cmd(&root);
+            index_cmd(&root, context);
             Ok(false)
         }
         Command::State(args) => state_cmd(&root, args).map(|()| false),
@@ -448,7 +450,11 @@ fn search(root: &Path, args: SearchArgs, context: &Context) -> Result<bool, File
         // result. It carries no `path`, so the picker ignores it either way.
         println!(
             "{}",
-            serde_json::json!({ "hint": EMPTY_SEARCH_HINT, "results": 0 })
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "hint": EMPTY_SEARCH_HINT,
+                "results": 0,
+            })
         );
     }
 
@@ -551,12 +557,20 @@ fn print_row(
     kind: &str,
     label: &str,
     target: &str,
-    value: serde_json::Value,
+    mut value: serde_json::Value,
 ) {
     if plain {
         let marker = if included { "*" } else { " " };
         println!("{marker}\t[{kind}] {label}\t{target}");
     } else {
+        // Every search row carries the wire version, so JSON-lines readers do
+        // not need a separate header row (the Neovim picker ignores extra keys).
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "schema_version".to_string(),
+                serde_json::json!(SCHEMA_VERSION),
+            );
+        }
         println!("{value}");
     }
 }
@@ -889,7 +903,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         appendix,
         ..Default::default()
     };
-    let markdown = bundle::render(&index, &files, &bundle_options);
+    let rendered = bundle::describe(&index, &files, &bundle_options);
 
     if let (Some(path), Some(bundle)) = (&state_path, branch_bundle) {
         let mut doc = doc.unwrap_or_else(|| StateDoc::new(&root));
@@ -899,9 +913,19 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         }
     }
 
+    let output = if context.json {
+        let mut value = rendered.to_json();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("branch".to_string(), serde_json::json!(branch));
+        }
+        value.to_string()
+    } else {
+        rendered.markdown
+    };
+
     match args.out {
         Some(path) => {
-            if let Err(error) = std::fs::write(&path, &markdown) {
+            if let Err(error) = std::fs::write(&path, &output) {
                 return Err(FilerError::internal(format!(
                     "cannot write {}: {error}",
                     path.display()
@@ -915,7 +939,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
             ));
         }
         None => {
-            print!("{markdown}");
+            print!("{output}");
             context.summary(format!("{} units, {} new on this run", files.len(), fresh));
         }
     }
@@ -1031,7 +1055,13 @@ fn deps(root: &Path, args: DepsArgs, context: &Context) -> Result<(), FilerError
                 })
             })
             .collect();
-        println!("{}", serde_json::json!(value));
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "deps": value,
+            })
+        );
         return Ok(());
     }
 
@@ -1555,11 +1585,21 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
         appendix: Some(appendix),
         ..Default::default()
     };
-    let markdown = bundle::render(&index, &files, &bundle_options);
+    let rendered = bundle::describe(&index, &files, &bundle_options);
+
+    let output = if context.json {
+        let mut value = rendered.to_json();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("branch".to_string(), serde_json::json!(branch));
+        }
+        value.to_string()
+    } else {
+        rendered.markdown
+    };
 
     match args.out {
         Some(out) => {
-            if let Err(error) = std::fs::write(&out, &markdown) {
+            if let Err(error) = std::fs::write(&out, &output) {
                 return Err(FilerError::internal(format!(
                     "cannot write {}: {error}",
                     out.display()
@@ -1574,7 +1614,7 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
             ));
         }
         None => {
-            print!("{markdown}");
+            print!("{output}");
             context.summary(format!(
                 "{} units for branch {} from {}",
                 files.len(),
@@ -1587,8 +1627,70 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
     Ok(())
 }
 
-fn index_cmd(root: &Path) {
+fn index_cmd(root: &Path, context: &Context) {
     let index = Index::build(root);
+    let path = state::default_path(&index.root);
+    let branch = state::current_branch(&index.root);
+    let doc = state::load(&path);
+
+    if context.json {
+        let languages: Vec<serde_json::Value> = lang::Language::ALL
+            .iter()
+            .filter_map(|language| {
+                let files = index
+                    .files
+                    .iter()
+                    .filter(|file| file.language() == Some(*language))
+                    .count();
+                (files > 0).then(|| {
+                    serde_json::json!({
+                        "language": language.label(),
+                        "files": files,
+                    })
+                })
+            })
+            .collect();
+        let state = doc.map(|doc| {
+            let current = doc.bundle(&branch).map(|bundle| bundle.files.len());
+            let other_branches: Vec<serde_json::Value> = doc
+                .bundles
+                .iter()
+                .filter(|bundle| bundle.name != branch)
+                .map(|bundle| {
+                    serde_json::json!({
+                        "branch": bundle.name,
+                        "label": state::branch_label(&bundle.name),
+                        "entries": bundle.files.len(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "branch": branch,
+                "label": state::branch_label(&branch),
+                "entries": current,
+                "other_branches": other_branches,
+            })
+        });
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "root": index.root.to_string_lossy(),
+                "source_files": index.files.len(),
+                "languages": languages,
+                "packages": index.by_package.len(),
+                "types": index.by_fqn.len(),
+                "symbols": index.by_symbol.len(),
+                "cache": {
+                    "reused": index.reused_count,
+                    "parsed": index.parsed_count,
+                },
+                "state": state,
+            })
+        );
+        return;
+    }
+
     println!("root:       {}", index.root.display());
     println!("source files: {}", index.files.len());
     for language in lang::Language::ALL {
@@ -1609,9 +1711,7 @@ fn index_cmd(root: &Path) {
         index.reused_count, index.parsed_count
     );
 
-    let path = state::default_path(&index.root);
-    let branch = state::current_branch(&index.root);
-    match state::load(&path) {
+    match doc {
         Some(doc) => {
             let current = doc.bundle(&branch).map_or(0, |bundle| bundle.files.len());
             println!(

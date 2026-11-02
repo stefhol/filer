@@ -5,8 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::index::Index;
-use crate::lang::{Language, MemberKind};
+use crate::lang::{Language, MemberKind, Symbol};
 use crate::resolve::Reason;
+use crate::schema::SCHEMA_VERSION;
 use crate::state::Selection;
 
 pub struct BundleOptions {
@@ -112,6 +113,159 @@ impl BundleFile {
     }
 }
 
+/// Byte and line span of one rendered unit.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    end_line: usize,
+}
+
+/// The result of rendering one unit: the markdown section and, when the unit
+/// could be read, its span. `note` is the machine-readable reason an entry was
+/// left out (it is also written into the markdown as prose).
+struct UnitRender {
+    markdown: String,
+    rendered: bool,
+    note: Option<&'static str>,
+    span: Option<Span>,
+}
+
+impl UnitRender {
+    fn rendered(markdown: String, span: Span) -> Self {
+        Self {
+            markdown,
+            rendered: true,
+            note: None,
+            span: Some(span),
+        }
+    }
+
+    fn omitted(markdown: String, note: &'static str) -> Self {
+        Self {
+            markdown,
+            rendered: false,
+            note: Some(note),
+            span: None,
+        }
+    }
+}
+
+/// One unit in the JSON surface. The first twelve fields are the wire contract
+/// (`path` .. `rendered`); `label` and `markdown` carry the exact strings the
+/// markdown renderer emits so consumers can rebuild it.
+pub struct BundleEntry {
+    pub path: String,
+    pub scope: Selection,
+    pub symbol: Option<String>,
+    pub methods: Vec<String>,
+    pub depth: u32,
+    pub reason: Reason,
+    pub start_line: Option<usize>,
+    pub end_line: Option<usize>,
+    pub start_byte: Option<usize>,
+    pub end_byte: Option<usize>,
+    pub tokens: usize,
+    pub rendered: bool,
+    /// The `## Files` line for this unit, without the leading `- `.
+    pub label: String,
+    /// The exact `## Contents` section for this unit.
+    pub markdown: String,
+    /// Why the unit was not rendered (`too_large`, `unreadable`, ...).
+    pub note: Option<&'static str>,
+}
+
+/// The bundle as data. `markdown` and [`RenderedBundle::to_json`] are both
+/// derived from `entries`, so the two surfaces cannot describe different units.
+pub struct RenderedBundle {
+    pub title: String,
+    pub root: String,
+    pub depth: u32,
+    pub max_file_bytes: u64,
+    pub files: usize,
+    pub excerpts: usize,
+    pub methods: usize,
+    pub appendix: Option<String>,
+    pub entries: Vec<BundleEntry>,
+    pub markdown: String,
+}
+
+impl RenderedBundle {
+    /// The versioned JSON envelope. `entries` always names the same units as
+    /// the markdown; `omitted` is the subset that was not rendered, and
+    /// `diagnostics` is reserved for issue #10.
+    pub fn to_json(&self) -> serde_json::Value {
+        let entries: Vec<serde_json::Value> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "path": entry.path,
+                    "scope": entry.scope.as_str(),
+                    "symbol": entry.symbol,
+                    "methods": entry.methods,
+                    "depth": entry.depth,
+                    "reason": entry.reason.as_str(),
+                    "start_line": entry.start_line,
+                    "end_line": entry.end_line,
+                    "start_byte": entry.start_byte,
+                    "end_byte": entry.end_byte,
+                    "tokens": entry.tokens,
+                    "rendered": entry.rendered,
+                    "label": entry.label,
+                    "markdown": entry.markdown,
+                })
+            })
+            .collect();
+        let omitted: Vec<serde_json::Value> = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.rendered)
+            .map(|entry| {
+                serde_json::json!({
+                    "path": entry.path,
+                    "scope": entry.scope.as_str(),
+                    "symbol": entry.symbol,
+                    "reason": entry.note.unwrap_or("unrendered"),
+                })
+            })
+            .collect();
+        let used_bytes: usize = self
+            .entries
+            .iter()
+            .filter_map(|entry| match (entry.start_byte, entry.end_byte) {
+                (Some(start), Some(end)) => Some(end.saturating_sub(start)),
+                _ => None,
+            })
+            .sum();
+        let used_tokens: usize = self.entries.iter().map(|entry| entry.tokens).sum();
+        let truncated = self
+            .entries
+            .iter()
+            .any(|entry| entry.note == Some("too_large"));
+        serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "root": self.root,
+            "title": self.title,
+            "depth": self.depth,
+            "files": self.files,
+            "excerpts": self.excerpts,
+            "methods": self.methods,
+            "budget": {
+                "max_file_bytes": self.max_file_bytes,
+                "used_bytes": used_bytes,
+                "used_tokens": used_tokens,
+                "truncated": truncated,
+            },
+            "entries": entries,
+            "omitted": omitted,
+            "diagnostics": [],
+            "state_toml": self.appendix,
+        })
+    }
+}
+
 enum Content<'a> {
     Single(&'a BundleFile),
     Class {
@@ -214,37 +368,43 @@ fn group<'a>(files: &'a [BundleFile]) -> Vec<Content<'a>> {
     contents
 }
 
-pub fn render(index: &Index, files: &[BundleFile], options: &BundleOptions) -> String {
+/// Renders the bundle and keeps both surfaces: the markdown text and the units
+/// it was built from. The JSON envelope is serialized from the same entries.
+pub fn describe(index: &Index, files: &[BundleFile], options: &BundleOptions) -> RenderedBundle {
     let name = index
         .root
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "project".to_string());
 
-    let mut out = String::new();
-    let title = options.title.clone().unwrap_or_else(|| name.clone());
-    out.push_str(&format!("# Code bundle: {title}\n\n"));
-    out.push_str(&format!("- root: `{}`\n", index.root.to_string_lossy()));
+    let mut markdown = String::new();
+    let title = options.title.clone().unwrap_or(name);
+    let root = index.root.to_string_lossy().to_string();
     let contents = group(files);
     let distinct: HashSet<&str> = contents
         .iter()
         .map(|content| content.entry().rel.as_str())
         .collect();
-    out.push_str(&format!("- files: {}\n", distinct.len()));
+    let file_count = distinct.len();
     let excerpts = contents
         .iter()
         .filter(|content| content.entry().scope != Selection::File)
         .count();
-    if excerpts > 0 {
-        out.push_str(&format!("- excerpts: {excerpts}\n"));
-    }
     let methods_kept: usize = contents.iter().map(Content::methods_kept).sum();
-    if methods_kept > 0 {
-        out.push_str(&format!("- methods: {methods_kept}\n"));
-    }
-    out.push_str(&format!("- import depth: {}\n\n", options.depth));
 
-    out.push_str("## Files\n\n");
+    markdown.push_str(&format!("# Code bundle: {title}\n\n"));
+    markdown.push_str(&format!("- root: `{root}`\n"));
+    markdown.push_str(&format!("- files: {file_count}\n"));
+    if excerpts > 0 {
+        markdown.push_str(&format!("- excerpts: {excerpts}\n"));
+    }
+    if methods_kept > 0 {
+        markdown.push_str(&format!("- methods: {methods_kept}\n"));
+    }
+    markdown.push_str(&format!("- import depth: {}\n\n", options.depth));
+
+    markdown.push_str("## Files\n\n");
+    let mut labels = Vec::with_capacity(contents.len());
     for content in &contents {
         let file = content.entry();
         let detail = match (file.depth, file.reason) {
@@ -252,36 +412,87 @@ pub fn render(index: &Index, files: &[BundleFile], options: &BundleOptions) -> S
             (0, reason) => format!(" ({})", reason.as_str()),
             (depth, reason) => format!(" (depth {depth}, {})", reason.as_str()),
         };
-        out.push_str(&format!("- {}{detail}\n", content.label()));
+        let label = format!("{}{detail}", content.label());
+        markdown.push_str(&format!("- {label}\n"));
+        labels.push(label);
     }
-    out.push_str("\n## Contents\n");
+    markdown.push_str("\n## Contents\n");
 
-    for content in &contents {
-        match content {
-            Content::Single(file) => render_unit(&mut out, index, file, options),
+    let mut entries = Vec::with_capacity(contents.len());
+    for (content, label) in contents.iter().zip(labels) {
+        let unit = match content {
+            Content::Single(file) => render_unit(index, file, options),
             Content::Class { entry, members } => {
-                render_member_group(&mut out, index, entry, members, options);
+                render_member_group(index, entry, members, options)
             }
-        }
+        };
+        let file = content.entry();
+        let methods = match content {
+            Content::Class { members, .. } => {
+                members.iter().map(|member| member.to_string()).collect()
+            }
+            Content::Single(_) => file.methods.iter().cloned().collect(),
+        };
+        let span = unit.span;
+        let (start_line, end_line, start_byte, end_byte) = match span {
+            Some(span) => (
+                Some(span.start_line),
+                Some(span.end_line),
+                Some(span.start_byte),
+                Some(span.end_byte),
+            ),
+            None => (None, None, None, None),
+        };
+        let tokens = span
+            .map(|span| span.end_byte.saturating_sub(span.start_byte) / 4)
+            .unwrap_or(0);
+        markdown.push_str(&unit.markdown);
+        entries.push(BundleEntry {
+            path: file.rel.clone(),
+            scope: file.scope,
+            symbol: file.symbol.clone(),
+            methods,
+            depth: file.depth,
+            reason: file.reason,
+            start_line,
+            end_line,
+            start_byte,
+            end_byte,
+            tokens,
+            rendered: unit.rendered,
+            label,
+            markdown: unit.markdown,
+            note: unit.note,
+        });
     }
 
     if let Some(appendix) = &options.appendix {
-        out.push_str("\n## Bundle state\n\n");
-        out.push_str("```toml\n");
-        out.push_str(appendix.trim_end());
-        out.push_str("\n```\n");
+        markdown.push_str("\n## Bundle state\n\n");
+        markdown.push_str("```toml\n");
+        markdown.push_str(appendix.trim_end());
+        markdown.push_str("\n```\n");
     }
 
-    out
+    RenderedBundle {
+        title,
+        root,
+        depth: options.depth,
+        max_file_bytes: options.max_file_bytes,
+        files: file_count,
+        excerpts,
+        methods: methods_kept,
+        appendix: options.appendix.clone(),
+        entries,
+        markdown,
+    }
 }
 
-fn render_unit(out: &mut String, index: &Index, file: &BundleFile, options: &BundleOptions) {
+fn render_unit(index: &Index, file: &BundleFile, options: &BundleOptions) -> UnitRender {
     let language = language_for(&file.rel);
     let bytes = match read_bytes(file, options) {
         Ok(bytes) => bytes,
-        Err(note) => {
-            out.push_str(&format!("\n### {}\n\n{note}\n", file.label()));
-            return;
+        Err((note, code)) => {
+            return UnitRender::omitted(format!("\n### {}\n\n{note}\n", file.label()), code);
         }
     };
 
@@ -290,36 +501,50 @@ fn render_unit(out: &mut String, index: &Index, file: &BundleFile, options: &Bun
         .as_ref()
         .filter(|_| file.scope != Selection::File)
     else {
-        out.push_str(&format!("\n### {}\n\n", file.label()));
-        out.push_str(&render_text(&String::from_utf8_lossy(&bytes), language));
-        return;
+        let markdown = format!(
+            "\n### {}\n\n{}",
+            file.label(),
+            render_text(&String::from_utf8_lossy(&bytes), language)
+        );
+        let span = Span {
+            start_byte: 0,
+            end_byte: bytes.len(),
+            start_line: 1,
+            end_line: end_line_number(&bytes, bytes.len()),
+        };
+        return UnitRender::rendered(markdown, span);
     };
 
-    let Some(span) = symbol_span(index, file, symbol) else {
+    let Some(symbol_entry) = symbol_span(index, file, symbol) else {
         // The symbol moved or disappeared since the state was written.
-        out.push_str(&format!(
-            "\n### {}\n\n_(omitted: `{symbol}` is no longer part of the file)_\n",
-            file.label()
-        ));
-        return;
+        return UnitRender::omitted(
+            format!(
+                "\n### {}\n\n_(omitted: `{symbol}` is no longer part of the file)_\n",
+                file.label()
+            ),
+            "symbol_missing",
+        );
     };
 
-    if span.0 > span.1 || span.1 > bytes.len() {
-        out.push_str(&format!(
-            "\n### {}\n\n_(omitted: `{symbol}` moved while reading the file)_\n",
-            file.label()
-        ));
-        return;
+    let (start, end) = (symbol_entry.start, symbol_entry.end);
+    if start > end || end > bytes.len() {
+        return UnitRender::omitted(
+            format!(
+                "\n### {}\n\n_(omitted: `{symbol}` moved while reading the file)_\n",
+                file.label()
+            ),
+            "stale_span",
+        );
     }
-    let line = line_number(&bytes, span.0);
-    out.push_str(&format!("\n### {} (line {line})\n\n", file.label()));
+    let line = line_number(&bytes, start);
+    let mut markdown = format!("\n### {} (line {line})\n\n", file.label());
 
     let preamble_end = index
         .by_rel
         .get(&file.rel)
         .map(|&position| index.files[position].preamble_end)
         .unwrap_or(0)
-        .min(span.0);
+        .min(start);
     let mut text = String::new();
     let mut open_braces = 0;
     if preamble_end > 0 {
@@ -330,73 +555,89 @@ fn render_unit(out: &mut String, index: &Index, file: &BundleFile, options: &Bun
             text.push_str("\n\n");
         }
     }
-    text.push_str(&String::from_utf8_lossy(&bytes[span.0..span.1]));
+    text.push_str(&String::from_utf8_lossy(&bytes[start..end]));
     for _ in 0..open_braces {
         text.push_str("\n}");
     }
-    out.push_str(&render_text(&text, language));
+    markdown.push_str(&render_text(&text, language));
+
+    UnitRender::rendered(
+        markdown,
+        Span {
+            start_byte: start,
+            end_byte: end,
+            start_line: line,
+            end_line: symbol_entry.end_line.max(line),
+        },
+    )
 }
 
-fn read_bytes(file: &BundleFile, options: &BundleOptions) -> Result<Vec<u8>, String> {
-    let metadata = fs::metadata(&file.abs).map_err(|error| format!("_(unreadable: {error})_"))?;
+/// Reads the file unless it exceeds `max_file_bytes`. The second value is the
+/// machine-readable omission code used by the JSON surface.
+fn read_bytes(
+    file: &BundleFile,
+    options: &BundleOptions,
+) -> Result<Vec<u8>, (String, &'static str)> {
+    let metadata = fs::metadata(&file.abs)
+        .map_err(|error| (format!("_(unreadable: {error})_"), "unreadable"))?;
     if metadata.len() > options.max_file_bytes {
-        return Err(format!(
-            "_(omitted: {} bytes, larger than the {} byte limit)_",
-            metadata.len(),
-            options.max_file_bytes
+        return Err((
+            format!(
+                "_(omitted: {} bytes, larger than the {} byte limit)_",
+                metadata.len(),
+                options.max_file_bytes
+            ),
+            "too_large",
         ));
     }
-    fs::read(&file.abs).map_err(|error| format!("_(unreadable: {error})_"))
+    fs::read(&file.abs).map_err(|error| (format!("_(unreadable: {error})_"), "unreadable"))
 }
 
 /// Renders a class shell with only `members` kept; every other method body is
 /// replaced by its signature plus `// body omitted`.
 fn render_member_group(
-    out: &mut String,
     index: &Index,
     entry: &BundleFile,
     members: &BTreeSet<&str>,
     options: &BundleOptions,
-) {
+) -> UnitRender {
     let Some(class_name) = &entry.symbol else {
-        render_unit(out, index, entry, options);
-        return;
+        return render_unit(index, entry, options);
     };
     let language = language_for(&entry.rel);
     let bytes = match read_bytes(entry, options) {
         Ok(bytes) => bytes,
-        Err(note) => {
-            out.push_str(&format!("\n### {}\n\n{note}\n", entry.label()));
-            return;
+        Err((note, code)) => {
+            return UnitRender::omitted(format!("\n### {}\n\n{note}\n", entry.label()), code);
         }
     };
     let Some(position) = index.by_rel.get(&entry.rel).copied() else {
-        out.push_str(&format!(
-            "\n### {}\n\n_(omitted: not indexed)_\n",
-            entry.label()
-        ));
-        return;
+        return UnitRender::omitted(
+            format!("\n### {}\n\n_(omitted: not indexed)_\n", entry.label()),
+            "not_indexed",
+        );
     };
     let Some(class) = index.files[position].symbol(class_name) else {
-        out.push_str(&format!(
-            "\n### {}\n\n_(omitted: `{class_name}` is no longer part of the file)_\n",
-            entry.label()
-        ));
-        return;
+        return UnitRender::omitted(
+            format!(
+                "\n### {}\n\n_(omitted: `{class_name}` is no longer part of the file)_\n",
+                entry.label()
+            ),
+            "symbol_missing",
+        );
     };
     if class.start > class.end || class.end > bytes.len() {
-        out.push_str(&format!(
-            "\n### {}\n\n_(omitted: `{class_name}` moved while reading the file)_\n",
-            entry.label()
-        ));
-        return;
+        return UnitRender::omitted(
+            format!(
+                "\n### {}\n\n_(omitted: `{class_name}` moved while reading the file)_\n",
+                entry.label()
+            ),
+            "stale_span",
+        );
     }
 
     let line = line_number(&bytes, class.start);
-    out.push_str(&format!(
-        "\n### `{}` :: `{class_name}` (line {line})\n\n",
-        entry.rel
-    ));
+    let mut markdown = format!("\n### `{}` :: `{class_name}` (line {line})\n\n", entry.rel);
 
     let mut text = String::from_utf8_lossy(&bytes[class.start..class.end]).to_string();
     let mut splices: Vec<(usize, usize, String)> = class
@@ -438,7 +679,17 @@ fn render_member_group(
     for _ in 0..open_braces {
         text.push_str("\n}");
     }
-    out.push_str(&render_text(&format!("{prefix}{text}"), language));
+    markdown.push_str(&render_text(&format!("{prefix}{text}"), language));
+
+    UnitRender::rendered(
+        markdown,
+        Span {
+            start_byte: class.start,
+            end_byte: class.end,
+            start_line: line,
+            end_line: class.end_line.max(line),
+        },
+    )
 }
 
 fn render_text(content: &str, language: &str) -> String {
@@ -447,13 +698,12 @@ fn render_text(content: &str, language: &str) -> String {
     format!("{fence}{language}\n{content}\n{fence}\n")
 }
 
-/// Byte span of `symbol` in the indexed file, if it still exists.
-fn symbol_span(index: &Index, file: &BundleFile, symbol: &str) -> Option<(usize, usize)> {
+/// The indexed symbol with this name, if it still exists. Its `start`/`end`
+/// and `line`/`end_line` are the span the JSON surface reports.
+fn symbol_span<'a>(index: &'a Index, file: &BundleFile, symbol: &str) -> Option<&'a Symbol> {
     let position = *index.by_rel.get(&file.rel)?;
     let entry = index.files.get(position)?;
-    entry
-        .symbol(symbol)
-        .map(|symbol| (symbol.start, symbol.end))
+    entry.symbol(symbol)
 }
 
 /// The file header (license, package, imports) that goes in front of an
@@ -517,6 +767,12 @@ fn line_number(bytes: &[u8], offset: usize) -> usize {
         + 1
 }
 
+/// 1-based line of the last byte in `0..end`; a trailing newline does not add
+/// an extra line to a whole-file entry.
+fn end_line_number(bytes: &[u8], end: usize) -> usize {
+    line_number(bytes, end.saturating_sub(1))
+}
+
 /// Uses a longer fence when the file itself contains triple backticks.
 fn fence_for(content: &str) -> String {
     let mut longest = 0;
@@ -575,6 +831,99 @@ mod tests {
         );
     }
 
+    /// Rebuilds the markdown from the JSON envelope the way a consumer would:
+    /// header from top-level fields, one `## Files` line and one `## Contents`
+    /// section per `entries` item.
+    fn markdown_from_json(value: &serde_json::Value) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "# Code bundle: {}\n\n",
+            value["title"].as_str().expect("title")
+        ));
+        out.push_str(&format!(
+            "- root: `{}`\n",
+            value["root"].as_str().expect("root")
+        ));
+        out.push_str(&format!("- files: {}\n", value["files"]));
+        let excerpts = value["excerpts"].as_u64().expect("excerpts");
+        if excerpts > 0 {
+            out.push_str(&format!("- excerpts: {excerpts}\n"));
+        }
+        let methods = value["methods"].as_u64().expect("methods");
+        if methods > 0 {
+            out.push_str(&format!("- methods: {methods}\n"));
+        }
+        out.push_str(&format!("- import depth: {}\n\n", value["depth"]));
+        out.push_str("## Files\n\n");
+        let entries = value["entries"].as_array().expect("entries");
+        for entry in entries {
+            out.push_str(&format!("- {}\n", entry["label"].as_str().expect("label")));
+        }
+        out.push_str("\n## Contents\n");
+        for entry in entries {
+            out.push_str(entry["markdown"].as_str().expect("markdown"));
+        }
+        if let Some(appendix) = value["state_toml"].as_str() {
+            out.push_str("\n## Bundle state\n\n```toml\n");
+            out.push_str(appendix.trim_end());
+            out.push_str("\n```\n");
+        }
+        out
+    }
+
+    #[test]
+    fn json_entries_reconstruct_the_markdown() {
+        let root = std::env::temp_dir().join(format!("filer-bundle-json-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Service.java"),
+            "package app;\n\npublic class Service {\n    private Repo repo;\n\n    int used() { return repo.size(); }\n\n    int unused() { return 1; }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Repo.java"),
+            "package app;\n\npublic class Repo {\n    public int size() { return 0; }\n    public int other() { return 1; }\n}\n",
+        )
+        .unwrap();
+
+        let index = Index::build(&root);
+        let files = vec![
+            BundleFile::members(
+                "Service.java".to_string(),
+                root.join("Service.java"),
+                0,
+                Reason::Seed,
+                "Service".to_string(),
+                BTreeSet::from(["used".to_string()]),
+            ),
+            BundleFile::excerpt(
+                "Repo.java".to_string(),
+                root.join("Repo.java"),
+                1,
+                Reason::Call,
+                "Repo".to_string(),
+            ),
+        ];
+        let options = BundleOptions {
+            appendix: Some("version = 3\n".to_string()),
+            ..Default::default()
+        };
+        let described = describe(&index, &files, &options);
+        let json = described.to_json();
+
+        assert_eq!(json["schema_version"], serde_json::json!(SCHEMA_VERSION));
+        assert_eq!(
+            json["entries"].as_array().unwrap().len(),
+            described.entries.len()
+        );
+        assert_eq!(json["omitted"].as_array().unwrap().len(), 0);
+        // The JSON surface and the markdown describe the same units, and the
+        // markdown can be rebuilt from `entries` plus the envelope fields.
+        assert_eq!(markdown_from_json(&json), described.markdown);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn line_number_is_one_based() {
         let bytes = b"a\nb\nc";
@@ -619,7 +968,7 @@ mod tests {
                 BTreeSet::from(["size".to_string()]),
             ),
         ];
-        let markdown = render(&index, &files, &BundleOptions::default());
+        let markdown = describe(&index, &files, &BundleOptions::default()).markdown;
         assert!(
             markdown.contains("### `Service.java` :: `Service` (line 5)"),
             "{markdown}"
@@ -682,7 +1031,7 @@ mod tests {
                 BTreeSet::from(["used".to_string()]),
             ),
         ];
-        let markdown = render(&index, &files, &BundleOptions::default());
+        let markdown = describe(&index, &files, &BundleOptions::default()).markdown;
         // One file line, one content block, and the whole class text.
         assert_eq!(
             markdown.matches("- `Service.java`").count(),
