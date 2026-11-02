@@ -9,10 +9,20 @@ return {
     "stefhol/filer",
     name = "filer",
     -- Commands are defined by plugin/filer.lua, so lazy-loading on them is safe.
-    cmd = { "FilerSearch", "FilerHere", "FilerBundle", "FilerShow", "FilerReset", "FilerResetAll" },
+    cmd = {
+      "FilerSearch",
+      "FilerHere",
+      "FilerBundle",
+      "FilerDepth",
+      "FilerShow",
+      "FilerReset",
+      "FilerResetAll",
+    },
     keys = {
       { "<leader>fc", function() require("filer").search() end, desc = "filer: bundle for chat" },
       { "<leader>fh", function() require("filer").here() end, desc = "filer: bundle current file" },
+      { "<leader>fH", "<cmd>FilerHere!<cr>", desc = "filer: bundle current file (ask depth)" },
+      { "<leader>fd", "<cmd>FilerDepth<cr>", desc = "filer: show import depth" },
       {
         "<leader>fC",
         function()
@@ -26,7 +36,8 @@ return {
       bin = nil,
       -- Project root. nil = detect via .git / pom.xml / build.gradle(.kts) / build.sbt / tsconfig / package.json / *.csproj.
       root = nil,
-      -- Import hops to follow when bundling.
+      -- Import hops to follow when bundling. Change live with :FilerDepth [n],
+      -- or ask per call with :FilerHere! / :FilerBundle!.
       depth = 2,
       -- Also include files sharing a package with a bundled file.
       same_package = false,

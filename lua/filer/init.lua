@@ -6,7 +6,8 @@ M.config = {
   bin = nil,
   -- Project root. nil = detect from the current buffer (git/maven/gradle markers).
   root = nil,
-  -- Import hops to follow when bundling.
+  -- Import hops to follow when bundling. `:FilerDepth [n]` changes it for good,
+  -- `:FilerHere!` / `:FilerBundle!` ask for a one-off depth.
   depth = 2,
   -- Also include files sharing a package with a bundled file.
   same_package = false,
@@ -22,6 +23,9 @@ M.config = {
   -- State file path. nil = <root>/.filer/bundle.toml
   state_file = nil,
 }
+
+--- Depth passed to `setup`, so `:FilerDepth reset` has something to go back to.
+M._default_depth = M.config.depth
 
 local bin_cache = nil
 
@@ -106,8 +110,38 @@ end
 
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+  M._default_depth = M.config.depth
   bin_cache = nil
   return M
+end
+
+--- Import depth used by the next bundles.
+function M.depth()
+  return M.config.depth
+end
+
+--- Import depth `:FilerDepth reset` goes back to.
+function M.default_depth()
+  return M._default_depth
+end
+
+--- Changes the import depth for every following bundle. `nil` (or `"reset"`)
+--- restores the depth passed to `setup`. Returns the depth now in effect, or nil
+--- when `depth` was not a whole number >= 0.
+function M.set_depth(depth)
+  if depth == nil or depth == "reset" then
+    M.config.depth = M._default_depth
+    notify(("depth reset to %s"):format(tostring(M.config.depth)))
+    return M.config.depth
+  end
+  local number = tonumber(depth)
+  if not number or number < 0 or number % 1 ~= 0 then
+    notify(("depth must be a whole number >= 0, not %s"):format(vim.inspect(depth)), vim.log.levels.ERROR)
+    return nil
+  end
+  M.config.depth = math.floor(number)
+  notify(("depth set to %d"):format(M.config.depth))
+  return M.config.depth
 end
 
 --- Runs the binary and returns (stdout, stderr, code).
