@@ -410,6 +410,7 @@ on load.
 ```sh
 filer --root ~/code/demo search --query user           # JSON lines, one per symbol
 filer --root ~/code/demo search --query user --plain   # fqn<TAB>path[::symbol]
+filer --root ~/code/demo search --query 'discount rounding' --json  # empty -> hint
 filer --root ~/code/demo deps src/main/java/com/example/app/Application.java
 filer --root ~/code/demo bundle --depth 2 --with-config \
       src/main/java/com/example/app/Application.java > bundle.md
@@ -431,7 +432,7 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C
 
 `bundle` flags: `--depth N` (0 = only the given units), `--with-same-package`,
 `--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`, `--at-line N`.
-Default depth is 2. Add `::Symbol` for one declaration and `::Class.method` for a Java or
+Default depth is 2. Global flags: `--json`, `--quiet` (see below). Add `::Symbol` for one declaration and `::Class.method` for a Java or
 Rust method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
 `filer --root ~/code/demo bundle 'app/Service.java::Service.used'`,
 `filer --root ~/code/demo bundle 'src/app/service.rs::Service.used'`.
@@ -453,6 +454,43 @@ current branch's bundle (`--branch` overrides), re-reads the files from disk and
 again — useful after a restart, or to pipe a bundle into another tool. Files or excerpts
 that vanished since are dropped with a notice; asking for a branch that has no bundle lists
 the ones that do.
+
+### Machine-readable errors and exit codes
+
+`--json` (global) prints a fatal error as one envelope on stderr instead of prose:
+
+```json
+{"error":{"code":"symbol_not_found","message":"app/Service.java has no symbol Nope","hint":"pass a path alone to bundle the whole file"}}
+```
+
+Soft notices (dropped entries, skipped inputs, unresolved imports) become
+`{"warning":"..."}` lines on stderr, so an agent never has to parse English.
+
+Exit codes are stable:
+
+| Code | Meaning | Examples |
+| --- | --- | --- |
+| `0` | success | rows printed, bundle rendered |
+| `1` | internal | unreadable/unwritable file, usage error |
+| `2` | not found | `symbol_not_found`, `file_not_found`, `branch_not_found`, `state_not_found` |
+| `3` | not indexed | `not_indexed` (binary, skipped directory or unsupported language) |
+| `4` | empty result | no search hits, nothing to bundle, empty saved bundle |
+
+An empty `search` result exits `4`. With `--json` it also prints a hint line that names
+what the index does *not* look at:
+
+```sh
+$ filer --root ~/code/demo search --query 'discount rounding' --json
+{"hint":"symbol/path index only; use text search for file contents","results":0}
+```
+
+The picker scores FQN, relative path and symbol/member names only — never fields,
+parameters, locals, imports, comments or bodies. `.fe` calls and top-level declarations are
+matched by name too, but file contents are not searched.
+
+`--quiet` (global) suppresses the trailing `filer: N units, M new on this run` summary,
+the `dropping ...` notices and the `unresolved ...` list. Hard errors still print. A
+successful `bundle --quiet` writes nothing to stderr.
 
 ## How resolution works
 
