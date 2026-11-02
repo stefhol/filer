@@ -486,6 +486,7 @@ filer --root ~/code/demo bundle --depth 2 --with-config \
 filer --root ~/code/demo bundle 'src/main/java/app/Service.java::Service.usedEverywhere'
 filer --root ~/code/demo bundle --at-line 120 src/main/java/app/Service.java
 filer --root ~/code/demo index                         # cache stats
+filer --root ~/code/demo index --update app/Service.java  # refresh one file's cache entry
 filer --root ~/code/demo show                          # re-render this branch's bundle
 filer --root ~/code/demo show --branch main            # ... another branch's
 filer --root ~/code/demo show --out bundle.md           # ... into a file
@@ -787,6 +788,24 @@ Every command builds the same index, so the filter is global:
   literal input — and warns that the file is outside the index.
 - The cache follows: a path leaves the index as soon as it is ignored or excluded, while its
   parse memo survives if the file still exists, so un-ignoring it costs no re-parse.
+
+### Incremental index refresh
+
+Every command builds the index by walking the tree; the mtime+size cache makes that cheap,
+but an agent that just edited five files does not need to walk anything at all:
+
+```sh
+filer --root ~/code/demo index --update src/app/Service.java src/app/Repo.java
+git diff --name-only | filer --root ~/code/demo index --update -    # one path per line
+```
+
+`--update` re-parses only the named paths (or reuses their memo when nothing changed), drops
+the entries of named paths that are gone, and writes the cache atomically. Everything else in
+the cache is left alone, so the next full walk reuses the result. It prints
+`parsed/reused/removed/skipped` counts plus the cache size — as JSON with `--json`, e.g.
+`{"updated":{"parsed":1,"reused":0,"removed":0,"skipped":0},"entries":42}`. Paths outside the
+root, non-source files and unreadable files are skipped with a warning instead of failing the
+run. `filer index --update` never resolves, bundles or touches the bundle state.
 
 ## How resolution works
 

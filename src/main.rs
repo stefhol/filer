@@ -89,8 +89,8 @@ enum Command {
     Refs(RefsArgs),
     /// Re-render the saved bundle from the state file.
     Show(ShowArgs),
-    /// Build the index cache and print stats.
-    Index,
+    /// Build the index cache and print stats, or refresh named paths only.
+    Index(IndexArgs),
     /// Show or clear the saved bundle state.
     State(StateArgs),
 }
@@ -129,6 +129,15 @@ struct LocateArgs {
     /// 1-based line number.
     #[arg(long, value_name = "LINE")]
     at_line: usize,
+}
+
+#[derive(Args)]
+struct IndexArgs {
+    /// Re-parse only these paths and fold them into the cache, without walking
+    /// the tree. Repeatable; `-` reads one path per line from stdin, so
+    /// `git diff --name-only | filer index --update -` works.
+    #[arg(long, value_name = "PATH")]
+    update: Vec<String>,
 }
 
 #[derive(Args)]
@@ -346,8 +355,8 @@ fn run(context: &Context, root: Option<PathBuf>, command: Command) -> Result<boo
         Command::Why(args) => why_cmd(&root, args, context),
         Command::Refs(args) => refs_cmd(&root, args, context),
         Command::Show(args) => show_cmd(&root, args, context).map(|()| false),
-        Command::Index => {
-            index_cmd(&root, context);
+        Command::Index(args) => {
+            index_cmd(&root, args, context)?;
             Ok(false)
         }
         Command::State(args) => state_cmd(&root, args).map(|()| false),
@@ -2050,7 +2059,11 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
     Ok(())
 }
 
-fn index_cmd(root: &Path, context: &Context) {
+fn index_cmd(root: &Path, args: IndexArgs, context: &Context) -> Result<(), FilerError> {
+    if !args.update.is_empty() {
+        return update_cmd(root, &args.update, context);
+    }
+
     let index = Index::build_with(root, &context.filter);
     let path = state::default_path(&index.root);
     let branch = state::current_branch(&index.root);
@@ -2111,7 +2124,7 @@ fn index_cmd(root: &Path, context: &Context) {
                 "state": state,
             })
         );
-        return;
+        return Ok(());
     }
 
     println!("root:       {}", index.root.display());
@@ -2160,6 +2173,61 @@ fn index_cmd(root: &Path, context: &Context) {
         }
         None => println!("bundle:     none at {}", path.display()),
     }
+    Ok(())
+}
+
+/// `filer index --update`: fold the named paths into the cache without a walk.
+fn update_cmd(root: &Path, inputs: &[String], context: &Context) -> Result<(), FilerError> {
+    // `-` reads one path per line from stdin, like `--seeds-from`.
+    let mut paths: Vec<String> = Vec::new();
+    for input in inputs {
+        if input == "-" {
+            let text = std::io::read_to_string(std::io::stdin()).map_err(|error| {
+                FilerError::internal(format!("cannot read paths from stdin: {error}"))
+            })?;
+            paths.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(str::to_string),
+            );
+        } else {
+            paths.push(input.clone());
+        }
+    }
+    if paths.is_empty() {
+        return Err(FilerError::empty_result("no paths to update")
+            .with_hint("pass --update PATH, or `-` to read one path per line from stdin"));
+    }
+
+    let (stats, warnings) = Index::update_cache(root, &paths);
+    for warning in warnings {
+        context.warn(warning);
+    }
+
+    if context.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "root": root.canonicalize().unwrap_or_else(|_| root.to_path_buf()).to_string_lossy(),
+                "updated": {
+                    "parsed": stats.parsed,
+                    "reused": stats.reused,
+                    "removed": stats.removed,
+                    "skipped": stats.skipped,
+                },
+                "entries": stats.entries,
+            })
+        );
+        return Ok(());
+    }
+
+    println!(
+        "filer: {} parsed, {} reused, {} removed, {} skipped; {} entries cached",
+        stats.parsed, stats.reused, stats.removed, stats.skipped, stats.entries
+    );
+    Ok(())
 }
 
 fn state_cmd(root: &Path, args: StateArgs) -> Result<(), FilerError> {
