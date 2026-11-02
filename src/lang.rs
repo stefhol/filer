@@ -107,7 +107,7 @@ impl Language {
     pub fn granularity(self) -> Granularity {
         match self {
             Language::Fe => Granularity::Function,
-            Language::Java | Language::Kotlin => Granularity::Member,
+            Language::Java | Language::Kotlin | Language::Groovy => Granularity::Member,
             Language::Vue => Granularity::File,
             _ => Granularity::Symbol,
         }
@@ -492,6 +492,7 @@ mod tests {
         assert_eq!(Language::Fe.granularity(), Granularity::Function);
         assert_eq!(Language::Vue.granularity(), Granularity::File);
         assert_eq!(Language::Kotlin.granularity(), Granularity::Member);
+        assert_eq!(Language::Groovy.granularity(), Granularity::Member);
         assert_eq!(Language::Scala.granularity(), Granularity::Symbol);
         assert_eq!(Language::TypeScript.granularity(), Granularity::Symbol);
         assert!(!Language::Fe.granularity().file_row());

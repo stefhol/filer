@@ -1298,6 +1298,73 @@ mod tests {
     }
 
     #[test]
+    fn groovy_method_and_file_seeds_use_the_call_graph() {
+        let root = index_from_disk(
+            "groovy",
+            &[
+                (
+                    "app/Service.groovy",
+                    "package app\n\nclass Service extends Base {\n    private Repo repo\n\n    int used(Helper helper) {\n        helper.pong()\n        return repo.size()\n    }\n\n    int omitted() { return 1 }\n}\n",
+                ),
+                (
+                    "app/Repo.groovy",
+                    "package app\n\nclass Repo {\n    int size() { return 0 }\n    int unused() { return 1 }\n}\n",
+                ),
+                (
+                    "app/Helper.groovy",
+                    "package app\n\nclass Helper {\n    void pong() {}\n    void quiet() {}\n}\n",
+                ),
+                (
+                    "app/Base.groovy",
+                    "package app\n\nclass Base {\n    void parent() {}\n}\n",
+                ),
+            ],
+        );
+        let index = Index::build(&root);
+        let service = index.by_rel["app/Service.groovy"];
+
+        let order = closure_units(
+            &index,
+            &[member_seed(service, "Service", "used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let members = member_names(&order);
+        for expected in [("Helper", "pong"), ("Repo", "size")] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(class, member)| class == expected.0 && member == expected.1),
+                "missing {expected:?} in {members:?}"
+            );
+        }
+        assert!(!members
+            .iter()
+            .any(|(class, member)| class == "Repo" && member == "unused"));
+
+        let order = closure_units(
+            &index,
+            &[Unit::File(service)],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(order.iter().any(|(unit, _, _)| {
+            unit.symbol() == Some("Repo") && unit.member() == Some("size")
+        }));
+        assert!(!order
+            .iter()
+            .any(|(unit, _, _)| unit.member() == Some("unused")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn kotlin_method_and_file_seeds_use_the_call_graph() {
         let root = index_from_disk(
             "kotlin",
