@@ -21,6 +21,7 @@ import {
   type ProcessRunner,
   type RootResolver,
 } from "./src/cli";
+import { registerFilerTools } from "./src/tools";
 
 /** `--filer-bin <path>`: highest-precedence binary override. */
 export const FILER_BIN_FLAG = "filer-bin";
@@ -120,7 +121,12 @@ export default function filerExtension(
   deps: FilerAdapterDeps = {},
 ): void {
   registerFilerFlags(pi);
-  // Created eagerly but process-free; #41 attaches the tools to this adapter.
+  // Created eagerly but process-free; the tools resolve the binary and root
+  // lazily on their first call (and once at session_start for --version).
   const adapter = createFilerAdapter(deps);
-  void adapter;
+  registerFilerTools(pi, {
+    adapter,
+    binFlag: FILER_BIN_FLAG,
+    rootFlag: FILER_ROOT_FLAG,
+  });
 }

@@ -11,26 +11,53 @@ import type { ProcessRunner } from "../src/cli";
 interface FakePi {
   api: ExtensionAPI;
   flags: Array<{ name: string; options: unknown }>;
-  tools: unknown[];
+  tools: Array<{ name: string }>;
   commands: unknown[];
+  handlers: Map<string, unknown>;
+  activeTools: string[];
 }
 
 function fakePi(): FakePi {
   const flags: FakePi["flags"] = [];
-  const tools: unknown[] = [];
+  const tools: FakePi["tools"] = [];
   const commands: unknown[] = [];
+  const handlers = new Map<string, unknown>();
+  let activeTools: string[] = [];
   const api = {
     registerFlag(name: string, options: unknown) {
       flags.push({ name, options });
     },
-    registerTool(tool: unknown) {
+    registerTool(tool: { name: string }) {
       tools.push(tool);
+      activeTools.push(tool.name);
     },
     registerCommand(name: string, options: unknown) {
       commands.push({ name, options });
     },
+    on(event: string, handler: unknown) {
+      handlers.set(event, handler);
+      return () => {};
+    },
+    getFlag() {
+      return undefined;
+    },
+    getActiveTools() {
+      return [...activeTools];
+    },
+    setActiveTools(names: string[]) {
+      activeTools = names;
+    },
   } as unknown as ExtensionAPI;
-  return { api, flags, tools, commands };
+  return {
+    api,
+    flags,
+    tools,
+    commands,
+    handlers,
+    get activeTools() {
+      return activeTools;
+    },
+  };
 }
 
 const failingRunner: ProcessRunner = {
@@ -40,8 +67,8 @@ const failingRunner: ProcessRunner = {
 };
 
 describe("extension factory", () => {
-  test("registers exactly the two flags and nothing else", () => {
-    const { api, flags, tools, commands } = fakePi();
+  test("registers the two flags, the eight tools and no commands", () => {
+    const { api, flags, tools, commands, handlers } = fakePi();
     let gitLookups = 0;
     filerExtension(api, {
       runner: failingRunner,
@@ -54,8 +81,19 @@ describe("extension factory", () => {
     for (const flag of flags) {
       expect(flag.options).toMatchObject({ type: "string" });
     }
-    expect(tools).toEqual([]);
+    expect(tools.map((tool) => tool.name)).toEqual([
+      "filer_bundle",
+      "filer_show",
+      "filer_search",
+      "filer_deps",
+      "filer_callers",
+      "filer_why",
+      "filer_refs",
+      "filer_state",
+    ]);
     expect(commands).toEqual([]);
+    expect(handlers.has("session_start")).toBe(true);
+    // Registration is process-free; the session-start check runs later.
     expect(gitLookups).toBe(0);
   });
 

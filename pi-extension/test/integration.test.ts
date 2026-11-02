@@ -6,11 +6,18 @@
 
 import { describe, expect, test } from "bun:test";
 import { cpSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionToolContext,
+} from "@earendil-works/pi-coding-agent";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createFilerAdapter } from "../index";
 import { createFilerClient, defaultRunner, type FilerClient } from "../src/cli";
 import { bundle, callers, deps, index, refs, search, state } from "../src/operations";
 import { renderBundleMarkdown } from "../src/format";
+import { registerFilerTools, type BundleToolDetails } from "../src/tools";
 
 const repoRoot = resolve(import.meta.dir, "..", "..");
 const fixtureRoot = join(repoRoot, "tests", "fixtures", "java-scopes", "class-seed");
@@ -51,6 +58,45 @@ async function supportsEnvelope(subcommand: "state" | "index"): Promise<boolean>
   } catch {
     return false;
   }
+}
+
+interface RegisteredToolLike {
+  execute(
+    id: string,
+    params: unknown,
+    signal: AbortSignal | undefined,
+    onUpdate: unknown,
+    ctx: ExtensionToolContext,
+  ): Promise<AgentToolResult<BundleToolDetails>>;
+}
+
+/** A pi stub that only records the tools and the session-start handler. */
+function toolHarness(): { pi: ExtensionAPI; tools: Map<string, RegisteredToolLike> } {
+  const tools = new Map<string, RegisteredToolLike>();
+  const pi = {
+    registerTool(tool: RegisteredToolLike & { name: string }) {
+      tools.set(tool.name, tool);
+    },
+    on() {
+      return () => {};
+    },
+    getFlag() {
+      return undefined;
+    },
+    getActiveTools() {
+      return [...tools.keys()];
+    },
+    setActiveTools() {},
+  } as unknown as ExtensionAPI;
+  return { pi, tools };
+}
+
+function toolContext(cwd: string): ExtensionToolContext {
+  return {
+    cwd,
+    ui: { notify() {} },
+    signal: undefined,
+  } as unknown as ExtensionToolContext;
 }
 
 const stateJsonReady = haveBinary ? await supportsEnvelope("state") : false;
@@ -197,6 +243,69 @@ describe("integration: java-scopes/class-seed", () => {
       code = (error as { code?: string }).code;
     }
     expect(code).toBe("symbol_not_found");
+  }, 60_000);
+});
+
+describe("integration: tools over the real binary", () => {
+  test.skipIf(!haveBinary)("filer_bundle from a subdirectory matches the CLI envelope", async () => {
+    const { pi, tools } = toolHarness();
+    // No injected git lookup: FILER_ROOT wins from a `src/` subdirectory.
+    const adapter = createFilerAdapter({
+      env: { FILER_BIN: binaryPath, FILER_ROOT: fixtureRoot },
+    });
+    registerFilerTools(pi, { adapter });
+
+    const tool = tools.get("filer_bundle");
+    expect(tool).toBeDefined();
+    const result = await tool!.execute(
+      "call-1",
+      { seeds: [seed], depth: 2 },
+      undefined,
+      undefined,
+      toolContext(join(fixtureRoot, "src")),
+    );
+
+    const direct = await cliJson([
+      "--root",
+      fixtureRoot,
+      "--json",
+      "--quiet",
+      "bundle",
+      "--depth",
+      "2",
+      "--",
+      seed,
+    ]);
+    const envelope = JSON.parse(direct.stdout);
+    expect(result.content[0]).toMatchObject({
+      type: "text",
+      text: renderBundleMarkdown(envelope),
+    });
+    expect(result.details.units).toBe(envelope.entries.length);
+    expect(result.details.depth).toBe(2);
+    expect(result.details.coverage).toEqual(envelope.coverage);
+    expect(result.isError).toBeUndefined();
+  }, 60_000);
+
+  test.skipIf(!haveBinary || !stateJsonReady)("filer_state reads #39's envelope", async () => {
+    const { pi, tools } = toolHarness();
+    const adapter = createFilerAdapter({
+      env: { FILER_BIN: binaryPath, FILER_ROOT: fixtureRoot },
+    });
+    registerFilerTools(pi, { adapter });
+    const result = await tools.get("filer_state")!.execute(
+      "call-2",
+      {},
+      undefined,
+      undefined,
+      toolContext(fixtureRoot),
+    );
+    expect(result.structuredContent).toMatchObject({
+      schema_version: 1,
+      root: fixtureRoot,
+      state_path: join(fixtureRoot, ".filer", "bundle.toml"),
+    });
+    expect(result.isError).toBeUndefined();
   }, 60_000);
 });
 
