@@ -161,6 +161,14 @@ struct BundleArgs {
     /// (used by `:FilerHere` inside a `.fe` file).
     #[arg(long, value_name = "LINE")]
     at_line: Option<usize>,
+    /// Total budget in source bytes. Units past it are omitted from the tail
+    /// of the canonical order and listed in `omitted`.
+    #[arg(long, value_name = "BYTES")]
+    max_bytes: Option<u64>,
+    /// Total budget in tokens, a convenience for `--max-bytes`: one token is
+    /// four source bytes.
+    #[arg(long, value_name = "TOKENS", conflicts_with = "max_bytes")]
+    max_tokens: Option<u64>,
 }
 
 #[derive(Args)]
@@ -221,6 +229,12 @@ struct ShowArgs {
     /// Write the bundle to a file instead of stdout.
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
+    /// Total budget in source bytes (see `bundle --max-bytes`).
+    #[arg(long, value_name = "BYTES")]
+    max_bytes: Option<u64>,
+    /// Total budget in tokens (see `bundle --max-tokens`).
+    #[arg(long, value_name = "TOKENS", conflicts_with = "max_bytes")]
+    max_tokens: Option<u64>,
 }
 
 #[derive(Args)]
@@ -1016,9 +1030,27 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         .map(|(unit, (depth, reason))| (unit, depth, reason))
         .collect();
     units = drop_covered_symbols(units);
-    units.sort_by(|(unit_a, depth_a, _), (unit_b, depth_b, _)| {
-        depth_a
-            .cmp(depth_b)
+    // Same order `bundle::describe` renders in (see "Order and budget" in the
+    // README), so the state file and the bundle agree. The span tie-breaker is
+    // the only part missing here, and no two distinct units share the rest.
+    let seed_order: HashMap<&Unit, usize> = seeds
+        .iter()
+        .enumerate()
+        .map(|(position, unit)| (unit, position))
+        .collect();
+    units.sort_by(|(unit_a, depth_a, reason_a), (unit_b, depth_b, reason_b)| {
+        let seed_a = seed_order.get(unit_a).copied();
+        let seed_b = seed_order.get(unit_b).copied();
+        seed_a
+            .is_none()
+            .cmp(&seed_b.is_none())
+            .then_with(|| seed_a.unwrap_or(0).cmp(&seed_b.unwrap_or(0)))
+            .then_with(|| {
+                bundle::scope_rank(unit_selection(unit_a))
+                    .cmp(&bundle::scope_rank(unit_selection(unit_b)))
+            })
+            .then_with(|| depth_a.cmp(depth_b))
+            .then_with(|| bundle::reason_rank(*reason_a).cmp(&bundle::reason_rank(*reason_b)))
             .then_with(|| {
                 index.files[unit_a.file()]
                     .rel
@@ -1127,6 +1159,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
     let bundle_options = BundleOptions {
         title: args.title,
         depth: args.depth,
+        max_bytes: max_bytes(args.max_bytes, args.max_tokens),
         appendix,
         ..Default::default()
     };
@@ -1149,7 +1182,8 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         }
         value.to_string()
     } else {
-        // Markdown cannot carry the list; at least say the slice is incomplete.
+        // Markdown cannot carry the lists; at least say the slice is incomplete.
+        warn_budget(&rendered, context);
         if !rendered.diagnostics.is_empty() {
             context.warn(format!(
                 "{} diagnostics: the bundle is an incomplete slice (see --json)",
@@ -1181,6 +1215,28 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
     }
 
     Ok(())
+}
+
+/// The `--max-bytes` primitive, with `--max-tokens` as the documented
+/// convenience: one token is [`bundle::BYTES_PER_TOKEN`] source bytes.
+fn max_bytes(bytes: Option<u64>, tokens: Option<u64>) -> Option<u64> {
+    let per_token = bundle::BYTES_PER_TOKEN as u64;
+    bytes.or_else(|| tokens.map(|tokens| tokens.saturating_mul(per_token)))
+}
+
+/// Text mode has no list of what the budget cut, so say the markdown is a
+/// prefix and point at the JSON surface that does.
+fn warn_budget(rendered: &bundle::RenderedBundle, context: &Context) {
+    if rendered.dropped.is_empty() {
+        return;
+    }
+    let used: usize = rendered.entries.iter().map(|entry| entry.tokens).sum();
+    context.warn(format!(
+        "budget: {} of {} units dropped after {used} of {} tokens (--json lists them)",
+        rendered.dropped.len(),
+        rendered.entries.len() + rendered.dropped.len(),
+        rendered.max_tokens.unwrap_or_default(),
+    ));
 }
 
 /// Index-wide completeness counters for the `bundle --json`/`show --json`
@@ -1431,12 +1487,17 @@ fn unit_label(index: &Index, unit: &Unit) -> String {
     }
 }
 
-fn unit_scope(unit: &Unit) -> &'static str {
+/// The scope a unit is written with in the state file and the JSON surface.
+fn unit_selection(unit: &Unit) -> Selection {
     match unit {
-        Unit::File(_) => "file",
-        Unit::Symbol { .. } => "symbol",
-        Unit::Member { .. } => "methods",
+        Unit::File(_) => Selection::File,
+        Unit::Symbol { .. } => Selection::Symbol,
+        Unit::Member { .. } => Selection::Methods,
     }
+}
+
+fn unit_scope(unit: &Unit) -> &'static str {
+    unit_selection(unit).as_str()
 }
 
 /// The units recorded in one branch bundle, validated against the live index.
@@ -1891,6 +1952,7 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
     let bundle_options = BundleOptions {
         title: args.title,
         depth: bundle.depth,
+        max_bytes: max_bytes(args.max_bytes, args.max_tokens),
         appendix: Some(appendix),
         ..Default::default()
     };
@@ -1906,6 +1968,7 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
         }
         value.to_string()
     } else {
+        warn_budget(&rendered, context);
         rendered.markdown
     };
 

@@ -62,7 +62,12 @@ whole picture instead of a fragment.
   namespace, exactly like the language's IntelliJ plugin resolves them. Class methods add a second one: class shell for context, call-path bodies for content.
 - Every entry has an explicit **scope** — `file`, `symbol` or `methods` — so the picker,
   the state file and the renderer agree on what was included and why.
-- Walks the resulting graph to a configurable depth.
+- Walks the resulting graph to a configurable depth, then sorts what it found into a
+  documented canonical order (seeds, `file` > `symbol` > `methods`, depth, reason, path,
+  span) so the same selection always renders the same bytes, no matter how the imports moved.
+- Applies an optional byte/token budget (`--max-bytes`, `--max-tokens`) by cutting the tail of
+  that order, and lists every dropped unit in `omitted` instead of silently shortening the
+  bundle. See [Order and budget](#order-and-budget).
 - Remembers what is already bundled in a TOML state file, marks those entries with `✓` in
   the picker, and grows the bundle instead of replacing it. Switching git branch kills the
   old state automatically.
@@ -426,6 +431,48 @@ advisory write lock (kept on purpose; the kernel releases the lock when the proc
 without git use a single `(no branch)` bundle. Older single-branch state files are migrated
 on load.
 
+## Order and budget
+
+The bundle has one documented order, and it is the same order the budget truncates:
+
+1. **Seeds** first, in the order you gave them on the command line.
+2. **Scope**: whole files (`file`) before class/declaration excerpts (`symbol`) before
+   method scopes (`methods`). Complete files are the most useful thing in a slice, so they
+   survive a tight budget longest.
+3. **Ascending depth** within a scope, so a shallower dependency beats a deeper one.
+4. **Reason**: `seed` before `call` before the import reasons (`import`, `static-import`,
+   `wildcard-import`, `module-import`), then `same-package`/`usage`, then `package`,
+   `config`, `external`.
+5. **Path**, then **span** start, as the final tie-breakers.
+
+Nothing depends on discovery order, so reordering imports in a seed file cannot reorder the
+bundle, and the same seed with the same budget renders the same bytes twice in a row. The
+state file is written in this order too.
+
+### Budgets
+
+```sh
+filer --root ~/code/demo bundle --max-tokens 2000 app/Service.java
+filer --root ~/code/demo bundle --max-bytes 8000 app/Service.java   # the primitive
+filer --root ~/code/demo show --max-tokens 2000                     # re-render under a budget
+```
+
+- `--max-bytes` is the primitive: total **source** bytes of the bundled spans.
+- `--max-tokens` is a convenience for `--max-bytes`, derived as `tokens * 4` (one token is
+  four source bytes, documented in `bundle::BYTES_PER_TOKEN`). **There is no tokenizer
+  dependency**, so the number is an estimate; `--max-bytes` is exact.
+- Both are unlimited by default; the state file always keeps the **full** selection, so the
+  budget only shapes what is rendered now and raising it later brings entries back.
+- Truncation is strict: the last unit that still fits survives, and everything after it in
+  the canonical order is dropped. A smaller budget can only remove entries from the tail of
+  the order above — it never reshuffles or reorders the rest.
+- Dropped units are not rendered and not listed in `## Files`; the JSON envelope lists every
+  one in `omitted` with `"reason": "budget"` and reports `budget.truncated: true`. In text
+  mode a one-line warning on stderr says how many units were cut.
+
+A budget does not fight the per-file safety valve: a single file above 1 MiB is still
+reported as `too_large` instead of being cut.
+
 ## CLI
 
 ```sh
@@ -456,7 +503,9 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C
 ```
 
 `bundle` flags: `--depth N` (0 = only the given units), `--with-same-package`,
-`--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`, `--at-line N`.
+`--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`, `--at-line N`,
+`--max-bytes N`, `--max-tokens N` (see [Order and budget](#order-and-budget)). `show`
+takes the same two budget flags.
 Default depth is 2. Global flags: `--json`, `--quiet`, `--include GLOB`, `--exclude GLOB`,
 `--no-ignore` (see below). Add `::Symbol` for one declaration and `::Class.method` for a Java or
 Rust method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
@@ -551,7 +600,14 @@ filer --root ~/code/demo --json index
   "files": 2,
   "excerpts": 2,
   "methods": 1,
-  "budget": {"max_file_bytes": 1048576, "used_bytes": 4096, "used_tokens": 1024, "truncated": false},
+  "budget": {
+    "max_file_bytes": 1048576,
+    "max_bytes": 8000,
+    "max_tokens": 2000,
+    "used_bytes": 4096,
+    "used_tokens": 1024,
+    "truncated": false
+  },
   "entries": [
     {
       "path": "app/Service.java",
@@ -581,8 +637,13 @@ filer --root ~/code/demo --json index
 
 - `entries` names exactly the units the markdown contains, in order; `label` is the
   `## Files` line and `markdown` is the `## Contents` section, so a consumer can rebuild
-  the bundle from the JSON. `omitted` is the subset that could not be rendered
-  (`too_large`, `unreadable`, `symbol_missing`, `stale_span`, `not_indexed`).
+  the bundle from the JSON. `omitted` lists the units that are not in it: either selected
+  but unrenderable (`too_large`, `unreadable`, `symbol_missing`, `stale_span`, `not_indexed`)
+  or cut by the budget (`budget`). Budget cuts are not in `entries`, so `entries[].tokens`
+  always sums to `budget.used_tokens`.
+- `budget.max_bytes` / `budget.max_tokens` are `null` when no budget was given;
+  `used_tokens` is the sum of `entries[].tokens`, and `truncated` is true when the budget
+  cut units or a file hit `max_file_bytes`. See [Order and budget](#order-and-budget).
 - Spans are 1-based lines and 0-based byte offsets. `tokens` is `bytes / 4` for the unit
   span; there is no tokenizer dependency.
 - `state_toml` preserves the bundle-state appendix as TOML inside the JSON envelope, so
@@ -764,9 +825,11 @@ Every command builds the same index, so the filter is global:
 7. For a symbol seed, do the same with the names used *inside that symbol*, and map each hit
    to the symbol that declares it (a sibling in the same file first). A whole-file unit that
    ends up in the same bundle supersedes its symbol units.
-8. Breadth-first walk from the seeds up to `--depth`, preserving discovery order so the
-   bundle reads top-down from your entry point. Materialized edges are kept in the graph,
-   so `deps --json` can expose them and `callers`/`why` can walk them backwards.
+8. Breadth-first walk from the seeds up to `--depth`. The walk records depth and reason per
+   unit; the bundle then sorts them into the [canonical order](#order-and-budget) (seeds,
+   scope, depth, reason, path, span) instead of rendering discovery order, which is what
+   makes the output reproducible. Materialized edges are kept in the graph, so `deps --json`
+   can expose them and `callers`/`why` can walk them backwards.
 9. While resolving, record what was declined (unresolved imports, unknown receivers,
    method-not-found fallbacks, skipped type-only deps, ambiguities) as diagnostics. They
    travel with the closure, not with the rendered markdown, so `bundle --json` can report
