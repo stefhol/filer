@@ -10,11 +10,15 @@ bundles — the CLI owns all of that, and the extension is versioned with it.
 ```sh
 cargo build --release            # the binary the integration tests spawn
 cd pi-extension
+bun install                      # typebox, pi-tui and the type deps
 bun test
 ```
 
 Without `target/release/filer` the integration suite is skipped with a message, so `bun test`
-stays green on a fresh clone. To run that suite against a binary somewhere else, point
+stays green on a fresh clone. `bun.lock` is committed so CI can install reproducibly with
+`bun install --frozen-lockfile`. Without `bun install` the run fails on `src/tools.ts`:
+the tool schemas need `typebox` at import time and the result renderers need
+`@earendil-works/pi-tui`. To run that suite against a binary somewhere else, point
 `FILER_BIN` at it:
 
 ```sh
@@ -44,8 +48,11 @@ pi -e ./pi-extension
 
 ## Rules
 
-- **No runtime SDK import below `index.ts`.** `@earendil-works/pi-coding-agent` is a
-  type-only import, `index.ts` included, so `bun test` runs without the pi runtime installed.
+- **`@earendil-works/pi-coding-agent` stays type-only.** It is imported with `import type`
+  everywhere, `index.ts` included. The two host modules the tools need at runtime —
+  `typebox` (tool schemas) and `@earendil-works/pi-tui` (result renderers, imported in
+  `src/tools.ts`) — are declared as peer and dev dependencies, so `bun install` satisfies
+  them locally and pi provides them in a session.
 - One function per CLI command in `src/operations.ts`. Resolution, slicing and rendering stay
   in Rust; the adapter only builds argv and maps JSON.
 - `--json --quiet` is mandatory on every call — the adapter parses the JSON surface and never
@@ -55,5 +62,6 @@ pi -e ./pi-extension
 - Bumping `schema_version` in `src/schema.rs` means bumping `SUPPORTED_SCHEMA_VERSION` in
   `src/schema.ts` in the same change.
 
-CI runs the same commands (`.github/workflows/ci.yml`, job `extension`):
-`cargo build --release --locked`, then `bun test` with `working-directory: pi-extension`.
+CI runs the same commands (`.github/workflows/ci.yml`, job `extension`, all with
+`working-directory: pi-extension`): `cargo build --release --locked`, `bun install
+--frozen-lockfile`, `bun run typecheck`, then `bun test`.

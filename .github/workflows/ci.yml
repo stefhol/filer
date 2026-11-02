@@ -58,5 +58,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: oven-sh/setup-bun@v2
       - run: cargo build --release --locked
+      # The tools import `typebox` and `@earendil-works/pi-tui` at runtime, so the
+      # suite needs the dev dependencies installed first; `bun.lock` is committed.
+      - run: bun install --frozen-lockfile
+        working-directory: pi-extension
+      - run: bun run typecheck
+        working-directory: pi-extension
       - run: bun test
         working-directory: pi-extension
