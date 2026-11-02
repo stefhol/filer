@@ -3,6 +3,7 @@
 mod atomic;
 mod bundle;
 mod csharp;
+mod error;
 mod fe;
 mod groovy;
 mod index;
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 
 use bundle::{BundleFile, BundleOptions};
+use error::{FilerError, EXIT_EMPTY, EXIT_INTERNAL};
 use index::{FileEntry, Index};
 use lang::{Granularity, Language, MemberKind, SymbolKind};
 use resolve::{closure_units, drop_covered_symbols, Reason, ResolveOptions, Unit};
@@ -36,6 +38,15 @@ struct Cli {
     /// Project root. Defaults to the current directory.
     #[arg(long, global = true, value_name = "DIR")]
     root: Option<PathBuf>,
+
+    /// Print errors as a JSON envelope instead of prose, and let `search`
+    /// explain an empty result with a machine-readable hint.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Suppress progress summaries and non-fatal warnings on stderr.
+    #[arg(long, global = true)]
+    quiet: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -66,7 +77,7 @@ struct SearchArgs {
     #[arg(long, default_value_t = 200)]
     limit: usize,
     /// Human-readable output instead of JSON lines.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "json")]
     plain: bool,
     /// Mark files already in the bundle at this state file.
     #[arg(long, value_name = "FILE")]
@@ -116,9 +127,6 @@ struct DepsArgs {
     /// Import hops to follow.
     #[arg(long, default_value_t = 2)]
     depth: u32,
-    /// JSON output.
-    #[arg(long)]
-    json: bool,
 }
 
 #[derive(Args)]
@@ -154,21 +162,87 @@ struct StateArgs {
 }
 
 fn main() {
-    let cli = Cli::parse();
-    let root = cli
-        .root
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    match cli.command {
-        Command::Search(args) => search(&root, args),
-        Command::Bundle(args) => bundle_cmd(&root, args),
-        Command::Deps(args) => deps(&root, args),
-        Command::Show(args) => show_cmd(&root, args),
-        Command::Index => index_cmd(&root),
-        Command::State(args) => state_cmd(&root, args),
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) if error.use_stderr() => {
+            // Usage errors are internal (exit 1), never 2 ("not found").
+            let json = std::env::args().any(|argument| argument == "--json");
+            if json {
+                FilerError::internal(error.to_string().trim().to_string()).emit(true);
+            } else {
+                eprint!("{error}");
+            }
+            std::process::exit(EXIT_INTERNAL);
+        }
+        // --help / --version are successful output, not errors.
+        Err(error) => error.exit(),
+    };
+    let context = Context {
+        json: cli.json,
+        quiet: cli.quiet,
+    };
+    match run(&context, cli.root, cli.command) {
+        // A successful run that produced nothing: exit 4 without stderr noise.
+        Ok(true) => std::process::exit(EXIT_EMPTY),
+        Ok(false) => {}
+        Err(error) => {
+            error.emit(context.json);
+            std::process::exit(error.code.exit_code());
+        }
     }
 }
+
+/// Global output switches shared by every command.
+struct Context {
+    /// `--json`: errors are envelopes, `search` hints at an empty result.
+    json: bool,
+    /// `--quiet`: no summaries and no soft warnings on stderr.
+    quiet: bool,
+}
+
+impl Context {
+    /// A non-fatal notice: dropped entries, skipped inputs, unresolved imports.
+    /// With `--json` it is a JSON line on stderr so agents never parse prose.
+    fn warn(&self, message: impl std::fmt::Display) {
+        if self.quiet {
+            return;
+        }
+        if self.json {
+            eprintln!("{}", serde_json::json!({ "warning": message.to_string() }));
+        } else {
+            eprintln!("filer: {message}");
+        }
+    }
+
+    /// The trailing "N units" line of a successful bundle or show.
+    fn summary(&self, message: impl std::fmt::Display) {
+        if !self.quiet {
+            eprintln!("filer: {message}");
+        }
+    }
+}
+
+/// `Ok(true)` means "succeeded, but the result is empty" (exit code 4).
+fn run(context: &Context, root: Option<PathBuf>, command: Command) -> Result<bool, FilerError> {
+    let root =
+        root.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    match command {
+        Command::Search(args) => search(&root, args, context),
+        Command::Bundle(args) => bundle_cmd(&root, args, context).map(|()| false),
+        Command::Deps(args) => deps(&root, args, context).map(|()| false),
+        Command::Show(args) => show_cmd(&root, args, context).map(|()| false),
+        Command::Index => {
+            index_cmd(&root);
+            Ok(false)
+        }
+        Command::State(args) => state_cmd(&root, args).map(|()| false),
+    }
+}
+
+/// The hint an empty `search --json` carries: what this index does and does not
+/// match, so an agent knows to fall back to text search for file contents.
+const EMPTY_SEARCH_HINT: &str = "symbol/path index only; use text search for file contents";
 
 struct SearchHit {
     score: u8,
@@ -239,7 +313,7 @@ fn granularity_of(file: &FileEntry) -> Granularity {
         .unwrap_or(Granularity::File)
 }
 
-fn search(root: &Path, args: SearchArgs) {
+fn search(root: &Path, args: SearchArgs, context: &Context) -> Result<bool, FilerError> {
     let index = Index::build(root);
     let branch = args
         .branch
@@ -329,6 +403,16 @@ fn search(root: &Path, args: SearchArgs) {
             .then_with(|| hit_label(&index, a).cmp(&hit_label(&index, b)))
     });
 
+    let empty = hits.is_empty();
+    if empty && context.json {
+        // One JSON line, so `search --json | jq .hint` explains the empty
+        // result. It carries no `path`, so the picker ignores it either way.
+        println!(
+            "{}",
+            serde_json::json!({ "hint": EMPTY_SEARCH_HINT, "results": 0 })
+        );
+    }
+
     for hit in hits.into_iter().take(args.limit) {
         let file = &index.files[hit.file];
         let granularity = granularity_of(file);
@@ -417,6 +501,8 @@ fn search(root: &Path, args: SearchArgs) {
             value,
         );
     }
+
+    Ok(empty)
 }
 
 /// One picker row: JSON for Telescope, or `marker<TAB>[kind] label<TAB>target`.
@@ -501,7 +587,7 @@ fn score(fqn: &str, rel: &str, names: &[String], query: &str, tokens: &[&str]) -
     })
 }
 
-fn bundle_cmd(root: &Path, args: BundleArgs) {
+fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), FilerError> {
     let index = Index::build(root);
     let root = index.root.clone();
     let state_path = args.state.clone();
@@ -537,10 +623,10 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                                 value,
                             );
                         } else {
-                            eprintln!(
-                                "filer: dropping {}::{symbol}: no longer in the file",
+                            context.warn(format!(
+                                "dropping {}::{symbol}: no longer in the file",
                                 file.path
-                            );
+                            ));
                         }
                     }
                     Selection::Methods => {
@@ -548,10 +634,10 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                             continue;
                         };
                         let Some(class) = entry.symbol(symbol) else {
-                            eprintln!(
-                                "filer: dropping {}::{symbol}: no longer in the file",
+                            context.warn(format!(
+                                "dropping {}::{symbol}: no longer in the file",
                                 file.path
-                            );
+                            ));
                             continue;
                         };
                         for member in &file.methods {
@@ -568,10 +654,10 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
                                     value,
                                 );
                             } else {
-                                eprintln!(
-                                    "filer: dropping {}::{symbol}.{member}: no longer in the file",
+                                context.warn(format!(
+                                    "dropping {}::{symbol}.{member}: no longer in the file",
                                     file.path
-                                );
+                                ));
                             }
                         }
                     }
@@ -587,7 +673,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
     for input in &args.files {
         let (path, symbol) = split_symbol(input);
         let Some(rel) = locate(&index, &root, path) else {
-            eprintln!("filer: skipping {path}: not inside {}", root.display());
+            context.warn(format!("skipping {path}: not inside {}", root.display()));
             continue;
         };
         let Some(&position) = index.by_rel.get(&rel) else {
@@ -601,13 +687,8 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
         };
 
         let unit = match symbol {
-            Some(symbol) => seed_unit(&index, position, symbol).unwrap_or_else(|| {
-                eprintln!(
-                    "filer: {} has no symbol {symbol}; bundling the whole file",
-                    index.files[position].rel
-                );
-                Unit::File(position)
-            }),
+            Some(symbol) => seed_unit(&index, position, symbol)
+                .ok_or_else(|| FilerError::symbol_not_found(&index.files[position].rel, symbol))?,
             None if !at_line_used && args.at_line.is_some() => {
                 at_line_used = true;
                 let line = args.at_line.expect("checked");
@@ -731,8 +812,8 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
     files.extend(extras);
 
     if files.is_empty() {
-        eprintln!("filer: nothing to bundle");
-        std::process::exit(1);
+        return Err(FilerError::empty_result("nothing to bundle")
+            .with_hint("check the paths and symbol names; `filer search` lists what is indexed"));
     }
 
     let branch_bundle = if state_path.is_some() {
@@ -775,28 +856,32 @@ fn bundle_cmd(root: &Path, args: BundleArgs) {
         let mut doc = doc.unwrap_or_else(|| StateDoc::new(&root));
         doc.upsert(bundle);
         if let Err(error) = state::save(path, &doc) {
-            eprintln!("filer: cannot write state {}: {error}", path.display());
+            context.warn(format!("cannot write state {}: {error}", path.display()));
         }
     }
 
     match args.out {
         Some(path) => {
             if let Err(error) = std::fs::write(&path, &markdown) {
-                eprintln!("filer: cannot write {}: {error}", path.display());
-                std::process::exit(1);
+                return Err(FilerError::internal(format!(
+                    "cannot write {}: {error}",
+                    path.display()
+                )));
             }
-            eprintln!(
-                "filer: wrote {} ({} units, {} new)",
+            context.summary(format!(
+                "wrote {} ({} units, {} new)",
                 path.display(),
                 files.len(),
                 fresh
-            );
+            ));
         }
         None => {
             print!("{markdown}");
-            eprintln!("filer: {} units, {} new on this run", files.len(), fresh);
+            context.summary(format!("{} units, {} new on this run", files.len(), fresh));
         }
     }
+
+    Ok(())
 }
 
 /// `path::symbol` (Windows drive letters do not contain `::`).
@@ -867,16 +952,21 @@ fn offset_of_line(source: &str, line: usize) -> usize {
     source.len()
 }
 
-fn deps(root: &Path, args: DepsArgs) {
+fn deps(root: &Path, args: DepsArgs, context: &Context) -> Result<(), FilerError> {
     let index = Index::build(root);
     let root = index.root.clone();
     let Some(rel) = locate(&index, &root, &args.file) else {
-        eprintln!("filer: {} is not inside {}", args.file, root.display());
-        std::process::exit(1);
+        return Err(FilerError::file_not_found(format!(
+            "{} is not inside {}",
+            args.file,
+            root.display()
+        )));
     };
     let Some(&position) = index.by_rel.get(&rel) else {
-        eprintln!("filer: {rel} is not indexed (binary or skipped directory?)");
-        std::process::exit(1);
+        return Err(FilerError::not_indexed(format!(
+            "{rel} is not indexed (binary, skipped directory or unsupported language?)"
+        ))
+        .with_hint("run `filer index` to see what the index contains"));
     };
 
     let order = resolve::closure_detailed(
@@ -889,7 +979,7 @@ fn deps(root: &Path, args: DepsArgs) {
         },
     );
 
-    if args.json {
+    if context.json {
         let value: Vec<_> = order
             .iter()
             .map(|&(position, depth, reason)| {
@@ -903,7 +993,7 @@ fn deps(root: &Path, args: DepsArgs) {
             })
             .collect();
         println!("{}", serde_json::json!(value));
-        return;
+        return Ok(());
     }
 
     for &(position, depth, reason) in &order {
@@ -920,13 +1010,15 @@ fn deps(root: &Path, args: DepsArgs) {
     }
 
     for import in resolve::unresolved_imports(&index, position) {
-        eprintln!("unresolved (probably JDK/third-party): {import}");
+        context.warn(format!("unresolved (probably JDK/third-party): {import}"));
     }
+
+    Ok(())
 }
 
 /// Re-renders one branch's bundle from the state file: same files, same depths
 /// and reasons, current file contents.
-fn show_cmd(root: &Path, args: ShowArgs) {
+fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerError> {
     let index = Index::build(root);
     let root = index.root.clone();
     let path = args
@@ -935,11 +1027,11 @@ fn show_cmd(root: &Path, args: ShowArgs) {
         .unwrap_or_else(|| state::default_path(&root));
 
     let Some(doc) = state::load(&path) else {
-        eprintln!(
-            "filer: no bundle state at {} — bundle something first",
-            path.display()
-        );
-        std::process::exit(1);
+        return Err(FilerError::new(
+            error::Code::StateNotFound,
+            format!("no bundle state at {}", path.display()),
+        )
+        .with_hint("bundle something first"));
     };
 
     let branch = args
@@ -959,16 +1051,19 @@ fn show_cmd(root: &Path, args: ShowArgs) {
                 )
             })
             .collect();
-        eprintln!(
-            "filer: no bundle for branch {} (have: {})",
-            state::branch_label(&branch),
-            if available.is_empty() {
-                "none".to_string()
-            } else {
-                available.join(", ")
-            }
-        );
-        std::process::exit(1);
+        return Err(FilerError::new(
+            error::Code::BranchNotFound,
+            format!(
+                "no bundle for branch {} (have: {})",
+                state::branch_label(&branch),
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ),
+        )
+        .with_hint("`filer state` lists every branch with a bundle"));
     };
 
     let mut files: Vec<BundleFile> = Vec::new();
@@ -994,10 +1089,10 @@ fn show_cmd(root: &Path, args: ShowArgs) {
                             continue;
                         };
                         if entry.symbol(symbol).is_none() {
-                            eprintln!(
-                                "filer: dropping {}::{symbol}: no longer in the file",
+                            context.warn(format!(
+                                "dropping {}::{symbol}: no longer in the file",
                                 file.path
-                            );
+                            ));
                             continue;
                         }
                         Some(BundleFile::excerpt(
@@ -1013,10 +1108,10 @@ fn show_cmd(root: &Path, args: ShowArgs) {
                             continue;
                         };
                         let Some(class) = entry.symbol(symbol) else {
-                            eprintln!(
-                                "filer: dropping {}::{symbol}: no longer in the file",
+                            context.warn(format!(
+                                "dropping {}::{symbol}: no longer in the file",
                                 file.path
-                            );
+                            ));
                             continue;
                         };
                         let mut kept = BTreeSet::new();
@@ -1027,14 +1122,15 @@ fn show_cmd(root: &Path, args: ShowArgs) {
                             if exists {
                                 kept.insert(member.clone());
                             } else {
-                                eprintln!(
-                                    "filer: dropping {}::{symbol}.{member}: no longer in the file",
+                                context.warn(format!(
+                                    "dropping {}::{symbol}.{member}: no longer in the file",
                                     file.path
-                                );
+                                ));
                             }
                         }
                         if kept.is_empty() {
-                            eprintln!("filer: dropping {}::{symbol}: no methods left", file.path);
+                            context
+                                .warn(format!("dropping {}::{symbol}: no methods left", file.path));
                             continue;
                         }
                         shown_file.methods = kept.iter().cloned().collect();
@@ -1063,15 +1159,17 @@ fn show_cmd(root: &Path, args: ShowArgs) {
                 shown.files.push(file.clone());
             }
             None => {
-                eprintln!("filer: dropping {}: no longer in the project", file.path);
+                context.warn(format!("dropping {}: no longer in the project", file.path));
                 continue;
             }
         }
     }
 
     if files.is_empty() {
-        eprintln!("filer: bundle is empty ({})", path.display());
-        std::process::exit(1);
+        return Err(
+            FilerError::empty_result(format!("bundle is empty ({})", path.display()))
+                .with_hint("`:FilerReset` and bundle again"),
+        );
     }
 
     let appendix = {
@@ -1091,27 +1189,31 @@ fn show_cmd(root: &Path, args: ShowArgs) {
     match args.out {
         Some(out) => {
             if let Err(error) = std::fs::write(&out, &markdown) {
-                eprintln!("filer: cannot write {}: {error}", out.display());
-                std::process::exit(1);
+                return Err(FilerError::internal(format!(
+                    "cannot write {}: {error}",
+                    out.display()
+                )));
             }
-            eprintln!(
-                "filer: wrote {} ({} units for branch {} from {})",
+            context.summary(format!(
+                "wrote {} ({} units for branch {} from {})",
                 out.display(),
                 files.len(),
                 state::branch_label(&branch),
                 path.display()
-            );
+            ));
         }
         None => {
             print!("{markdown}");
-            eprintln!(
-                "filer: {} units for branch {} from {}",
+            context.summary(format!(
+                "{} units for branch {} from {}",
                 files.len(),
                 state::branch_label(&branch),
                 path.display()
-            );
+            ));
         }
     }
+
+    Ok(())
 }
 
 fn index_cmd(root: &Path) {
@@ -1166,7 +1268,7 @@ fn index_cmd(root: &Path) {
     }
 }
 
-fn state_cmd(root: &Path, args: StateArgs) {
+fn state_cmd(root: &Path, args: StateArgs) -> Result<(), FilerError> {
     let path = args.file.clone().unwrap_or_else(|| {
         state::default_path(&root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))
     });
@@ -1177,18 +1279,20 @@ fn state_cmd(root: &Path, args: StateArgs) {
             Ok(true) => println!("filer: cleared every branch ({})", path.display()),
             Ok(false) => println!("filer: no state at {}", path.display()),
             Err(error) => {
-                eprintln!("filer: cannot remove {}: {error}", path.display());
-                std::process::exit(1);
+                return Err(FilerError::internal(format!(
+                    "cannot remove {}: {error}",
+                    path.display()
+                )));
             }
         }
-        return;
+        return Ok(());
     }
 
     if args.clear {
         let target = args.branch.clone().unwrap_or_else(|| current.clone());
         let Some(mut doc) = state::load(&path) else {
             println!("filer: no state at {}", path.display());
-            return;
+            return Ok(());
         };
         if !doc.remove(&target) {
             println!(
@@ -1196,23 +1300,25 @@ fn state_cmd(root: &Path, args: StateArgs) {
                 state::branch_label(&target),
                 path.display()
             );
-            return;
+            return Ok(());
         }
         if let Err(error) = state::save(&path, &doc) {
-            eprintln!("filer: cannot write {}: {error}", path.display());
-            std::process::exit(1);
+            return Err(FilerError::internal(format!(
+                "cannot write {}: {error}",
+                path.display()
+            )));
         }
         println!(
             "filer: cleared bundle for {} ({})",
             state::branch_label(&target),
             path.display()
         );
-        return;
+        return Ok(());
     }
 
     let Some(doc) = state::load(&path) else {
         println!("filer: no state at {}", path.display());
-        return;
+        return Ok(());
     };
     println!("state:    {}", path.display());
     println!("current:  {}", state::branch_label(&current));
@@ -1233,7 +1339,7 @@ fn state_cmd(root: &Path, args: StateArgs) {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        return;
+        return Ok(());
     };
 
     println!(
@@ -1245,6 +1351,8 @@ fn state_cmd(root: &Path, args: StateArgs) {
     for file in &bundle.files {
         println!("  {} (depth {}, {})", file.label(), file.depth, file.reason);
     }
+
+    Ok(())
 }
 
 fn locate(index: &Index, root: &Path, input: &str) -> Option<String> {
@@ -1380,6 +1488,15 @@ mod tests {
         assert!(class.symbol("Class").is_some());
         // A class entry covers all of its methods.
         assert!(class.method("Class", "anything").is_some());
+    }
+
+    #[test]
+    fn empty_search_hint_names_the_index_limits() {
+        // Locked down: the issue asks for exactly this explanation.
+        assert_eq!(
+            EMPTY_SEARCH_HINT,
+            "symbol/path index only; use text search for file contents"
+        );
     }
 
     #[test]
