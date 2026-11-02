@@ -176,6 +176,16 @@ struct BundleArgs {
     /// four source bytes.
     #[arg(long, value_name = "TOKENS", conflicts_with = "max_bytes")]
     max_tokens: Option<u64>,
+    /// Leave out a unit the caller already has: `path`, `path::Symbol` or
+    /// `path::Class.method`. Repeatable. The unit stays in the resolution graph,
+    /// so what it pulls in can still be new.
+    #[arg(long, value_name = "UNIT")]
+    skip: Vec<String>,
+    /// Return only units not yet in this manifest: `-` for stdin, `@FILE` or a
+    /// bare path. Accepts `bundle --json` output (or its `entries` array) or one
+    /// `path[::Symbol]` per line. The saved state keeps the full bundle.
+    #[arg(long, value_name = "SOURCE")]
+    only_new: Option<String>,
 }
 
 #[derive(Args)]
@@ -971,6 +981,21 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         );
     }
 
+    // What the caller already has: `--skip` units plus the `--only-new` manifest.
+    // These stay in the graph (a kept callee can still be new) but are not
+    // rendered, and they stay in the state file so a delta run cannot truncate
+    // what filer knows.
+    let mut covered = Covered::default();
+    for unit in &args.skip {
+        let (path, symbol) = split_symbol(unit);
+        covered.add(&index, manifest_unit(path, symbol));
+    }
+    if let Some(source) = &args.only_new {
+        for entry in read_manifest(source)? {
+            covered.add(&index, entry);
+        }
+    }
+
     let mut seeds: Vec<Unit> = Vec::new();
     let mut extras: Vec<BundleFile> = Vec::new();
     let mut at_line_used = false;
@@ -1091,53 +1116,15 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
             })
     });
 
-    // Group the method units of one class into a single `methods` entry.
-    let mut files: Vec<BundleFile> = Vec::new();
-    let mut class_slot: HashMap<(String, String), usize> = HashMap::new();
-    for (unit, depth, reason) in units {
-        let entry = &index.files[unit.file()];
-        match unit {
-            Unit::File(_) => files.push(BundleFile::whole(
-                entry.rel.clone(),
-                entry.abs.clone(),
-                depth,
-                reason,
-            )),
-            Unit::Symbol { symbol, .. } => files.push(BundleFile::excerpt(
-                entry.rel.clone(),
-                entry.abs.clone(),
-                depth,
-                reason,
-                symbol,
-            )),
-            Unit::Member { class, member, .. } => {
-                let key = (entry.rel.clone(), class.clone());
-                match class_slot.get(&key).copied() {
-                    Some(position) => {
-                        let file = &mut files[position];
-                        file.methods.insert(member);
-                        if depth < file.depth {
-                            file.depth = depth;
-                            file.reason = reason;
-                        } else if depth == file.depth && reason == Reason::Seed {
-                            file.reason = reason;
-                        }
-                    }
-                    None => {
-                        class_slot.insert(key, files.len());
-                        files.push(BundleFile::members(
-                            entry.rel.clone(),
-                            entry.abs.clone(),
-                            depth,
-                            reason,
-                            class,
-                            BTreeSet::from([member]),
-                        ));
-                    }
-                }
-            }
-        }
+    // The full set before the delta filter: what a state file keeps.
+    let total_units = units.len();
+    let state_files = (!covered.is_empty()).then(|| group_units(&index, units.clone()));
+    if !covered.is_empty() {
+        units.retain(|(unit, _, _)| !covered.covers(unit, &index));
     }
+    let kept_units = units.len();
+
+    let mut files = group_units(&index, units);
 
     if args.with_config {
         files.extend(config_files(&root));
@@ -1145,6 +1132,12 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
     files.extend(extras);
 
     if files.is_empty() {
+        if total_units > 0 && kept_units == 0 {
+            return Err(FilerError::empty_result(
+                "nothing new: every unit is already in the manifest",
+            )
+            .with_hint("drop --only-new/--skip, widen --depth, or seed something new"));
+        }
         return Err(FilerError::empty_result("nothing to bundle")
             .with_hint("check the paths and symbol names; `filer search` lists what is indexed"));
     }
@@ -1154,7 +1147,9 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
             name: branch.clone(),
             created: state::now(),
             depth: args.depth,
-            files: files
+            files: state_files
+                .as_ref()
+                .unwrap_or(&files)
                 .iter()
                 .map(|file| StateFile {
                     path: file.rel.clone(),
@@ -1258,6 +1253,213 @@ fn warn_budget(rendered: &bundle::RenderedBundle, context: &Context) {
         rendered.entries.len() + rendered.dropped.len(),
         rendered.max_tokens.unwrap_or_default(),
     ));
+}
+
+/// Groups the method units of one class into a single `methods` entry, so the
+/// bundle, the state file and the picker all talk about the same rows.
+fn group_units(index: &Index, units: Vec<(Unit, u32, Reason)>) -> Vec<BundleFile> {
+    let mut files: Vec<BundleFile> = Vec::new();
+    let mut class_slot: HashMap<(String, String), usize> = HashMap::new();
+    for (unit, depth, reason) in units {
+        let entry = &index.files[unit.file()];
+        match unit {
+            Unit::File(_) => files.push(BundleFile::whole(
+                entry.rel.clone(),
+                entry.abs.clone(),
+                depth,
+                reason,
+            )),
+            Unit::Symbol { symbol, .. } => files.push(BundleFile::excerpt(
+                entry.rel.clone(),
+                entry.abs.clone(),
+                depth,
+                reason,
+                symbol,
+            )),
+            Unit::Member { class, member, .. } => {
+                let key = (entry.rel.clone(), class.clone());
+                match class_slot.get(&key).copied() {
+                    Some(position) => {
+                        let file = &mut files[position];
+                        file.methods.insert(member);
+                        if depth < file.depth {
+                            file.depth = depth;
+                            file.reason = reason;
+                        } else if depth == file.depth && reason == Reason::Seed {
+                            file.reason = reason;
+                        }
+                    }
+                    None => {
+                        class_slot.insert(key, files.len());
+                        files.push(BundleFile::members(
+                            entry.rel.clone(),
+                            entry.abs.clone(),
+                            depth,
+                            reason,
+                            class,
+                            BTreeSet::from([member]),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    files
+}
+
+/// Units the caller already has, at file, symbol or method granularity. Used by
+/// `--skip` and `--only-new` to return the delta of a resolved bundle.
+#[derive(Default)]
+struct Covered {
+    files: std::collections::HashSet<String>,
+    symbols: std::collections::HashSet<(String, String)>,
+    members: std::collections::HashSet<(String, String, String)>,
+}
+
+/// One row of an `--only-new` manifest, in either accepted format.
+enum ManifestUnit {
+    File(String),
+    /// `path::Symbol`, or `path::Class.method` once the index confirms it.
+    Symbol(String, String),
+    Methods(String, String, Vec<String>),
+}
+
+/// `path::Symbol` for a command-line unit, or the whole file for a bare path.
+fn manifest_unit(path: &str, symbol: Option<&str>) -> ManifestUnit {
+    match symbol {
+        Some(symbol) => ManifestUnit::Symbol(path.to_string(), symbol.to_string()),
+        None => ManifestUnit::File(path.to_string()),
+    }
+}
+
+impl Covered {
+    fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.symbols.is_empty() && self.members.is_empty()
+    }
+
+    fn add(&mut self, index: &Index, entry: ManifestUnit) {
+        match entry {
+            ManifestUnit::File(path) => {
+                self.files.insert(path);
+            }
+            ManifestUnit::Symbol(path, symbol) => self.add_symbol(index, path, symbol),
+            ManifestUnit::Methods(path, symbol, methods) => {
+                for member in methods {
+                    self.members.insert((path.clone(), symbol.clone(), member));
+                }
+            }
+        }
+    }
+
+    /// `Class.method` is only a method when the index says the class declares it;
+    /// otherwise it is a symbol name that happens to contain a dot.
+    fn add_symbol(&mut self, index: &Index, path: String, symbol: String) {
+        if let Some((class, member)) = symbol.rsplit_once('.') {
+            let declared = index.by_rel.get(&path).is_some_and(|&position| {
+                let entry = &index.files[position];
+                entry.symbol(class).is_some_and(|found| {
+                    found.members.iter().any(|candidate| {
+                        candidate.kind == MemberKind::Method && candidate.name == member
+                    })
+                })
+            });
+            if declared {
+                self.members
+                    .insert((path, class.to_string(), member.to_string()));
+                return;
+            }
+        }
+        self.symbols.insert((path, symbol));
+    }
+
+    fn covers(&self, unit: &Unit, index: &Index) -> bool {
+        let path = &index.files[unit.file()].rel;
+        if self.files.contains(path) {
+            return true;
+        }
+        match unit {
+            Unit::File(_) => false,
+            Unit::Symbol { symbol, .. } => self.symbols.contains(&(path.clone(), symbol.clone())),
+            Unit::Member { class, member, .. } => {
+                self.symbols.contains(&(path.clone(), class.clone()))
+                    || self
+                        .members
+                        .contains(&(path.clone(), class.clone(), member.clone()))
+            }
+        }
+    }
+}
+
+/// Reads a manifest: JSON if it starts with `{` or `[` (a `bundle --json`
+/// document or its bare `entries` array), otherwise one `path`,
+/// `path::Symbol` or `path::Class.method` per line, with the same `-`/`@FILE`
+/// and comment rules as `--seeds-from`.
+fn read_manifest(source: &str) -> Result<Vec<ManifestUnit>, FilerError> {
+    let text = if source == "-" {
+        std::io::read_to_string(std::io::stdin()).map_err(|error| {
+            FilerError::internal(format!("cannot read manifest from stdin: {error}"))
+        })?
+    } else {
+        let path = Path::new(source.strip_prefix('@').unwrap_or(source));
+        std::fs::read_to_string(path).map_err(|error| {
+            FilerError::file_not_found(format!("cannot read manifest {}: {error}", path.display()))
+        })?
+    };
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return manifest_from_json(&text, source);
+    }
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let (path, symbol) = split_symbol(line);
+            manifest_unit(path, symbol)
+        })
+        .collect())
+}
+
+/// `bundle --json` output, or just its `entries` array. A `methods` entry
+/// covers exactly those methods, a `symbol` entry the whole declaration.
+fn manifest_from_json(text: &str, source: &str) -> Result<Vec<ManifestUnit>, FilerError> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|error| {
+        FilerError::internal(format!("cannot parse manifest {source}: {error}"))
+            .with_hint("pass `filer bundle --json` output, or one `path[::Symbol]` per line")
+    })?;
+    let entries = match value {
+        serde_json::Value::Array(entries) => entries,
+        serde_json::Value::Object(object) => object
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            let path = entry["path"].as_str()?.to_string();
+            let symbol = entry["symbol"].as_str().map(str::to_string);
+            let methods: Vec<String> = entry["methods"]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match entry["scope"].as_str().unwrap_or_default() {
+                "file" => Some(ManifestUnit::File(path)),
+                "methods" => Some(ManifestUnit::Methods(path, symbol?, methods)),
+                _ => match symbol {
+                    Some(symbol) => Some(ManifestUnit::Symbol(path, symbol)),
+                    None => Some(ManifestUnit::File(path)),
+                },
+            }
+        })
+        .collect())
 }
 
 /// Index-wide completeness counters for the `bundle --json`/`show --json`
