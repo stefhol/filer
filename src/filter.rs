@@ -11,6 +11,10 @@
 //! - `--include`/`--exclude` globs are the caller's ad-hoc view, e.g. "only
 //!   `src/**`" or "not `**/legacy/**`". They apply to files, never prune
 //!   directories, and `--exclude` wins over `--include`.
+//! - `--roots` (and `[index] roots` in `.filer/config.toml`) narrows the walk
+//!   itself to a few subdirectories, validated to stay inside the project root.
+
+use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
@@ -28,6 +32,8 @@ pub struct Filter {
     include_names: GlobSet,
     exclude_paths: GlobSet,
     exclude_names: GlobSet,
+    /// Absolute walk roots. Empty means "the project root".
+    roots: Vec<PathBuf>,
 }
 
 impl Default for Filter {
@@ -39,15 +45,18 @@ impl Default for Filter {
             include_names: GlobSet::empty(),
             exclude_paths: GlobSet::empty(),
             exclude_names: GlobSet::empty(),
+            roots: Vec::new(),
         }
     }
 }
 
 impl Filter {
     pub fn new(
+        root: &Path,
         include: &[String],
         exclude: &[String],
         ignore_files: bool,
+        roots: &[String],
     ) -> Result<Self, FilerError> {
         let (include_paths, include_names) = compile(include)?;
         let (exclude_paths, exclude_names) = compile(exclude)?;
@@ -58,7 +67,13 @@ impl Filter {
             include_names,
             exclude_paths,
             exclude_names,
+            roots: walk_roots(root, roots)?,
         })
+    }
+
+    /// Absolute walk roots, empty when the whole project root is walked.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
     }
 
     /// Whether the walk should read `.gitignore` and `.ignore` files.
@@ -77,6 +92,38 @@ impl Filter {
         }
         self.include_paths.is_match(rel) || self.include_names.is_match(name)
     }
+}
+
+/// Resolves `--roots`/`[index] roots` against the project root. A root that does
+/// not exist or escapes the project is an error: silently walking nothing would
+/// make the index look empty for no visible reason.
+fn walk_roots(root: &Path, roots: &[String]) -> Result<Vec<PathBuf>, FilerError> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut resolved: Vec<PathBuf> = Vec::new();
+    for root_name in roots {
+        let path = root.join(root_name);
+        let canonical = path.canonicalize().map_err(|error| {
+            FilerError::internal(format!("root {root_name}: {error}"))
+                .with_hint("roots are directories inside the project root")
+        })?;
+        if !canonical.starts_with(&root) {
+            return Err(FilerError::internal(format!(
+                "root {root_name} is outside {}",
+                root.display()
+            ))
+            .with_hint("roots are directories inside the project root"));
+        }
+        if !canonical.is_dir() {
+            return Err(
+                FilerError::internal(format!("root {root_name} is not a directory"))
+                    .with_hint("roots are directories inside the project root"),
+            );
+        }
+        if !resolved.contains(&canonical) {
+            resolved.push(canonical);
+        }
+    }
+    Ok(resolved)
 }
 
 /// Split the patterns into "has a path separator" (whole path) and "just a
@@ -116,6 +163,7 @@ mod tests {
 
     fn filter(include: &[&str], exclude: &[&str]) -> Filter {
         Filter::new(
+            Path::new("."),
             &include
                 .iter()
                 .map(|glob| glob.to_string())
@@ -125,8 +173,17 @@ mod tests {
                 .map(|glob| glob.to_string())
                 .collect::<Vec<_>>(),
             true,
+            &[],
         )
         .expect("globs compile")
+    }
+
+    fn project(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("filer-filter-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        dir
     }
 
     #[test]
@@ -170,8 +227,37 @@ mod tests {
     }
 
     #[test]
+    fn roots_are_resolved_against_the_project_root() {
+        let root = project("roots");
+        let filter = Filter::new(
+            &root,
+            &[],
+            &[],
+            true,
+            &["src".to_string(), "lib".to_string()],
+        )
+        .expect("roots resolve");
+        assert_eq!(filter.roots().len(), 2);
+        assert!(filter.roots()[0].ends_with("src"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_root_outside_the_project_or_missing_is_an_error() {
+        let root = project("bad-roots");
+        let outside = Filter::new(&root, &[], &[], true, &["..".to_string()]);
+        assert!(outside.is_err(), "escaping the root must fail");
+        let missing = Filter::new(&root, &[], &[], true, &["nope".to_string()]);
+        assert!(missing.is_err(), "a missing root must fail");
+        let file = Filter::new(&root, &[], &[], true, &["src/app".to_string()]);
+        assert!(file.is_ok(), "a subdirectory is fine");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_broken_glob_is_an_internal_error_with_a_hint() {
-        let error = Filter::new(&[needs_escaping()], &[], true).expect_err("bad glob");
+        let error =
+            Filter::new(Path::new("."), &[needs_escaping()], &[], true, &[]).expect_err("bad glob");
         assert_eq!(error.code, crate::error::Code::Internal);
         assert!(error.hint.is_some());
     }

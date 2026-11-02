@@ -2,6 +2,7 @@
 
 mod atomic;
 mod bundle;
+mod config;
 mod csharp;
 mod error;
 mod fe;
@@ -70,6 +71,10 @@ struct Cli {
     /// `$FILER_SESSION` when the flag is absent.
     #[arg(long, global = true, value_name = "ID")]
     session: Option<String>,
+    /// Walk only these subdirectories instead of the whole root. Repeatable or
+    /// comma-separated; each must exist inside the root.
+    #[arg(long, global = true, value_name = "DIR", value_delimiter = ',')]
+    roots: Vec<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -160,9 +165,14 @@ struct BundleArgs {
     /// stay off the command line.
     #[arg(long, value_name = "SOURCE")]
     seeds_from: Vec<String>,
-    /// Import hops to follow. 0 bundles only the given files.
-    #[arg(long, default_value_t = 2)]
-    depth: u32,
+    /// Import hops to follow. 0 bundles only the given files. Defaults to
+    /// `[bundle] depth` in `.filer/config.toml`, else 2.
+    #[arg(long, value_name = "HOPS")]
+    depth: Option<u32>,
+    /// Per-file size limit in bytes; larger files are omitted and listed in
+    /// `omitted`. Defaults to `[bundle] max_file_bytes`, else 1 MiB.
+    #[arg(long, value_name = "BYTES")]
+    max_file_bytes: Option<u64>,
     /// Also include files that share a package with a bundled file.
     #[arg(long)]
     with_same_package: bool,
@@ -269,6 +279,10 @@ struct ShowArgs {
     /// Total budget in tokens (see `bundle --max-tokens`).
     #[arg(long, value_name = "TOKENS", conflicts_with = "max_bytes")]
     max_tokens: Option<u64>,
+    /// Per-file size limit in bytes (see `bundle --max-file-bytes`). Defaults to
+    /// `[bundle] max_file_bytes` in `.filer/config.toml`.
+    #[arg(long, value_name = "BYTES")]
+    max_file_bytes: Option<u64>,
 }
 
 #[derive(Args)]
@@ -327,7 +341,41 @@ fn main() {
         // --help / --version are successful output, not errors.
         Err(error) => error.exit(),
     };
-    let filter = match Filter::new(&cli.include, &cli.exclude, !cli.no_ignore) {
+    // Config file defaults: flag > `.filer/config.toml` > built-in. Resolved once
+    // here so every command sees the same view of the tree.
+    let root = cli
+        .root
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let config = match config::load(&root) {
+        Ok(config) => config,
+        Err(error) => {
+            error.emit(cli.json);
+            std::process::exit(error.code.exit_code());
+        }
+    };
+    let include = if cli.include.is_empty() {
+        config.index.include.clone().unwrap_or_default()
+    } else {
+        cli.include.clone()
+    };
+    let exclude = if cli.exclude.is_empty() {
+        config.index.exclude.clone().unwrap_or_default()
+    } else {
+        cli.exclude.clone()
+    };
+    let roots = if cli.roots.is_empty() {
+        config.index.roots.clone().unwrap_or_default()
+    } else {
+        cli.roots.clone()
+    };
+    let filter = match Filter::new(
+        &root,
+        &include,
+        &exclude,
+        !cli.no_ignore && config.index.ignore.unwrap_or(true),
+        &roots,
+    ) {
         Ok(filter) => filter,
         Err(error) => {
             error.emit(cli.json);
@@ -352,9 +400,14 @@ fn main() {
         json: cli.json,
         quiet: cli.quiet,
         session,
+        depth: config.bundle.depth.unwrap_or(config::DEFAULT_DEPTH),
+        max_file_bytes: config
+            .bundle
+            .max_file_bytes
+            .unwrap_or(bundle::DEFAULT_MAX_FILE_BYTES),
         filter,
     };
-    match run(&context, cli.root, cli.command) {
+    match run(&context, root, cli.command) {
         // A successful run that produced nothing: exit 4 without stderr noise.
         Ok(true) => std::process::exit(EXIT_EMPTY),
         Ok(false) => {}
@@ -371,7 +424,11 @@ struct Context {
     json: bool,
     /// `--quiet`: no summaries and no soft warnings on stderr.
     quiet: bool,
-    /// `--include`/`--exclude`/`--no-ignore`: which files exist for this run.
+    /// Default import hops: `--depth` > `[bundle] depth` > 2.
+    depth: u32,
+    /// Default per-file size limit: `--max-file-bytes` > `[bundle] max_file_bytes`.
+    max_file_bytes: u64,
+    /// `--include`/`--exclude`/`--no-ignore`/`--roots`: which files exist here.
     filter: Filter,
     /// `--session`/`$FILER_SESSION`: per-session state instead of the branch one.
     session: Option<String>,
@@ -400,10 +457,7 @@ impl Context {
 }
 
 /// `Ok(true)` means "succeeded, but the result is empty" (exit code 4).
-fn run(context: &Context, root: Option<PathBuf>, command: Command) -> Result<bool, FilerError> {
-    let root =
-        root.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
+fn run(context: &Context, root: PathBuf, command: Command) -> Result<bool, FilerError> {
     match command {
         Command::Search(args) => search(&root, args, context),
         Command::Resolve(args) => resolve_cmd(&root, args, context),
@@ -956,7 +1010,10 @@ fn score(fqn: &str, rel: &str, names: &[String], query: &str, tokens: &[&str]) -
 fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), FilerError> {
     let index = Index::build_with(root, &context.filter);
     let root = index.root.clone();
-    // `--session` (or `$FILER_SESSION`) switches the state file; `--state` wins.
+    // Flag > `.filer/config.toml` > built-in.
+    let depth = args.depth.unwrap_or(context.depth);
+    let max_file_bytes = args.max_file_bytes.unwrap_or(context.max_file_bytes);
+    // `--state` wins; then `--session` (or `$FILER_SESSION`).
     let state_path = args.state.clone().or_else(|| {
         context
             .session
@@ -1114,7 +1171,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         &index,
         &seeds,
         ResolveOptions {
-            depth: args.depth,
+            depth,
             same_package: args.with_same_package,
             minimal: true,
         },
@@ -1217,7 +1274,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
         Some(BranchBundle {
             name: branch.clone(),
             created: state::now(),
-            depth: args.depth,
+            depth,
             files: state_files
                 .as_ref()
                 .unwrap_or(&files)
@@ -1245,10 +1302,10 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
 
     let bundle_options = BundleOptions {
         title: args.title,
-        depth: args.depth,
+        depth,
+        max_file_bytes,
         max_bytes: max_bytes(args.max_bytes, args.max_tokens),
         appendix,
-        ..Default::default()
     };
     let mut rendered = bundle::describe(&index, &files, &bundle_options);
     rendered.diagnostics = diagnostics;
@@ -2285,9 +2342,9 @@ fn show_cmd(root: &Path, args: ShowArgs, context: &Context) -> Result<(), FilerE
     let bundle_options = BundleOptions {
         title: args.title,
         depth: bundle.depth,
+        max_file_bytes: args.max_file_bytes.unwrap_or(context.max_file_bytes),
         max_bytes: max_bytes(args.max_bytes, args.max_tokens),
         appendix: Some(appendix),
-        ..Default::default()
     };
     let mut rendered = bundle::describe(&index, &files, &bundle_options);
     // `show` re-renders stored units without resolving, so there is no
