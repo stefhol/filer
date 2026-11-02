@@ -53,7 +53,10 @@ The full, copy-paste spec lives in [`examples/lazyvim.lua`](examples/lazyvim.lua
 already carries the defaults below. Drop it into your config and fix `dir`:
 
 ```sh
+# LazyVim / lazy.nvim import dir:
 cp examples/lazyvim.lua ~/.config/nvim/lua/plugins/filer.lua
+# kickstart.nvim (import = "custom.plugins"):
+cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
 ```
 
 ```lua

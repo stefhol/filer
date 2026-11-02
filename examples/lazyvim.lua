@@ -1,6 +1,7 @@
--- Ready-to-use LazyVim spec.
--- Copy to ~/.config/nvim/lua/plugins/filer.lua (or `:LazyExtras`-style local plugin file)
--- and adjust `dir` to where this repo lives.
+-- Ready-to-use lazy.nvim spec (LazyVim and kickstart.nvim).
+-- LazyVim:   copy to ~/.config/nvim/lua/plugins/filer.lua
+-- kickstart: copy to ~/.config/nvim/lua/custom/plugins/filer.lua
+-- Adjust `dir` to where this repo lives.
 return {
   {
     dir = "~/Work/filer",
