@@ -1117,6 +1117,24 @@ The extension registers the eight `filer_*` tools (`bundle`, `show`, `search`, `
 `session_tree`. The documented precedence still holds (`--filer-bin`/`FILER_BIN` over a
 session bin), and the status line shows `<units> units · <root>` after a bundle/show.
 
+### Steering
+
+The tools only help when the model reaches for them, so the extension steers two cases. Both
+are silent until `--version` succeeded, and neither blocks a call:
+
+- Before every run it adds a `tool_guidance` section to the system prompt: load a source file
+you need to understand with `filer_bundle` — the file *and* its import/call closure — instead
+of `read`, and answer "what does this function or class do" with `filer_deps`/`filer_callers`
+on the unit instead of grepping call sites. The `filer_bundle`, `filer_deps`,
+`filer_callers` and `filer_refs` tools carry matching `promptGuidelines`.
+- A full `read` of a file whose extension `src/lang.rs` parses gets one appended paragraph
+pointing at `filer_bundle` for that path. Ranged reads (`offset`/`limit`), images, failed
+reads and unsupported files are left untouched, so quick peeks and `/skill` file loads keep
+working.
+
+Without a usable binary — missing, not `filer`, or timing out — the prompt and every tool
+result are exactly what they are without the extension.
+
 ## How resolution works
 
 1. Walk the tree, skipping `.git`, `.gradle`, `.idea`, `.filer`, `.venv`, `.next`, `.nuxt`,

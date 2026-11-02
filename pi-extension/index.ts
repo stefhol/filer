@@ -22,6 +22,7 @@ import {
   type RootResolver,
 } from "./src/cli";
 import { registerFilerTools } from "./src/tools";
+import { createAvailability, registerFilerGuidance } from "./src/guidance";
 import { registerFilerCommands } from "./src/commands";
 import {
   createSessionOverrides,
@@ -149,9 +150,14 @@ export default function filerExtension(
     binFlag: FILER_BIN_FLAG,
     rootFlag: FILER_ROOT_FLAG,
   });
+  // The tools own the `session_start` probe; it flips this flag, which the
+  // guidance reads so a missing binary means an unchanged prompt (#61).
+  const availability = createAvailability();
   registerFilerTools(pi, {
     adapter,
+    availability,
     binFlag: FILER_BIN_FLAG,
     rootFlag: FILER_ROOT_FLAG,
   });
+  registerFilerGuidance(pi, { availability });
 }

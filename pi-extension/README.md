@@ -37,6 +37,7 @@ pi -e ./pi-extension
 | `src/operations.ts` | typed operations: run, classify the exit status, guard the version, return `{ data, text, warnings }` |
 | `src/commands.ts` | `/filer` subcommands, `M new` diff, why-chain text, status line |
 | `src/session.ts` | `filer-overrides` session state: save, restore, last branch entry wins |
+| `src/guidance.ts` | steering: the `tool_guidance` prompt section and the `read` nudge, both gated on the usability flag |
 | `src/schema.ts` | `schema_version` 1 guard and the shared mismatch message |
 | `src/errors.ts` | exit codes and `{"error": ...}` payloads → `FilerToolError` with a hint |
 | `src/format.ts` | envelope → markdown (the README `jq` recipe) and the 32 KiB / 2000-line cap |
@@ -54,6 +55,10 @@ pi -e ./pi-extension
   quoted, split or interpolated.
 - Bumping `schema_version` in `src/schema.rs` means bumping `SUPPORTED_SCHEMA_VERSION` in
   `src/schema.ts` in the same change.
+- `SOURCE_EXTENSIONS` in `src/guidance.ts` mirrors `Language::from_path` in `src/lang.rs`; a new
+  language needs the extension listed there too, or the model gets no nudge for its files.
+- Steering never blocks a tool: `read` always succeeds and the nudge is appended, so a wrong
+  guess costs one extra sentence, not a failed turn.
 
 CI runs the same commands (`.github/workflows/ci.yml`, job `extension`):
 `cargo build --release --locked`, then `bun test` with `working-directory: pi-extension`.

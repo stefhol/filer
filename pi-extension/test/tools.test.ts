@@ -12,6 +12,7 @@ import { Value } from "typebox/value";
 import { createFilerAdapter } from "../index";
 import type { ProcessRunner, RunResult } from "../src/cli";
 import { renderBundleMarkdown } from "../src/format";
+import { createAvailability, type FilerAvailability } from "../src/guidance";
 import {
   FILER_INSTALL_HINT,
   registerFilerTools,
@@ -139,7 +140,8 @@ function fakeRunner(
 function setup(
   handler: (argv: string[]) => Partial<RunResult> | Promise<Partial<RunResult>>,
   flags: Record<string, string> = {},
-): FakePi & { calls: Recorded[]; ctx: ExtensionToolContext } {
+  availability: FilerAvailability = createAvailability(),
+): FakePi & { calls: Recorded[]; ctx: ExtensionToolContext; availability: FilerAvailability } {
   const pi = fakePi(flags);
   const { runner, calls } = fakeRunner(handler);
   const adapter = createFilerAdapter({
@@ -147,8 +149,8 @@ function setup(
     runner,
     detectGitRoot: async () => "/repo",
   });
-  registerFilerTools(pi.api, { adapter });
-  return { ...pi, calls, ctx: fakeCtx(pi.notifications) };
+  registerFilerTools(pi.api, { adapter, availability });
+  return { ...pi, calls, ctx: fakeCtx(pi.notifications), availability };
 }
 
 async function run<D extends FilerToolDetails = FilerToolDetails>(
@@ -660,6 +662,8 @@ describe("session_start usability check", () => {
     expect(pi.calls[0]!.timeoutMs).toBe(5_000);
     expect(pi.notifications).toEqual([]);
     expect(pi.activeTools).toHaveLength(8);
+    // #61: the guidance binds to this flag, so it must turn on here.
+    expect(pi.availability.usable).toBe(true);
   });
 
   test("a missing binary notifies and removes every filer_* tool", async () => {
@@ -676,6 +680,22 @@ describe("session_start usability check", () => {
     expect(pi.notifications[0]?.message).toContain(FILER_INSTALL_HINT);
     expect(pi.notifications[0]?.message).not.toContain("ENOENT");
     expect(pi.activeTools).toEqual([]);
+    expect(pi.availability.usable).toBe(false);
+  });
+
+  test("a failed probe turns a previously usable flag back off", async () => {
+    const availability = createAvailability();
+    availability.usable = true;
+    const pi = setup(
+      (argv) => (argv.includes("--version") ? { code: null, timedOut: true } : {}),
+      {},
+      availability,
+    );
+    await pi.handlers.get("session_start")!(
+      { type: "session_start", reason: "reload" },
+      pi.ctx,
+    );
+    expect(availability.usable).toBe(false);
   });
 
   test("a binary that is not filer also disables the tools", async () => {

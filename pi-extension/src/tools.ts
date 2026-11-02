@@ -26,6 +26,7 @@ import { Type, type TSchema } from "typebox";
 import type { FilerAdapter } from "../index";
 import { FilerToolError } from "./errors";
 import { capText, type Truncation } from "./format";
+import type { FilerAvailability } from "./guidance";
 import {
   bundle,
   callers,
@@ -75,6 +76,11 @@ export interface FilerToolsDeps {
   binFlag?: string;
   /** `--filer-root` flag name. */
   rootFlag?: string;
+  /**
+   * Flips with the `session_start` probe: `src/guidance.ts` only steers the
+   * model once the binary answered `filer --version`.
+   */
+  availability?: FilerAvailability;
 }
 
 /** The details every tool returns, plus what the renderer prints. */
@@ -448,6 +454,10 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
     parameters: BundleParams,
     namespace: FILER_NAMESPACE,
     annotations: BUNDLE_ANNOTATIONS,
+    promptGuidelines: [
+      "Prefer filer_bundle over read when you need a source file's contents: it returns the file plus its import/call closure.",
+      "To understand a member, seed filer_bundle with `path::Class.method` instead of reading the whole file.",
+    ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
         const result = await runTool(ctx, signal, (context) =>
@@ -607,6 +617,9 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
     namespace: FILER_NAMESPACE,
     annotations: READ_ONLY,
     outputSchema: DepsOutput,
+    promptGuidelines: [
+      "To learn what a function, method or class does, call filer_deps on its unit (`path::Symbol`) before grepping its body or call sites.",
+    ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
         const result = await runTool(ctx, signal, (context) =>
@@ -655,6 +668,9 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
     namespace: FILER_NAMESPACE,
     annotations: READ_ONLY,
     outputSchema: CallersOutput,
+    promptGuidelines: [
+      "Call filer_callers to find who reaches a symbol instead of grepping for its name; results are call edges, nearest first.",
+    ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
         const result = await runTool(ctx, signal, (context) =>
@@ -746,6 +762,9 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
     namespace: FILER_NAMESPACE,
     annotations: READ_ONLY,
     outputSchema: RefsOutput,
+    promptGuidelines: [
+      "Use filer_refs for every recorded use and call of a name; bodies, comments and string literals are out of scope, so it complements a content search rather than replacing it.",
+    ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
         const result = await runTool(ctx, signal, (context) =>
@@ -832,7 +851,11 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
     const check = await deps.adapter
       .client({ ...resolved, timeoutMs: VERSION_TIMEOUT_MS })
       .run(["--version"]);
-    if (check.code === 0 && /\bfiler\b/i.test(check.stdout)) return;
+    const usable = check.code === 0 && /\bfiler\b/i.test(check.stdout);
+    // #61: unset on failure, so the model is never steered to a tool that is
+    // about to be removed from the active set.
+    if (deps.availability !== undefined) deps.availability.usable = usable;
+    if (usable) return;
 
     ctx.ui.notify(
       `${FILER_INSTALL_HINT} (tried \`${resolved.bin}\`)`,
