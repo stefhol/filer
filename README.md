@@ -143,6 +143,7 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 | `:FilerSearch` | Telescope picker. `<Tab>` multi-selects, `<CR>` bundles. |
 | `:FilerHere` | Bundles the current buffer's file with its imports. |
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute). |
+| `:FilerShow` | Re-renders the saved bundle (current file contents) without re-resolving. |
 | `:FilerReset` | Forgets the current bundle state; the next bundle starts empty. |
 
 In the bundle buffer: `y` yanks, `q` closes. The buffer is `nofile` and never written to
@@ -194,6 +195,7 @@ Cleaning up:
 | Switched branch | Nothing — a branch mismatch is detected and the old bundle is dropped, with a notice |
 | Want a one-off bundle, no state | `:FilerBundle` with `opts.state = false`, or `filer bundle` without `--state` |
 | See what is stored | `filer state` |
+| Reopen what you bundled yesterday | `:FilerShow` (or `filer show`) |
 
 `.filer/.gitignore` containing `*` is created automatically, so the state never shows up in
 `git status` and your own `.gitignore` is left alone. Detached HEADs are recorded as
@@ -208,6 +210,8 @@ filer --root ~/code/demo deps src/main/java/com/example/app/Application.java
 filer --root ~/code/demo bundle --depth 2 --with-config \
       src/main/java/com/example/app/Application.java > bundle.md
 filer --root ~/code/demo index                         # cache stats
+filer --root ~/code/demo show                          # re-render the saved bundle
+filer --root ~/code/demo show --out bundle.md           # ... into a file
 filer --root ~/code/demo state                         # what is in the bundle?
 filer --root ~/code/demo state --clear                 # forget it
 
@@ -218,7 +222,12 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C
 ```
 
 `bundle` flags: `--depth N` (0 = only the given files), `--with-same-package`,
-`--with-config`, `--title`, `--out FILE`. Default depth is 2.
+`--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`. Default depth is 2.
+
+`show` takes no files: it reads the state file (default `<root>/.filer/bundle.toml`), re-reads
+the files from disk and renders the same bundle again — useful after a restart, or to pipe a
+bundle into another tool. Files that vanished since are dropped with a notice; state from a
+different branch is shown with a warning.
 
 ## How resolution works
 

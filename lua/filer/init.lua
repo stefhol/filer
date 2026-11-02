@@ -55,7 +55,9 @@ function M.root()
     "gradlew",
     "mvnw",
   }
-  return vim.fs.root(0, markers) or vim.fn.getcwd()
+  -- The bundle buffer has no path of its own, so fall back to the root the
+  -- last bundle was built from before giving up on the cwd.
+  return vim.fs.root(0, markers) or M._last_root or vim.fn.getcwd()
 end
 
 --- Where the bundle state lives for `root`.
@@ -237,7 +239,7 @@ function M.bundle(paths, opts)
   if stderr ~= "" then
     notify((stderr:gsub("\n", " ")))
   end
-  M.open(stdout, opts)
+  M.open(stdout, vim.tbl_extend("force", opts, { root = root }))
 end
 
 --- Bundles the file in the current buffer together with its imports.
@@ -249,6 +251,27 @@ function M.here(opts)
     return
   end
   M.bundle({ name }, opts)
+end
+
+--- Re-renders the saved bundle (same files, current contents) into the buffer.
+function M.show(opts)
+  opts = opts or {}
+  local root = opts.root or M.root()
+  local args = { "show", "--root", root, "--state", M.state_path(root) }
+  if opts.title then
+    table.insert(args, "--title")
+    table.insert(args, opts.title)
+  end
+
+  local stdout, stderr, code = run(args, root)
+  if code ~= 0 then
+    notify(stderr ~= "" and stderr or "nothing bundled yet", vim.log.levels.WARN)
+    return
+  end
+  if stderr ~= "" then
+    notify((stderr:gsub("\n", " ")))
+  end
+  M.open(stdout, vim.tbl_extend("force", opts, { root = root }))
 end
 
 --- Drops the saved bundle state, so the next bundle starts empty.
@@ -299,6 +322,7 @@ function M.open(text, opts)
     table.remove(lines)
   end
 
+  M._last_root = opts.root or M._last_root
   local buf = M.find_bundle_buffer()
   local win = buf and vim.fn.bufwinid(buf) or -1
 

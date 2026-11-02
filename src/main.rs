@@ -39,6 +39,8 @@ enum Command {
     Bundle(BundleArgs),
     /// Print the import closure of a single file.
     Deps(DepsArgs),
+    /// Re-render the saved bundle from the state file.
+    Show(ShowArgs),
     /// Build the index cache and print stats.
     Index,
     /// Show or clear the saved bundle state.
@@ -103,6 +105,19 @@ struct DepsArgs {
 }
 
 #[derive(Args)]
+struct ShowArgs {
+    /// State file. Defaults to <root>/.filer/bundle.toml.
+    #[arg(long, value_name = "FILE")]
+    state: Option<PathBuf>,
+    /// Bundle title shown in the header.
+    #[arg(long)]
+    title: Option<String>,
+    /// Write the bundle to a file instead of stdout.
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct StateArgs {
     /// Delete the state file.
     #[arg(long)]
@@ -123,6 +138,7 @@ fn main() {
         Command::Search(args) => search(&root, args),
         Command::Bundle(args) => bundle_cmd(&root, args),
         Command::Deps(args) => deps(&root, args),
+        Command::Show(args) => show_cmd(&root, args),
         Command::Index => index_cmd(&root),
         Command::State(args) => state_cmd(&root, args),
     }
@@ -397,6 +413,102 @@ fn deps(root: &Path, args: DepsArgs) {
 
     for import in resolve::unresolved_imports(&index, position) {
         eprintln!("unresolved (probably JDK/third-party): {import}");
+    }
+}
+
+/// Re-renders the bundle from the state file: same files, same depths and
+/// reasons, current file contents.
+fn show_cmd(root: &Path, args: ShowArgs) {
+    let index = Index::build(root);
+    let root = index.root.clone();
+    let path = args
+        .state
+        .clone()
+        .unwrap_or_else(|| state::default_path(&root));
+
+    let Some(saved) = state::load(&path) else {
+        eprintln!(
+            "filer: no bundle state at {} — bundle something first",
+            path.display()
+        );
+        std::process::exit(1);
+    };
+
+    if saved.is_stale(&root) {
+        eprintln!(
+            "filer: state is from branch {} (now {}), showing it anyway",
+            saved.branch,
+            state::current_branch(&root)
+        );
+    }
+
+    let mut files: Vec<BundleFile> = Vec::new();
+    let mut shown = saved.clone();
+    shown.files.clear();
+
+    for file in &saved.files {
+        let abs = root.join(&file.path);
+        let reason = Reason::from_str(&file.reason);
+        match index.by_rel.get(&file.path) {
+            Some(&position) => files.push(BundleFile {
+                rel: index.files[position].rel.clone(),
+                abs: index.files[position].abs.clone(),
+                depth: file.depth,
+                reason,
+            }),
+            None if abs.is_file() => files.push(BundleFile {
+                rel: file.path.clone(),
+                abs,
+                depth: file.depth,
+                reason,
+            }),
+            None => {
+                eprintln!("filer: dropping {}: no longer in the project", file.path);
+                continue;
+            }
+        }
+        shown.files.push(file.clone());
+    }
+
+    if files.is_empty() {
+        eprintln!("filer: bundle is empty ({})", path.display());
+        std::process::exit(1);
+    }
+
+    let bundle_options = BundleOptions {
+        title: args.title,
+        depth: saved.depth,
+        appendix: Some(state::to_toml(&shown)),
+        ..Default::default()
+    };
+    let markdown = bundle::render(&index, &files, &bundle_options);
+
+    match args.out {
+        Some(out) => {
+            if let Err(error) = std::fs::write(&out, &markdown) {
+                eprintln!("filer: cannot write {}: {error}", out.display());
+                std::process::exit(1);
+            }
+            eprintln!(
+                "filer: wrote {} ({} files from {})",
+                out.display(),
+                files.len(),
+                path.display()
+            );
+        }
+        None => {
+            print!("{markdown}");
+            eprintln!(
+                "filer: {} files from {} (branch {})",
+                files.len(),
+                path.display(),
+                if shown.branch.is_empty() {
+                    "none"
+                } else {
+                    &shown.branch
+                }
+            );
+        }
     }
 }
 

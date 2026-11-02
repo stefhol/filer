@@ -15,6 +15,10 @@ vim.api.nvim_create_user_command("FilerHere", function()
   filer().here()
 end, { desc = "filer: bundle current file with its imports" })
 
+vim.api.nvim_create_user_command("FilerShow", function()
+  filer().show()
+end, { desc = "filer: reopen the saved bundle" })
+
 vim.api.nvim_create_user_command("FilerReset", function()
   filer().reset()
 end, { desc = "filer: forget the current bundle state" })
