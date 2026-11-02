@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+
+  build:
+    needs: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/filer dist/
+          cp README.md dist/
+          tar -C dist -cJf filer-x86_64-unknown-linux-gnu.tar.xz filer README.md
+          sha256sum filer-x86_64-unknown-linux-gnu.tar.xz > filer-x86_64-unknown-linux-gnu.tar.xz.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: filer-x86_64-unknown-linux-gnu
+          path: |
+            filer-x86_64-unknown-linux-gnu.tar.xz
+            filer-x86_64-unknown-linux-gnu.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 90
