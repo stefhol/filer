@@ -50,6 +50,9 @@ support:
   (`./x`, `../y.js`), extensionless imports, directory `index` files, `.js` specifiers that
   point at a `.ts` source, dynamic `import()` and CommonJS `require()`. Vue `<script>` and
   `<script setup>` blocks are extracted and parsed as TypeScript/JavaScript.
+- Resolves `tsconfig.json` / `jsconfig.json` path aliases and `baseUrl` imports, so
+  `import { User } from "@/model/user"` pulls `src/model/user.ts` in when the config says
+  `"paths": { "@/*": ["src/*"] }`. See [TypeScript config aliases](#typescript-config-aliases).
 - Follows type *usages* too, so a class that references a sibling in its own package — which
   Java, Scala, Kotlin, Groovy or C# needs no import for, e.g. `indexOps(DemoDocument.class)`,
   `DemoDocument.create()` or `new DemoDocument()` — still pulls that file in. Rust type
@@ -86,7 +89,8 @@ support:
 Things it deliberately does not do: compile your project, read `pom.xml` / `build.sbt` /
 `*.csproj` / `Cargo.toml` / `package.json` dependencies, or pretend to resolve libraries. JDK,
 Scala stdlib, npm packages, NuGet packages, Rust crates and other third-party imports are
-simply reported as unresolved (`tsconfig` path aliases are not read). Imports only resolve
+simply reported as unresolved; `node_modules`, package `exports`/`imports` and
+`moduleResolution` variants are not consulted. Imports only resolve
 within the same language family (JVM-ish languages with each other, TS/JS/Vue with each
 other, Rust with itself), never across.
 
@@ -322,11 +326,39 @@ symbols (and every other language) keeps the import/type closure.
 - TS/JS: type annotations on fields, parameters and locals type receivers, and module imports
   (`./Repo`) resolve classes. JavaScript has no annotations, so only `this.x()` and bare calls
   create edges.
+- TS/JS/Vue imports that are not relative go through the nearest `tsconfig.json` /
+  `jsconfig.json`: `paths` aliases first, then `baseUrl`. Whatever the config does not map
+  stays third-party. See [TypeScript config aliases](#typescript-config-aliases).
 - Rust: methods from every `impl Type` block attach to the type; `self`, `self.field`,
   parameter and local types resolve receivers; `Self::`/`Type::` resolve associated calls;
   free functions resolve by unique name across the crate.
 - Vue is never sliced: its script offsets are relative to the extracted `<script>` block, so
   it is always bundled whole.
+
+### TypeScript config aliases
+
+`tsconfig.json` and `jsconfig.json` are read as JSONC (comments and trailing commas are
+fine), and only what module resolution needs: `compilerOptions.baseUrl`,
+`compilerOptions.paths` and relative `extends` chains.
+
+- The **nearest** config for the importing file wins: the one in its directory, else the one
+  in the closest ancestor. That is what makes a monorepo work — `web/tsconfig.json` can map
+  `@/*` somewhere else than the root config.
+- Aliases feed the same probes as relative imports: exact file, `.ts`, `.tsx`, `.js`, `.jsx`,
+  `.mjs`, `.cjs`, `.vue`, and `<dir>/index.*`. A `.js` alias target prefers a `.ts` source
+  next to it.
+- Keys: an exact key wins over a wildcard key, wildcard keys are matched by longest prefix
+  (TypeScript precedence), and multiple targets are tried in declaration order.
+- Without `paths`, a non-relative import is tried against `baseUrl`
+  (`import { x } from "src/lib/x"`).
+- Candidates that escape the project root are dropped, and an alias only ever resolves into
+  the Web family: pointing one at a `.java` file does not pull a JVM file in.
+- Not supported: package-name `extends` (`@tsconfig/node20`, which lives in `node_modules`),
+  project `references`, `rootDirs`, and `moduleResolution` variants. Bare specifiers that no
+  alias matches (`react`, `@scope/pkg`, `#imports`) stay unresolved, as before.
+
+Configs are re-read on every run, so editing one takes effect without clearing the index
+cache.
 
 Excerpts are rendered as `### path :: name (line N)` and contain the declaration plus the
 file header (package/imports/`using`s, one time) so they stand alone. Braces left open by
@@ -966,8 +998,11 @@ run. `filer index --update` never resolves, bundles or touches the bundle state.
 5. For a TypeScript/JavaScript module import, join the specifier onto the importing file's
    directory, reject paths that escape the root, then probe in order: the exact path, TS
    extensions (`.ts`, `.tsx`, then JS `.js`, `.jsx`, `.mjs`, `.cjs`, then `.vue`), and
-   `<dir>/index.*`. A `.js` specifier prefers the matching `.ts`/`.tsx` source. Bare
-   specifiers (`react`) are treated as third-party.
+   `<dir>/index.*`. A `.js` specifier prefers the matching `.ts`/`.tsx` source. A
+   non-relative specifier goes through the nearest `tsconfig.json`/`jsconfig.json` first
+   (`paths` aliases, then `baseUrl`; see
+   [TypeScript config aliases](#typescript-config-aliases)); whatever the config does not map
+   (`react`) is treated as third-party.
    For a Rust import, expand the `use` tree, then resolve the longest module prefix against
    the Cargo layout: `crate::` starts at the nearest `src` directory, `self::` at the current
    module directory, `super::` one level up, and `mod foo;` uses the same relative lookup.

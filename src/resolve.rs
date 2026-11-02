@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::{FileEntry, Index};
 use crate::lang::{Family, Granularity, Import, ImportKind, Member, MemberKind, Receiver, Symbol};
+use crate::tsconfig::TsConfig;
 
 /// Extensions tried when resolving a TypeScript/JavaScript module specifier,
 /// in preference order (TS sources win over compiled JS next to them).
@@ -136,13 +137,13 @@ fn package_files(index: &Index, package: &str, family: Option<Family>) -> Vec<us
 ///
 /// Static member imports and nested types (`a.b.C.Inner`) are handled by
 /// trimming trailing segments until a known type name is hit. Module imports
-/// (`./x`, `../y.js`) go through [`resolve_module`].
+/// (`./x`, `../y.js`, `@/model/user`) go through [`resolve_module`].
 pub fn resolve_import(index: &Index, file: &FileEntry, import: &Import) -> Vec<usize> {
-    if import.kind == ImportKind::Module {
-        return resolve_module(index, &file.rel, &import.path);
-    }
-
     let family = family_of(file);
+
+    if import.kind == ImportKind::Module {
+        return resolve_module(index, &file.rel, &import.path, family);
+    }
 
     if family == Some(Family::Rust) {
         return resolve_rust_import(index, file, import);
@@ -216,35 +217,67 @@ pub fn resolve_import(index: &Index, file: &FileEntry, import: &Import) -> Vec<u
     Vec::new()
 }
 
-/// Resolves a relative module specifier against the index, with the same
-/// probing rules TypeScript/Node use: extensionless imports, directory index
-/// files, and `.js` specifiers that point at a `.ts` source.
-fn resolve_module(index: &Index, from_rel: &str, specifier: &str) -> Vec<usize> {
-    if !(specifier.starts_with("./") || specifier.starts_with("../")) {
-        return Vec::new();
-    }
-    let Some(base) = normalize_module(from_rel, specifier) else {
-        return Vec::new();
+/// Resolves a module specifier against the index, with the same probing rules
+/// TypeScript/Node use: extensionless imports, directory index files, and
+/// `.js` specifiers that point at a `.ts` source.
+///
+/// Relative specifiers are joined onto the importing file's directory.
+/// Non-relative ones are looked up through the nearest `tsconfig.json` /
+/// `jsconfig.json` (`paths` aliases, then `baseUrl`), and only for the Web
+/// family: an alias never pulls in a JVM file. Anything the config does not
+/// map stays unresolved, which is what third-party packages look like.
+fn resolve_module(
+    index: &Index,
+    from_rel: &str,
+    specifier: &str,
+    family: Option<Family>,
+) -> Vec<usize> {
+    let bases: Vec<String> = if specifier.starts_with("./") || specifier.starts_with("../") {
+        normalize_module(from_rel, specifier)
+            .into_iter()
+            .filter(|base| !base.is_empty())
+            .collect()
+    } else {
+        if family != Some(Family::Web) {
+            return Vec::new();
+        }
+        let Some(config) = TsConfig::nearest(&index.tsconfigs, from_rel) else {
+            return Vec::new();
+        };
+        config.candidates(specifier)
     };
-    if base.is_empty() {
-        return Vec::new();
-    }
 
+    // Several `paths` targets (and then `baseUrl`) can match one specifier;
+    // the first base that probes to a file wins, in declaration order.
+    for base in bases {
+        if let Some(position) = probe_module(index, &base, family) {
+            return vec![position];
+        }
+    }
+    Vec::new()
+}
+
+/// Probes one module base with the TypeScript/Node extension rules, skipping
+/// files outside the importer's language family.
+fn probe_module(index: &Index, base: &str, family: Option<Family>) -> Option<usize> {
+    if base.is_empty() {
+        return None;
+    }
     let mut candidates: Vec<String> = Vec::new();
-    let extension = Path::new(&base)
+    let extension = Path::new(base)
         .extension()
         .and_then(|extension| extension.to_str());
     match extension {
         // `./x.js` should find `x.ts` next to it, then `x.js` itself.
         Some(extension @ ("js" | "jsx" | "mjs" | "cjs")) => {
-            let stem = base.strip_suffix(&format!(".{extension}")).unwrap_or(&base);
+            let stem = base.strip_suffix(&format!(".{extension}")).unwrap_or(base);
             for candidate_extension in MODULE_EXTENSIONS {
                 candidates.push(format!("{stem}.{candidate_extension}"));
             }
-            candidates.push(base.clone());
+            candidates.push(base.to_string());
         }
         // An explicit `.ts`/`.vue`/... specifier keeps its own file first.
-        Some(_) => candidates.push(base.clone()),
+        Some(_) => candidates.push(base.to_string()),
         None => {
             for candidate_extension in MODULE_EXTENSIONS {
                 candidates.push(format!("{base}.{candidate_extension}"));
@@ -258,10 +291,12 @@ fn resolve_module(index: &Index, from_rel: &str, specifier: &str) -> Vec<usize> 
 
     for candidate in candidates {
         if let Some(&position) = index.by_rel.get(&candidate) {
-            return vec![position];
+            if compatible(index, position, family) {
+                return Some(position);
+            }
         }
     }
-    Vec::new()
+    None
 }
 
 /// Joins a relative specifier onto the importing file's directory and collapses
@@ -3343,6 +3378,125 @@ mod tests {
         assert!(resolve_web(&index, 0, "../outside").is_empty());
         assert!(resolve_web(&index, 0, "./missing").is_empty());
         assert!(resolve_web(&index, 1, "../../../outside").is_empty());
+    }
+
+    fn config(dir: &str, base_url: Option<&str>, paths: &[(&str, &[&str])]) -> TsConfig {
+        TsConfig {
+            dir: dir.to_string(),
+            base_url: base_url.map(str::to_string),
+            paths: paths
+                .iter()
+                .map(|(key, targets)| {
+                    (
+                        (*key).to_string(),
+                        targets.iter().map(|target| (*target).to_string()).collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The corpus from the issue: `@/*` and `~lib/*` aliases over `src/`.
+    fn alias_fixture() -> Index {
+        let mut index = index_from(vec![
+            entry("src/web/app.ts", None, &[], vec![]),
+            entry("src/model/user.ts", None, &["User"], vec![]),
+            entry("src/lib/index.ts", None, &[], vec![]),
+            entry("src/components/App.vue", None, &[], vec![]),
+            entry("src/legacy.ts", None, &[], vec![]),
+            entry("src/legacy.js", None, &[], vec![]),
+            entry("src/model/Model.java", None, &["Model"], vec![]),
+        ]);
+        index.tsconfigs = vec![config(
+            "",
+            Some(""),
+            &[("@/*", &["src/*"]), ("~lib/*", &["src/lib/*"])],
+        )];
+        index
+    }
+
+    #[test]
+    fn tsconfig_aliases_feed_the_module_probes() {
+        let index = alias_fixture();
+        // The issue's example: `import { User } from "@/model/user"`.
+        assert_eq!(resolve_web(&index, 0, "@/model/user"), vec![1]);
+        // Extensionless files, directory `index.*`, and components.
+        assert_eq!(resolve_web(&index, 0, "~lib/index"), vec![2]);
+        assert_eq!(resolve_web(&index, 0, "@/components/App"), vec![3]);
+        assert_eq!(resolve_web(&index, 0, "@/components/App.vue"), vec![3]);
+        // A `.js` alias target prefers the `.ts` source next to it.
+        assert_eq!(resolve_web(&index, 0, "@/legacy.js"), vec![4]);
+    }
+
+    #[test]
+    fn tsconfig_base_url_resolves_non_relative_imports() {
+        let mut index = index_from(vec![
+            entry("src/app.ts", None, &[], vec![]),
+            entry("src/lib/tax.ts", None, &[], vec![]),
+            entry("src/pages/home.ts", None, &[], vec![]),
+        ]);
+        index.tsconfigs = vec![config("", Some("src"), &[])];
+        assert_eq!(resolve_web(&index, 0, "lib/tax"), vec![1]);
+        assert_eq!(resolve_web(&index, 0, "pages/home"), vec![2]);
+        // No alias, no file: the package stays third-party.
+        assert!(resolve_web(&index, 0, "react").is_empty());
+        assert!(resolve_web(&index, 0, "@scope/pkg").is_empty());
+    }
+
+    #[test]
+    fn tsconfig_exact_keys_win_and_targets_are_tried_in_order() {
+        let mut index = index_from(vec![
+            entry("src/app.ts", None, &[], vec![]),
+            entry("src/special.ts", None, &[], vec![]),
+            entry("src/exact/special.ts", None, &[], vec![]),
+            entry("generated/other.ts", None, &[], vec![]),
+        ]);
+        index.tsconfigs = vec![config(
+            "",
+            Some(""),
+            &[
+                ("@/special", &["src/exact/special"]),
+                ("@/*", &["missing/*", "generated/*"]),
+            ],
+        )];
+        // The exact key beats the wildcard, even though `src/special.ts` exists.
+        assert_eq!(resolve_web(&index, 0, "@/special"), vec![2]);
+        // The first wildcard target does not exist, so the second one wins.
+        assert_eq!(resolve_web(&index, 0, "@/other"), vec![3]);
+    }
+
+    #[test]
+    fn tsconfig_aliases_stay_inside_the_web_family() {
+        let index = alias_fixture();
+        // An alias pointing at a `.java` file must not resolve.
+        assert!(resolve_web(&index, 0, "@/model/Model.java").is_empty());
+        assert!(resolve_web(&index, 0, "@/model/Model").is_empty());
+    }
+
+    #[test]
+    fn nearest_tsconfig_applies_to_its_directory() {
+        let mut index = index_from(vec![
+            entry("src/app.ts", None, &[], vec![]),
+            entry("web/app.ts", None, &[], vec![]),
+            entry("src/lib/root.ts", None, &[], vec![]),
+            entry("web/lib/web.ts", None, &[], vec![]),
+        ]);
+        index.tsconfigs = vec![
+            config("", Some(""), &[("@/*", &["src/*"])]),
+            config("web", Some(""), &[("@/*", &["web/lib/*"])]),
+        ];
+        assert_eq!(resolve_web(&index, 0, "@/lib/root"), vec![2]);
+        assert_eq!(resolve_web(&index, 1, "@/web"), vec![3]);
+        assert!(resolve_web(&index, 1, "@/root").is_empty());
+    }
+
+    #[test]
+    fn tsconfig_aliases_do_not_feed_relative_probes() {
+        let index = alias_fixture();
+        // Relative specifiers keep working with a config present, and a
+        // relative miss never falls back to an alias.
+        assert_eq!(resolve_web(&index, 0, "../model/user"), vec![1]);
+        assert!(resolve_web(&index, 0, "../missing").is_empty());
     }
 
     #[test]

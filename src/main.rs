@@ -17,6 +17,7 @@ mod rust;
 mod scala;
 mod schema;
 mod state;
+mod tsconfig;
 mod web;
 
 use std::collections::{BTreeSet, HashMap};
