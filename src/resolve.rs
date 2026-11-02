@@ -621,6 +621,100 @@ impl Unit {
     }
 }
 
+/// One resolved dependency edge. `line` is the call site for `Reason::Call`;
+/// for import/type edges it is the source member/symbol line (0 for a whole
+/// file, which has no single line).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edge {
+    pub to: Unit,
+    pub reason: Reason,
+    pub line: u32,
+}
+
+/// Something filer declined to include. Collected during the graph build;
+/// rendered by issue #10, not by this ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiagnosticKind {
+    UnresolvedCall,
+    UnknownReceiver,
+    MethodNotFound,
+    TypeOnlySkipped,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // read by #10; built here so it is not discarded
+pub struct Diagnostic {
+    pub kind: DiagnosticKind,
+    pub path: String,
+    pub line: u32,
+    pub name: String,
+}
+
+#[derive(Debug, Default)]
+pub struct Graph {
+    /// Outgoing edges for every expanded unit, in resolution order.
+    pub out: HashMap<Unit, Vec<Edge>>,
+    #[allow(dead_code)] // rendered by #10
+    pub diagnostics: Vec<Diagnostic>,
+    inc: Option<HashMap<Unit, Vec<Edge>>>,
+}
+
+impl Graph {
+    /// Reverse edges are only needed for callers/`--direction in`/ranking, so
+    /// they are built on first use; the default closure pays nothing for them.
+    #[allow(dead_code)]
+    pub fn reverse(&mut self) -> &HashMap<Unit, Vec<Edge>> {
+        if self.inc.is_none() {
+            let mut inc: HashMap<Unit, Vec<Edge>> = HashMap::new();
+            for (from, edges) in &self.out {
+                for edge in edges {
+                    inc.entry(edge.to.clone()).or_default().push(Edge {
+                        to: from.clone(),
+                        reason: edge.reason,
+                        line: edge.line,
+                    });
+                }
+            }
+            self.inc = Some(inc);
+        }
+        self.inc.as_ref().expect("inc was just built")
+    }
+
+    #[allow(dead_code)]
+    pub fn callers(&mut self, unit: &Unit) -> &[Edge] {
+        self.reverse().get(unit).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// BFS over the materialized `out` edges. This is the traversal
+    /// `closure_units` used to perform while resolving.
+    fn closure(&self, seeds: &[Unit]) -> Vec<(Unit, u32, Reason)> {
+        let mut depth_of: HashMap<Unit, u32> = HashMap::new();
+        let mut order: Vec<(Unit, u32, Reason)> = Vec::new();
+        let mut queue: VecDeque<Unit> = VecDeque::new();
+        for seed in seeds {
+            if depth_of.insert(seed.clone(), 0).is_none() {
+                order.push((seed.clone(), 0, Reason::Seed));
+                queue.push_back(seed.clone());
+            }
+        }
+        while let Some(current) = queue.pop_front() {
+            let depth = depth_of[&current];
+            for edge in self.out.get(&current).into_iter().flatten() {
+                if depth_of.contains_key(&edge.to) {
+                    continue;
+                }
+                let next = depth + 1;
+                depth_of.insert(edge.to.clone(), next);
+                order.push((edge.to.clone(), next, edge.reason));
+                queue.push_back(edge.to.clone());
+            }
+        }
+        drop_covered_symbols(order)
+    }
+}
+
 fn import_reason(kind: ImportKind) -> Reason {
     match kind {
         ImportKind::Type => Reason::Import,
@@ -819,16 +913,19 @@ fn symbol_neighbours(
     neighbours
 }
 
-/// Neighbours of one method excerpt: the class's own type dependencies and
-/// imports, plus the methods this member calls.
-fn member_neighbours(
-    index: &Index,
-    file_position: usize,
-    class_name: &str,
-    member_name: &str,
-    options: ResolveOptions,
-) -> Vec<(Unit, Reason)> {
-    let Some(file) = index.files.get(file_position) else {
+/// Neighbours of one method excerpt: the methods this member calls. The class
+/// shell already carries package/imports/fields/signatures, so member bundles
+/// follow calls only.
+fn member_neighbours(index: &Index, unit: &Unit, diagnostics: &mut Vec<Diagnostic>) -> Vec<Edge> {
+    let Unit::Member {
+        file: file_position,
+        class: class_name,
+        member: member_name,
+    } = unit
+    else {
+        return Vec::new();
+    };
+    let Some(file) = index.files.get(*file_position) else {
         return Vec::new();
     };
     let Some(class) = file.symbol(class_name) else {
@@ -837,25 +934,40 @@ fn member_neighbours(
     let Some(member) = class
         .members
         .iter()
-        .find(|member| member.kind == MemberKind::Method && member.name == member_name)
+        .find(|member| member.kind == MemberKind::Method && member.name == *member_name)
     else {
         return Vec::new();
     };
     let family = family_of(file);
-    let _ = options;
 
-    // Member bundles are call-path driven: the class shell already carries the
-    // package, imports, fields and signatures, so only methods that are
-    // actually called pull in other files.
-    let mut neighbours = Vec::new();
+    let mut edges = Vec::new();
     for call in &member.calls {
-        for unit in resolve_call(index, file_position, file, class, member, call, family) {
-            neighbours.push((unit, Reason::Call));
-        }
+        edges.extend(resolve_call(
+            index,
+            *file_position,
+            file,
+            class,
+            member,
+            call,
+            family,
+            diagnostics,
+        ));
     }
-    neighbours
+    edges
 }
 
+fn call_edges(units: Vec<Unit>, line: u32) -> Vec<Edge> {
+    units
+        .into_iter()
+        .map(|to| Edge {
+            to,
+            reason: Reason::Call,
+            line,
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)] // file, class, member, call, diagnostics
 fn resolve_call(
     index: &Index,
     file_position: usize,
@@ -864,7 +976,11 @@ fn resolve_call(
     member: &Member,
     call: &crate::lang::Call,
     family: Option<Family>,
-) -> Vec<Unit> {
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<Edge> {
+    let line = call.line as u32;
+    let path = file.rel.clone();
+
     match &call.receiver {
         Receiver::Bare | Receiver::This => {
             let mut visited = HashSet::new();
@@ -882,9 +998,28 @@ fn resolve_call(
             if found.is_empty() && family == Some(Family::Rust) {
                 found = rust_function_units(index, &call.name, family, Some(file_position));
             }
-            found
+            if found.is_empty() {
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::UnresolvedCall,
+                    path,
+                    line,
+                    name: call.name.clone(),
+                });
+            }
+            call_edges(found, line)
         }
-        Receiver::Super => super_methods(index, file_position, class, &call.name, family),
+        Receiver::Super => {
+            let found = super_methods(index, file_position, class, &call.name, family);
+            if found.is_empty() {
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::MethodNotFound,
+                    path,
+                    line,
+                    name: call.name.clone(),
+                });
+            }
+            call_edges(found, line)
+        }
         Receiver::Name(name) => {
             let type_name = member
                 .params
@@ -903,7 +1038,7 @@ fn resolve_call(
 
             if type_name == class.name {
                 let mut visited = HashSet::new();
-                return find_methods(
+                let found = find_methods(
                     index,
                     file_position,
                     class,
@@ -911,14 +1046,45 @@ fn resolve_call(
                     family,
                     &mut visited,
                 );
+                if found.is_empty() {
+                    diagnostics.push(Diagnostic {
+                        kind: DiagnosticKind::MethodNotFound,
+                        path,
+                        line,
+                        name: call.name.clone(),
+                    });
+                }
+                return call_edges(found, line);
             }
+
             let Some((target_file, target_index)) = resolve_class(index, file, &type_name, family)
             else {
                 if family == Some(Family::Rust) {
-                    return rust_function_units(index, &call.name, family, Some(file_position));
+                    let found = rust_function_units(index, &call.name, family, Some(file_position));
+                    if found.is_empty() {
+                        diagnostics.push(Diagnostic {
+                            kind: DiagnosticKind::UnresolvedCall,
+                            path,
+                            line,
+                            name: type_name.clone(),
+                        });
+                    }
+                    return call_edges(found, line);
                 }
+                let kind = if class_is_ambiguous(index, &type_name, family) {
+                    DiagnosticKind::Ambiguous
+                } else {
+                    DiagnosticKind::UnresolvedCall
+                };
+                diagnostics.push(Diagnostic {
+                    kind,
+                    path,
+                    line,
+                    name: type_name,
+                });
                 return Vec::new();
             };
+
             let target = &index.files[target_file].symbols[target_index];
             let mut visited = HashSet::new();
             let methods =
@@ -926,16 +1092,50 @@ fn resolve_call(
             if methods.is_empty() {
                 // We know the class but not the member: keep the whole class
                 // rather than silently dropping a method.
-                vec![Unit::Symbol {
-                    file: target_file,
-                    symbol: target.name.clone(),
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::MethodNotFound,
+                    path,
+                    line,
+                    name: call.name.clone(),
+                });
+                vec![Edge {
+                    to: Unit::Symbol {
+                        file: target_file,
+                        symbol: target.name.clone(),
+                    },
+                    reason: Reason::Call,
+                    line,
                 }]
             } else {
-                methods
+                call_edges(methods, line)
             }
         }
-        Receiver::Unknown => Vec::new(),
+        Receiver::Unknown => {
+            diagnostics.push(Diagnostic {
+                kind: DiagnosticKind::UnknownReceiver,
+                path,
+                line,
+                name: call.name.clone(),
+            });
+            Vec::new()
+        }
     }
+}
+
+/// Whether a simple name is declared by more than one file. Only reachable
+/// after [`resolve_class`] has already failed, so an ambiguity here means the
+/// global fallback had several candidates.
+fn class_is_ambiguous(index: &Index, name: &str, family: Option<Family>) -> bool {
+    let Some(candidates) = index.by_symbol.get(name) else {
+        return false;
+    };
+    let mut by_file: Vec<usize> = candidates
+        .iter()
+        .map(|(position, _)| *position)
+        .filter(|position| compatible(index, *position, family))
+        .collect();
+    by_file.dedup();
+    by_file.len() > 1
 }
 
 fn methods_named<'a>(class: &'a Symbol, name: &str) -> Vec<&'a Member> {
@@ -1151,38 +1351,88 @@ fn resolve_class(
     (by_file.len() == 1).then(|| (by_file[0].0, by_file[0].1))
 }
 
-/// Neighbours of one unit, honouring [`ResolveOptions::minimal`]: Java file and
-/// class seeds are call-path driven instead of import driven.
-fn unit_neighbours(index: &Index, unit: &Unit, options: ResolveOptions) -> Vec<(Unit, Reason)> {
+/// Source line of a unit for edges that have no call site (imports, type
+/// uses). Whole files have no single line, so they use 0.
+fn unit_line(index: &Index, unit: &Unit) -> u32 {
+    let Some(file) = index.files.get(unit.file()) else {
+        return 0;
+    };
     match unit {
-        Unit::File(position) if options.minimal => call_graph_seed(index, *position)
-            .unwrap_or_else(|| file_neighbours(index, *position, options)),
-        Unit::Symbol { file, symbol } if options.minimal => call_graph_class(index, *file, symbol)
-            .unwrap_or_else(|| symbol_neighbours(index, *file, symbol, options)),
-        Unit::File(position) => file_neighbours(index, *position, options),
-        Unit::Symbol { file, symbol } => symbol_neighbours(index, *file, symbol, options),
-        Unit::Member {
-            file,
-            class,
-            member,
-        } => member_neighbours(index, *file, class, member, options),
+        Unit::File(_) => 0,
+        Unit::Symbol { symbol, .. } => file.symbol(symbol).map_or(0, |symbol| symbol.line as u32),
+        Unit::Member { class, member, .. } => file
+            .symbol(class)
+            .and_then(|class| {
+                class.members.iter().find(|candidate| {
+                    candidate.kind == MemberKind::Method && candidate.name == *member
+                })
+            })
+            .map_or(0, |member| member.line as u32),
+    }
+}
+
+fn with_line(units: Vec<(Unit, Reason)>, line: u32) -> Vec<Edge> {
+    units
+        .into_iter()
+        .map(|(to, reason)| Edge { to, reason, line })
+        .collect()
+}
+
+/// Neighbours of one unit. Every edge carries a line: the call site for call
+/// edges, the source unit's line for import/type edges.
+fn unit_neighbours(
+    index: &Index,
+    unit: &Unit,
+    options: ResolveOptions,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<Edge> {
+    match unit {
+        Unit::File(position) if options.minimal => call_graph_seed(index, *position, diagnostics)
+            .unwrap_or_else(|| with_line(file_neighbours(index, *position, options), 0)),
+        Unit::Symbol { file, symbol } if options.minimal => {
+            call_graph_class(index, *file, symbol, diagnostics).unwrap_or_else(|| {
+                with_line(
+                    symbol_neighbours(index, *file, symbol, options),
+                    unit_line(index, unit),
+                )
+            })
+        }
+        Unit::File(position) => with_line(file_neighbours(index, *position, options), 0),
+        Unit::Symbol { file, symbol } => with_line(
+            symbol_neighbours(index, *file, symbol, options),
+            unit_line(index, unit),
+        ),
+        Unit::Member { .. } => member_neighbours(index, unit, diagnostics),
     }
 }
 
 /// Calls of every method in every class of a file, for a whole-file seed.
 /// `None` keeps the old import/type closure for files that are not
 /// member-capable or have no symbols.
-fn call_graph_seed(index: &Index, position: usize) -> Option<Vec<(Unit, Reason)>> {
+fn call_graph_seed(
+    index: &Index,
+    position: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Vec<Edge>> {
     let file = index.files.get(position)?;
     if file.language()?.granularity() != Granularity::Member || file.symbols.is_empty() {
         return None;
     }
     let family = family_of(file);
-    let mut out = Vec::new();
+    let mut edges = Vec::new();
     for class in &file.symbols {
-        out.extend(class_calls(index, position, file, class, family));
+        edges.extend(class_calls(
+            index,
+            position,
+            file,
+            class,
+            family,
+            diagnostics,
+        ));
     }
-    Some(out)
+    let classes: Vec<&Symbol> = file.symbols.iter().collect();
+    type_only_diagnostics(index, file, &classes, &edges, family, diagnostics);
+    Some(edges)
 }
 
 /// Calls of every method of one class, for a class seed (`path::Class`).
@@ -1190,13 +1440,17 @@ fn call_graph_class(
     index: &Index,
     position: usize,
     class_name: &str,
-) -> Option<Vec<(Unit, Reason)>> {
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Vec<Edge>> {
     let file = index.files.get(position)?;
     if file.language()?.granularity() != Granularity::Member {
         return None;
     }
     let class = file.symbol(class_name)?;
-    Some(class_calls(index, position, file, class, family_of(file)))
+    let family = family_of(file);
+    let edges = class_calls(index, position, file, class, family, diagnostics);
+    type_only_diagnostics(index, file, &[class], &edges, family, diagnostics);
+    Some(edges)
 }
 
 fn class_calls(
@@ -1205,7 +1459,8 @@ fn class_calls(
     file: &FileEntry,
     class: &Symbol,
     family: Option<Family>,
-) -> Vec<(Unit, Reason)> {
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<Edge> {
     let mut out = Vec::new();
     for member in class
         .members
@@ -1213,21 +1468,100 @@ fn class_calls(
         .filter(|member| member.kind == MemberKind::Method)
     {
         for call in &member.calls {
-            for unit in resolve_call(index, position, file, class, member, call, family) {
-                out.push((unit, Reason::Call));
-            }
+            out.extend(resolve_call(
+                index,
+                position,
+                file,
+                class,
+                member,
+                call,
+                family,
+                diagnostics,
+            ));
         }
     }
     // Rust free functions are top-level symbols with no members. Their calls
     // are recorded by name, so resolve them directly.
     if family == Some(Family::Rust) {
-        for name in class.calls.iter().map(|call| &call.name) {
-            for unit in rust_function_units(index, name, family, Some(position)) {
-                out.push((unit, Reason::Call));
+        for call in &class.calls {
+            let found = rust_function_units(index, &call.name, family, Some(position));
+            if found.is_empty() {
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::UnresolvedCall,
+                    path: file.rel.clone(),
+                    line: call.line as u32,
+                    name: call.name.clone(),
+                });
             }
+            out.extend(call_edges(found, call.line as u32));
         }
     }
     out
+}
+
+/// Types that are in scope but not on the call path. Minimal bundles
+/// deliberately skip them; #8 records the fact, #10 renders it.
+fn type_only_diagnostics(
+    index: &Index,
+    file: &FileEntry,
+    classes: &[&Symbol],
+    edges: &[Edge],
+    family: Option<Family>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let targets: HashSet<&str> = edges.iter().filter_map(|edge| edge.to.symbol()).collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for class in classes {
+        for name in &class.uses {
+            if name == &class.name || targets.contains(name.as_str()) || !seen.insert(name.as_str())
+            {
+                continue;
+            }
+            if resolve_class(index, file, name, family).is_some() {
+                diagnostics.push(Diagnostic {
+                    kind: DiagnosticKind::TypeOnlySkipped,
+                    path: file.rel.clone(),
+                    line: class.line as u32,
+                    name: name.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Breadth-first closure over units, keeping track of why each one was pulled
+/// in. Returns units in discovery order, seeds first (depth 0), duplicates
+/// removed. A whole-file unit supersedes symbol units of the same file.
+/// Resolves every reachable unit up to `options.depth` and keeps the outgoing
+/// edges. `out` is enough for the closure; `inc` is built on demand.
+pub fn build_graph(index: &Index, seeds: &[Unit], options: ResolveOptions) -> Graph {
+    let mut graph = Graph::default();
+    let mut visited: HashSet<Unit> = HashSet::new();
+    let mut queue: VecDeque<(Unit, u32)> = VecDeque::new();
+
+    for seed in seeds {
+        if visited.insert(seed.clone()) {
+            graph.out.entry(seed.clone()).or_default();
+            queue.push_back((seed.clone(), 0));
+        }
+    }
+
+    while let Some((unit, depth)) = queue.pop_front() {
+        if depth >= options.depth {
+            continue;
+        }
+        let mut diagnostics = Vec::new();
+        let edges = unit_neighbours(index, &unit, options, &mut diagnostics);
+        graph.diagnostics.append(&mut diagnostics);
+        graph.out.insert(unit.clone(), edges);
+        let edges = &graph.out[&unit];
+        for edge in edges {
+            if visited.insert(edge.to.clone()) {
+                queue.push_back((edge.to.clone(), depth + 1));
+            }
+        }
+    }
+    graph
 }
 
 /// Breadth-first closure over units, keeping track of why each one was pulled
@@ -1238,36 +1572,7 @@ pub fn closure_units(
     seeds: &[Unit],
     options: ResolveOptions,
 ) -> Vec<(Unit, u32, Reason)> {
-    let mut depth_of: HashMap<Unit, u32> = HashMap::new();
-    let mut order: Vec<(Unit, u32, Reason)> = Vec::new();
-    let mut queue: VecDeque<Unit> = VecDeque::new();
-
-    for seed in seeds {
-        if depth_of.insert(seed.clone(), 0).is_none() {
-            order.push((seed.clone(), 0, Reason::Seed));
-            queue.push_back(seed.clone());
-        }
-    }
-
-    while let Some(current) = queue.pop_front() {
-        let current_depth = depth_of[&current];
-        if current_depth >= options.depth {
-            continue;
-        }
-        let neighbours = unit_neighbours(index, &current, options);
-
-        for (neighbour, reason) in neighbours {
-            if depth_of.contains_key(&neighbour) {
-                continue;
-            }
-            let depth = current_depth + 1;
-            depth_of.insert(neighbour.clone(), depth);
-            order.push((neighbour.clone(), depth, reason));
-            queue.push_back(neighbour);
-        }
-    }
-
-    drop_covered_symbols(order)
+    build_graph(index, seeds, options).closure(seeds)
 }
 
 /// A file that is bundled whole already contains its symbols, so keep only the
@@ -2570,5 +2875,151 @@ mod tests {
             resolve_import(&index, &index.files[2], &index.files[2].imports[0]),
             vec![0]
         );
+    }
+
+    #[test]
+    fn graph_edges_are_consistent_in_both_directions() {
+        let index = java_fixture();
+        let seed = member_seed(0, "Service", "used");
+        let mut graph = build_graph(
+            &index,
+            std::slice::from_ref(&seed),
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(!graph.out.is_empty());
+        let inc = graph.reverse().clone();
+        for (from, edges) in &graph.out {
+            for edge in edges {
+                let back = inc
+                    .get(&edge.to)
+                    .unwrap_or_else(|| panic!("no inc edge for {edge:?}"));
+                assert!(
+                    back.iter().any(|reverse| reverse.to == *from
+                        && reverse.reason == edge.reason
+                        && reverse.line == edge.line),
+                    "missing reverse edge {from:?} -> {:?}",
+                    edge.to
+                );
+            }
+        }
+        assert!(!graph.out[&seed].is_empty());
+        assert!(graph.out[&seed].iter().all(|edge| edge.line > 0));
+    }
+
+    #[test]
+    fn graph_collects_diagnostics_without_changing_edges() {
+        let mut index = java_fixture();
+        index.files[0].symbols[0].members[0].calls = vec![
+            crate::lang::Call {
+                name: "missing".to_string(),
+                receiver: Receiver::Unknown,
+                line: 7,
+            },
+            crate::lang::Call {
+                name: "notThere".to_string(),
+                receiver: Receiver::Name("repo".to_string()),
+                line: 8,
+            },
+        ];
+        let graph = build_graph(
+            &index,
+            &[member_seed(0, "Service", "used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(graph.diagnostics.iter().any(|diagnostic| diagnostic.kind
+            == DiagnosticKind::UnknownReceiver
+            && diagnostic.line == 7));
+        assert!(graph.diagnostics.iter().any(|diagnostic| diagnostic.kind
+            == DiagnosticKind::MethodNotFound
+            && diagnostic.line == 8));
+        // The known-class/unknown-method fallback edge is still materialized.
+        assert!(graph.out[&member_seed(0, "Service", "used")]
+            .iter()
+            .any(|edge| edge.to
+                == Unit::Symbol {
+                    file: 2,
+                    symbol: "Repo".to_string(),
+                }));
+    }
+
+    #[test]
+    fn graph_reports_type_only_dependencies() {
+        let mut index = java_fixture();
+        let service_position = 0;
+        let unused = java_class("Unused", Vec::new(), &[], &[]);
+        index.files[service_position].symbols.push(unused);
+        index
+            .by_symbol
+            .entry("Unused".to_string())
+            .or_default()
+            .push((service_position, 1));
+        index.files[service_position].symbols[0].uses = vec!["Unused".to_string()];
+
+        let graph = build_graph(
+            &index,
+            &[Unit::Symbol {
+                file: service_position,
+                symbol: "Service".to_string(),
+            }],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(
+            graph.diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == DiagnosticKind::TypeOnlySkipped && diagnostic.name == "Unused"
+            }),
+            "{:?}",
+            graph.diagnostics
+        );
+    }
+
+    /// Ignored benchmark: `cargo test bench_reverse -- --ignored --nocapture`.
+    /// Reported in #8: ~0.9 ms for 1800 edges, which is why `inc` is lazy.
+    #[test]
+    #[ignore]
+    fn bench_reverse_cost() {
+        let mut classes = String::from("package p;\n");
+        for i in 0..300 {
+            classes.push_str(&format!("class C{i} {{\n"));
+            for m in 0..5 {
+                let target = (i + 1) % 300;
+                classes.push_str(&format!("  void m{m}() {{ new C{target}().m0(); }}\n"));
+            }
+            classes.push_str("}\n");
+        }
+        let root = index_from_disk("graph-bench", &[("C.java", &classes)]);
+        let index = crate::index::Index::build(&root);
+        let seed = Unit::File(*index.by_rel.get("C.java").expect("C.java"));
+        let start = std::time::Instant::now();
+        let mut graph = build_graph(
+            &index,
+            &[seed],
+            ResolveOptions {
+                depth: 2,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let build = start.elapsed();
+        let edges: usize = graph.out.values().map(Vec::len).sum();
+        let start = std::time::Instant::now();
+        let inc = graph.reverse().clone();
+        let reverse = start.elapsed();
+        println!(
+            "build {build:?}, edges {edges}, reverse {reverse:?}, inc nodes {}",
+            inc.len()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
