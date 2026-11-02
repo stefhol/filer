@@ -1,11 +1,12 @@
 # filer
 
-Select code in Neovim and get one pastable markdown blob for your chat LLM — with the files
-your selection imports, and the files those import, already included.
+Select code in Neovim and get one pastable markdown blob for your chat LLM or coding agent —
+with the files your selection imports, and the files those import, already included.
 
-You have a chat interface but no agentic workflow. `filer` covers the boring part: finding
-the three or four files that belong together and formatting them so the model sees the
-whole picture instead of a fragment.
+`filer` covers the boring part: finding the three or four files that belong together and
+formatting them so the model sees the whole picture instead of a fragment. The same
+selection is available as versioned JSON, so an agent can pull its own context instead of
+being pasted to.
 
 ```
 ┌─ Telescope: filer: symbols (demo) ───────────────────┐
@@ -71,6 +72,9 @@ support:
   old state automatically.
 - Renders the selection as markdown: header, file list with import depths, then one fenced
   block per file or excerpt. Fences grow automatically if a file already contains backticks.
+- Speaks JSON as well as markdown: spans, tokens, a budget report, diagnostics, coverage and
+  the provenance chain, with stable exit codes and `--quiet` for clean tool output. That is
+  the agent-facing contract; markdown is one consumer of it.
 - Caches the index in `~/.cache/filer/`, keyed by root path and invalidated per file by
   mtime + size. Re-indexing a 2000-file project takes ~40 ms, so the picker re-queries on
   every keystroke.
@@ -659,8 +663,9 @@ Empty results print `[]` with `--json` and exit `4`, like `search`.
 
 ### JSON surface
 
-The JSON form is the stable product; markdown is one consumer of the same data. Every JSON
-output covered here (`search`, `deps`, `bundle`, `show`, `index`) carries `schema_version: 1`:
+The JSON form is the stable product and the surface an agent drives; markdown is one
+consumer of the same data. Every JSON output covered here (`search`, `deps`, `bundle`,
+`show`, `index`) carries `schema_version: 1`:
 
 ```sh
 filer --root ~/code/demo --json search --query Service   # JSON lines, one row per unit
