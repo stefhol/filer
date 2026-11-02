@@ -1283,6 +1283,88 @@ mod tests {
         }
     }
 
+    /// Writes a small project to a temp directory and indexes it, so a test
+    /// exercises the real parser plus the resolver.
+    fn index_from_disk(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("filer-resolve-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, source) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("nested file")).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn kotlin_method_and_file_seeds_use_the_call_graph() {
+        let root = index_from_disk(
+            "kotlin",
+            &[
+                (
+                    "app/Service.kt",
+                    "package app\n\nclass Service(private val repo: Repo) : Base() {\n    val helper: Helper = Helper()\n\n    fun used(): Int {\n        helper.pong()\n        return repo.size()\n    }\n\n    fun omitted(): Int = 1\n}\n",
+                ),
+                (
+                    "app/Repo.kt",
+                    "package app\n\nclass Repo {\n    fun size(): Int = 0\n    fun unused(): Int = 1\n}\n",
+                ),
+                (
+                    "app/Helper.kt",
+                    "package app\n\nclass Helper {\n    fun pong() {}\n    fun quiet() {}\n}\n",
+                ),
+                (
+                    "app/Base.kt",
+                    "package app\n\nopen class Base {\n    fun inherited() {}\n    fun baseOnly() {}\n}\n",
+                ),
+            ],
+        );
+        let index = Index::build(&root);
+        let service = index.by_rel["app/Service.kt"];
+
+        let order = closure_units(
+            &index,
+            &[member_seed(service, "Service", "used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let members = member_names(&order);
+        for expected in [("Helper", "pong"), ("Repo", "size")] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(class, member)| class == expected.0 && member == expected.1),
+                "missing {expected:?} in {members:?}"
+            );
+        }
+        assert!(!members
+            .iter()
+            .any(|(class, member)| class == "Repo" && member == "unused"));
+
+        // A file seed follows the same calls, but renders the file whole.
+        let order = closure_units(
+            &index,
+            &[Unit::File(service)],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(order.iter().any(|(unit, _, _)| {
+            unit.symbol() == Some("Repo") && unit.member() == Some("size")
+        }));
+        assert!(!order
+            .iter()
+            .any(|(unit, _, _)| unit.member() == Some("unused")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn java_member_closure_follows_calls_only() {
         let index = java_fixture();
