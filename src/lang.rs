@@ -246,6 +246,10 @@ pub struct Call {
     pub name: String,
     #[serde(default)]
     pub receiver: Receiver,
+    /// 1-based line of the invocation itself (not of the member that holds
+    /// it), cached so reverse edges and `why` chains need no file reads.
+    #[serde(default)]
+    pub line: usize,
 }
 
 /// A prunable member of a top-level type (currently Java methods/constructors).
@@ -258,6 +262,9 @@ pub struct Member {
     pub start: usize,
     pub end: usize,
     pub line: usize,
+    /// 1-based line of the last byte of the span, cached at parse time.
+    #[serde(default)]
+    pub end_line: usize,
     /// Offset of the `{` that opens the body; `None` for abstract/interface
     /// methods (there is no body to elide).
     #[serde(default)]
@@ -287,12 +294,17 @@ pub struct Symbol {
     /// 1-based line of `start`, cached so the picker needs no file reads.
     #[serde(default)]
     pub line: usize,
+    /// 1-based line of `end`, cached so a span can be reported without
+    /// re-reading the file.
+    #[serde(default)]
+    pub end_line: usize,
     /// Names referenced inside the symbol, deduplicated and sorted.
     #[serde(default)]
     pub uses: Vec<String>,
-    /// Function names invoked from inside the symbol (Formula Engine).
+    /// Call sites recorded at symbol level, for languages whose calls do not
+    /// live in members: Formula Engine functions and Rust free functions.
     #[serde(default)]
-    pub calls: Vec<String>,
+    pub calls: Vec<Call>,
     /// Prunable members (Java methods/constructors) for call-path pruning.
     #[serde(default)]
     pub members: Vec<Member>,
@@ -372,6 +384,7 @@ pub fn symbol_from_node(
         start,
         end: node.end_byte(),
         line: line_of(src, start),
+        end_line: end_line_of(src, start, node.end_byte()),
         uses: Vec::new(),
         calls: Vec::new(),
         members: Vec::new(),
@@ -387,6 +400,13 @@ pub fn line_of(src: &str, offset: usize) -> usize {
         .filter(|byte| **byte == b'\n')
         .count()
         + 1
+}
+
+/// 1-based line of the last byte in `start..end`, never before `start`'s line.
+/// `line_of` counts the newlines strictly before the offset, so the last byte
+/// of the span (not the byte after it) is what gets measured.
+pub fn end_line_of(src: &str, start: usize, end: usize) -> usize {
+    line_of(src, end.saturating_sub(1)).max(line_of(src, start))
 }
 
 /// Assigns `(name, offset)` uses to the symbols that contain them and fills in
@@ -565,6 +585,199 @@ mod tests {
         for (language, source) in cases {
             let parsed = parser.parse(language, source).expect("parsed");
             assert!(!parsed.types.is_empty(), "{language:?}: {parsed:?}");
+        }
+    }
+
+    /// Two calls to the same method on different lines, per language. The call
+    /// site line is cached at parse time, so it has to be the line of the
+    /// invocation itself, not of the method that contains it.
+    const TWO_CALLS: &[(Language, &str, &str)] = &[
+        (
+            Language::Java,
+            "class A {\n    void run() {\n        repo.size();\n        repo.size();\n    }\n}\n",
+            "repo.size();",
+        ),
+        (
+            Language::Kotlin,
+            "class A {\n    fun run() {\n        repo.size()\n        repo.size()\n    }\n}\n",
+            "repo.size()",
+        ),
+        (
+            Language::Scala,
+            "class A {\n  def run(): Unit = {\n    repo.size()\n    repo.size()\n  }\n}\n",
+            "repo.size()",
+        ),
+        (
+            Language::Groovy,
+            "class A {\n    void run() {\n        repo.size()\n        repo.size()\n    }\n}\n",
+            "repo.size()",
+        ),
+        (
+            Language::CSharp,
+            "class A {\n    void Run() {\n        repo.Size();\n        repo.Size();\n    }\n}\n",
+            "repo.Size();",
+        ),
+        (
+            Language::Rust,
+            "struct A;\nimpl A {\n    fn run(&self) {\n        self.repo.size();\n        self.repo.size();\n    }\n}\n",
+            "self.repo.size();",
+        ),
+        (
+            Language::TypeScript,
+            "class A {\n    run() {\n        this.repo.size();\n        this.repo.size();\n    }\n}\n",
+            "this.repo.size();",
+        ),
+        (
+            Language::JavaScript,
+            "class A {\n    run() {\n        this.repo.size();\n        this.repo.size();\n    }\n}\n",
+            "this.repo.size();",
+        ),
+    ];
+
+    /// Asserts the invariants every parser must satisfy for cached spans.
+    fn assert_span_lines(parsed: &Source, label: &str) -> usize {
+        let mut calls = 0;
+        for symbol in &parsed.symbols {
+            assert!(symbol.line >= 1, "{label}: {} has no line", symbol.name);
+            assert!(
+                symbol.end_line >= symbol.line,
+                "{label}: {} ends at {} but starts at {}",
+                symbol.name,
+                symbol.end_line,
+                symbol.line
+            );
+            for call in &symbol.calls {
+                calls += 1;
+                assert!(
+                    call.line >= symbol.line && call.line <= symbol.end_line,
+                    "{label}: {}() at line {} is outside {} ({}..{})",
+                    call.name,
+                    call.line,
+                    symbol.name,
+                    symbol.line,
+                    symbol.end_line
+                );
+            }
+            for member in &symbol.members {
+                assert!(member.line >= 1, "{label}: {}.{}", symbol.name, member.name);
+                assert!(
+                    member.end_line >= member.line,
+                    "{label}: {}.{} ends at {} but starts at {}",
+                    symbol.name,
+                    member.name,
+                    member.end_line,
+                    member.line
+                );
+                assert!(
+                    member.start >= symbol.start && member.end <= symbol.end,
+                    "{label}: {}.{} falls outside its type",
+                    symbol.name,
+                    member.name
+                );
+                for call in &member.calls {
+                    calls += 1;
+                    assert!(
+                        call.line >= member.line && call.line <= member.end_line,
+                        "{label}: {}() at line {} is outside {}.{} ({}..{})",
+                        call.name,
+                        call.line,
+                        symbol.name,
+                        member.name,
+                        member.line,
+                        member.end_line
+                    );
+                }
+            }
+        }
+        calls
+    }
+
+    #[test]
+    fn call_sites_carry_their_own_line() {
+        let mut parser = SourceParser::new();
+        for (language, source, needle) in TWO_CALLS {
+            let parsed = parser.parse(*language, source).expect("parsed");
+            assert_span_lines(&parsed, &format!("{language:?}"));
+            let expected: Vec<usize> = source
+                .lines()
+                .enumerate()
+                .filter(|(_, text)| text.trim() == *needle)
+                .map(|(index, _)| index + 1)
+                .collect();
+            assert_eq!(expected.len(), 2, "{language:?}: fixture has two calls");
+            let mut lines: Vec<usize> = parsed
+                .symbols
+                .iter()
+                .flat_map(|symbol| symbol.members.iter())
+                .flat_map(|member| member.calls.iter())
+                .map(|call| call.line)
+                .collect();
+            lines.sort();
+            assert_eq!(lines, expected, "{language:?}: call-site lines");
+        }
+    }
+
+    #[test]
+    fn spans_stay_consistent_across_the_fixture_corpus() {
+        let corpus: &[(Language, &str)] = &[
+            (
+                Language::Java,
+                "package a;\n\n/** Doc. */\npublic class A {\n    private int count;\n\n    public int size() {\n        return count + helper();\n    }\n\n    private int helper() {\n        return 1;\n    }\n}\n",
+            ),
+            (
+                Language::Scala,
+                "package b\n\nclass B(\n    val name: String\n) {\n  def size(): Int = helper()\n\n  def helper(): Int = 1\n}\n",
+            ),
+            (
+                Language::Kotlin,
+                "package c\n\nclass C {\n    fun size(): Int {\n        return helper()\n    }\n\n    private fun helper(): Int = 1\n}\n",
+            ),
+            (
+                Language::Groovy,
+                "package d\n\nclass D {\n    int size() {\n        helper()\n    }\n\n    int helper() {\n        1\n    }\n}\n",
+            ),
+            (
+                Language::CSharp,
+                "namespace e;\n\npublic class E\n{\n    public int Size()\n    {\n        return Helper();\n    }\n\n    private int Helper() => 1;\n}\n",
+            ),
+            (
+                Language::TypeScript,
+                "export class F {\n    private count = 0;\n\n    size(): number {\n        return this.count + this.helper();\n    }\n\n    private helper(): number {\n        return 1;\n    }\n}\n",
+            ),
+            (
+                Language::JavaScript,
+                "export class G {\n    size() {\n        return this.helper();\n    }\n\n    helper() {\n        return 1;\n    }\n}\n",
+            ),
+            (
+                Language::Rust,
+                "pub struct R {\n    count: usize,\n}\n\nimpl R {\n    pub fn size(&self) -> usize {\n        self.count\n    }\n\n    fn helper(&self) -> usize {\n        1\n    }\n}\n",
+            ),
+            (
+                Language::Fe,
+                "// Risk model.\nfunction risk(size) {\n    local dict x = size;\n    return x;\n}\n",
+            ),
+        ];
+        let mut parser = SourceParser::new();
+        for (language, source) in corpus {
+            let parsed = parser.parse(*language, source).expect("parsed");
+            assert!(!parsed.symbols.is_empty(), "{language:?}: no symbols");
+            assert_span_lines(&parsed, &format!("{language:?}"));
+            for symbol in &parsed.symbols {
+                assert_eq!(
+                    symbol.line,
+                    line_of(source, symbol.start),
+                    "{language:?}: {} start line",
+                    symbol.name
+                );
+                let last = symbol.end.saturating_sub(1).min(source.len() - 1);
+                assert!(
+                    symbol.end_line >= line_of(source, last),
+                    "{language:?}: {} end line {} vs {}",
+                    symbol.name,
+                    symbol.end_line,
+                    line_of(source, last)
+                );
+            }
         }
     }
 }

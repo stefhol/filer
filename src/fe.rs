@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 
-use crate::lang::{line_of, Source, Symbol, SymbolKind};
+use crate::lang::{end_line_of, line_of, Call, Receiver, Source, Symbol, SymbolKind};
 
 /// Built-in functions from `FormulaEngine.bnf`. They have no defining file, so
 /// they must not turn into cross-file references.
@@ -259,7 +259,7 @@ fn parse_visibility_or_declaration<'a>(
 
     let mut declared = HashSet::new();
     declared.insert(name_token.text.to_string());
-    let (calls, uses) = scan_references(tokens, name_index + 1, cursor, &[], &declared);
+    let (calls, uses) = scan_references(src, tokens, name_index + 1, cursor, &[], &declared);
 
     let start = doc_start(src, tokens, index);
     let symbol = Symbol {
@@ -268,6 +268,7 @@ fn parse_visibility_or_declaration<'a>(
         start,
         end,
         line: line_of(src, start),
+        end_line: end_line_of(src, start, end),
         uses,
         calls,
         members: Vec::new(),
@@ -311,7 +312,7 @@ fn parse_function<'a>(
     let body_end = matching(tokens, brace, "{", "}")?;
     let end = tokens[body_end].end;
 
-    let (calls, uses) = scan_references(tokens, brace + 1, body_end, &params, &HashSet::new());
+    let (calls, uses) = scan_references(src, tokens, brace + 1, body_end, &params, &HashSet::new());
 
     let start = doc_start(src, tokens, index);
     let symbol = Symbol {
@@ -320,6 +321,7 @@ fn parse_function<'a>(
         start,
         end,
         line: line_of(src, start),
+        end_line: end_line_of(src, start, end),
         uses,
         calls,
         members: Vec::new(),
@@ -336,12 +338,13 @@ fn parse_function<'a>(
 /// variable names. Calls are kept apart from plain uses, and built-ins are
 /// ignored because no file defines them.
 fn scan_references(
+    src: &str,
     tokens: &[Token<'_>],
     from: usize,
     to: usize,
     params: &[String],
     extra_declared: &HashSet<String>,
-) -> (Vec<String>, Vec<String>) {
+) -> (Vec<Call>, Vec<String>) {
     let mut declared: HashSet<String> = params.iter().cloned().collect();
     declared.extend(extra_declared.iter().cloned());
     let mut nested_functions: HashSet<&str> = HashSet::new();
@@ -398,7 +401,11 @@ fn scan_references(
         let previous = index.checked_sub(1).and_then(|i| tokens.get(i));
         if next.is_some_and(|next| next.is(Kind::Punct, "(")) {
             if !BUILTIN_FUNCS.contains(&token.text) {
-                calls.push(token.text.to_string());
+                calls.push(Call {
+                    name: token.text.to_string(),
+                    receiver: Receiver::Bare,
+                    line: line_of(src, token.start),
+                });
             }
             continue;
         }
@@ -416,8 +423,10 @@ fn scan_references(
         uses.push(token.text.to_string());
     }
 
-    calls.sort();
-    calls.dedup();
+    // One entry per call site, so a function that calls the same target twice
+    // keeps both lines.
+    calls.sort_by(|a, b| (&a.name, a.line).cmp(&(&b.name, b.line)));
+    calls.dedup_by(|a, b| a.name == b.name && a.line == b.line);
     uses.sort();
     uses.dedup();
     (calls, uses)
@@ -623,7 +632,14 @@ mod tests {
         assert!(helper.uses.is_empty(), "{helper:?}");
 
         let main = &source.symbols[2];
-        assert_eq!(main.calls, vec!["helper"]);
+        assert_eq!(
+            main.calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["helper"]
+        );
+        assert_eq!(main.calls[0].line, 13);
         assert_eq!(main.uses, vec!["size"]);
         assert!(src[main.start..main.end].starts_with("/* Doc for main. */"));
         assert!(src[main.start..main.end].ends_with('}'));

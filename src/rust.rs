@@ -5,8 +5,8 @@
 use tree_sitter::{Node, Parser};
 
 use crate::lang::{
-    finish_symbols, line_of, symbol_from_node, Call, Import, ImportKind, Member, MemberKind,
-    Receiver, Source, Symbol, SymbolKind,
+    end_line_of, finish_symbols, line_of, symbol_from_node, Call, Import, ImportKind, Member,
+    MemberKind, Receiver, Source, Symbol, SymbolKind,
 };
 
 const COMMENTS: &[&str] = &["line_comment", "block_comment"];
@@ -67,10 +67,8 @@ impl RustParser {
                             let start = declaration_start(child);
                             symbol.start = start;
                             symbol.line = line_of(src, start);
-                            symbol.calls = calls_in(child, src)
-                                .into_iter()
-                                .map(|call| call.name)
-                                .collect();
+                            symbol.end_line = end_line_of(src, start, symbol.end);
+                            symbol.calls = calls_in(child, src);
                             push_symbol(&mut out, symbol);
                         }
                     }
@@ -86,6 +84,7 @@ impl RustParser {
                                 start,
                                 end: child.end_byte(),
                                 line: line_of(src, start),
+                                end_line: end_line_of(src, start, child.end_byte()),
                                 uses: Vec::new(),
                                 calls: Vec::new(),
                                 members: Vec::new(),
@@ -121,6 +120,7 @@ impl RustParser {
                             let start = declaration_start(child);
                             symbol.start = start;
                             symbol.line = line_of(src, start);
+                            symbol.end_line = end_line_of(src, start, symbol.end);
                             out.symbols.push(symbol);
                         }
                     }
@@ -199,6 +199,7 @@ fn merge_symbol<'a>(
             symbol.line = line_of(src, start);
         }
         symbol.end = symbol.end.max(end);
+        symbol.end_line = end_line_of(src, symbol.start, symbol.end);
         return symbol;
     }
     out.symbols.push(Symbol {
@@ -207,6 +208,7 @@ fn merge_symbol<'a>(
         start,
         end,
         line: line_of(src, start),
+        end_line: end_line_of(src, start, end),
         uses: Vec::new(),
         calls: Vec::new(),
         members: Vec::new(),
@@ -295,6 +297,7 @@ fn method_of(node: Node<'_>, src: &str) -> Option<Member> {
         start,
         end: node.end_byte(),
         line: line_of(src, start),
+        end_line: end_line_of(src, start, node.end_byte()),
         body_start,
         params: parameters_of(node, src),
         locals: locals_of(node, src),
@@ -413,7 +416,7 @@ fn calls_in(node: Node<'_>, src: &str) -> Vec<Call> {
     while let Some(current) = stack.pop() {
         if current.kind() == "call_expression" {
             if let Some(function) = current.child_by_field_name("function") {
-                if let Some(call) = call_of(function, src) {
+                if let Some(call) = call_of(function, src, line_of(src, current.start_byte())) {
                     out.push(call);
                 }
             }
@@ -426,13 +429,14 @@ fn calls_in(node: Node<'_>, src: &str) -> Vec<Call> {
     out
 }
 
-fn call_of(function: Node<'_>, src: &str) -> Option<Call> {
+fn call_of(function: Node<'_>, src: &str, line: usize) -> Option<Call> {
     match function.kind() {
         "identifier" => {
             let name = text_of(function, src);
             (!name.is_empty()).then_some(Call {
                 name,
                 receiver: Receiver::Bare,
+                line,
             })
         }
         "field_expression" => {
@@ -442,7 +446,11 @@ fn call_of(function: Node<'_>, src: &str) -> Option<Call> {
                 .child_by_field_name("value")
                 .map(|value| receiver_of(value, src))
                 .unwrap_or(Receiver::Unknown);
-            (!name.is_empty()).then_some(Call { name, receiver })
+            (!name.is_empty()).then_some(Call {
+                name,
+                receiver,
+                line,
+            })
         }
         "scoped_identifier" => {
             let name = function.child_by_field_name("name")?;
@@ -451,11 +459,15 @@ fn call_of(function: Node<'_>, src: &str) -> Option<Call> {
                 .child_by_field_name("path")
                 .map(|path| receiver_of_path(path, src))
                 .unwrap_or(Receiver::Bare);
-            (!name.is_empty()).then_some(Call { name, receiver })
+            (!name.is_empty()).then_some(Call {
+                name,
+                receiver,
+                line,
+            })
         }
         "generic_function" => function
             .child_by_field_name("function")
-            .and_then(|inner| call_of(inner, src)),
+            .and_then(|inner| call_of(inner, src, line)),
         _ => None,
     }
 }

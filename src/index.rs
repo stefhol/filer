@@ -33,7 +33,7 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 14;
+const CACHE_VERSION: u32 = 15;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -459,6 +459,40 @@ mod tests {
                 .len(),
             Language::ALL.len()
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The cache stores parsed symbols verbatim, so the new call-site and span
+    /// lines have to survive a save/load round trip.
+    #[test]
+    fn cache_round_trip_keeps_call_lines_and_end_lines() {
+        let root = std::env::temp_dir().join(format!("filer-cache-lines-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src/app")).unwrap();
+        fs::write(
+            root.join("src/app/Service.java"),
+            "package app;\n\nclass Service {\n    int size() {\n        return helper();\n    }\n\n    int helper() {\n        return 1;\n    }\n}\n",
+        )
+        .unwrap();
+
+        let parsed = Index::build(&root);
+        let cached = Index::build(&root);
+        assert_eq!(cached.reused_count, 1, "second build reads the cache");
+
+        for index in [&parsed, &cached] {
+            let service = index
+                .files
+                .iter()
+                .find(|file| file.types == ["Service"])
+                .unwrap();
+            let symbol = &service.symbols[0];
+            assert_eq!((symbol.line, symbol.end_line), (3, 11));
+            let size = &symbol.members[0];
+            assert_eq!((size.line, size.end_line), (4, 6));
+            assert_eq!(size.calls[0].name, "helper");
+            assert_eq!(size.calls[0].line, 5);
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
