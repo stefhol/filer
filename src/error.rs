@@ -26,6 +26,7 @@ pub const EXIT_EMPTY: i32 = 4;
 pub enum Code {
     Internal,
     SymbolNotFound,
+    UnitNotFound,
     FileNotFound,
     BranchNotFound,
     StateNotFound,
@@ -38,6 +39,7 @@ impl Code {
         match self {
             Code::Internal => "internal",
             Code::SymbolNotFound => "symbol_not_found",
+            Code::UnitNotFound => "unit_not_found",
             Code::FileNotFound => "file_not_found",
             Code::BranchNotFound => "branch_not_found",
             Code::StateNotFound => "state_not_found",
@@ -50,6 +52,7 @@ impl Code {
         match self {
             Code::Internal => EXIT_INTERNAL,
             Code::SymbolNotFound
+            | Code::UnitNotFound
             | Code::FileNotFound
             | Code::BranchNotFound
             | Code::StateNotFound => EXIT_NOT_FOUND,
@@ -92,6 +95,10 @@ impl FilerError {
             format!("{file} has no symbol {symbol}"),
         )
         .with_hint("pass a path alone to bundle the whole file")
+    }
+
+    pub fn unit_not_found(message: impl Into<String>) -> Self {
+        Self::new(Code::UnitNotFound, message)
     }
 
     pub fn file_not_found(message: impl Into<String>) -> Self {
@@ -140,6 +147,7 @@ mod tests {
     fn exit_codes_are_stable() {
         assert_eq!(Code::Internal.exit_code(), 1);
         assert_eq!(Code::SymbolNotFound.exit_code(), 2);
+        assert_eq!(Code::UnitNotFound.exit_code(), 2);
         assert_eq!(Code::FileNotFound.exit_code(), 2);
         assert_eq!(Code::BranchNotFound.exit_code(), 2);
         assert_eq!(Code::StateNotFound.exit_code(), 2);

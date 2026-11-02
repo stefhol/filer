@@ -49,6 +49,14 @@ pub enum Granularity {
 }
 
 impl Granularity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Granularity::File => "file",
+            Granularity::Function => "function",
+            Granularity::Member => "member",
+        }
+    }
+
     /// Whether the picker offers a whole-file row for this language.
     pub fn file_row(self) -> bool {
         self != Granularity::Function

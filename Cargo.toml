@@ -13,6 +13,7 @@ name = "filer"
 path = "src/main.rs"
 
 [dependencies]
+blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 dekobon-tree-sitter-groovy = "0.3.0"
 serde = { version = "1", features = ["derive"] }

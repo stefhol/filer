@@ -2144,6 +2144,8 @@ mod tests {
             uses: Vec::new(),
             symbols: Vec::new(),
             preamble_end: 0,
+            size: 0,
+            end_line: 0,
         }
     }
 
@@ -3188,6 +3190,8 @@ mod tests {
             uses: vec!["Unused".to_string(), "String".to_string()],
             symbols: Vec::new(),
             preamble_end: 0,
+            size: 0,
+            end_line: 0,
         });
         let position = index.files.len() - 1;
 

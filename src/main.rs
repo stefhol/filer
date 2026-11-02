@@ -25,7 +25,7 @@ use clap::{Args, Parser, Subcommand};
 use bundle::{BundleFile, BundleOptions};
 use error::{FilerError, EXIT_EMPTY, EXIT_INTERNAL};
 use index::{FileEntry, Index};
-use lang::{Granularity, Language, MemberKind, SymbolKind};
+use lang::{Granularity, Language, Member, MemberKind, Symbol, SymbolKind};
 use resolve::{build_graph, drop_covered_symbols, Reason, ResolveOptions, Unit};
 use schema::SCHEMA_VERSION;
 use state::{BranchBundle, Selection, StateDoc, StateFile};
@@ -58,6 +58,10 @@ struct Cli {
 enum Command {
     /// List source types as JSON lines (used by the Neovim picker).
     Search(SearchArgs),
+    /// Resolve an exact fully-qualified name to its span and hash.
+    Resolve(ResolveArgs),
+    /// Map a 1-based line to the unit that contains it.
+    Locate(LocateArgs),
     /// Emit a markdown bundle for the given files plus their import closure.
     Bundle(BundleArgs),
     /// Print the import closure of one file or unit, one row per file or per unit.
@@ -93,6 +97,23 @@ struct SearchArgs {
     /// Branch whose bundle is marked. Defaults to the current branch.
     #[arg(long, value_name = "BRANCH")]
     branch: Option<String>,
+}
+
+#[derive(Args)]
+struct ResolveArgs {
+    /// Exact fully-qualified name, e.g. `app.Pricing.discount`.
+    #[arg(value_name = "FQN")]
+    fqn: String,
+}
+
+#[derive(Args)]
+struct LocateArgs {
+    /// File to inspect, relative to the root (or absolute).
+    #[arg(value_name = "FILE")]
+    file: String,
+    /// 1-based line number.
+    #[arg(long, value_name = "LINE")]
+    at_line: usize,
 }
 
 #[derive(Args)]
@@ -271,6 +292,8 @@ fn run(context: &Context, root: Option<PathBuf>, command: Command) -> Result<boo
 
     match command {
         Command::Search(args) => search(&root, args, context),
+        Command::Resolve(args) => resolve_cmd(&root, args, context),
+        Command::Locate(args) => locate_cmd(&root, args, context),
         Command::Bundle(args) => bundle_cmd(&root, args, context).map(|()| false),
         Command::Deps(args) => deps(&root, args, context).map(|()| false),
         Command::Callers(args) => callers_cmd(&root, args, context),
@@ -476,6 +499,10 @@ fn search(root: &Path, args: SearchArgs, context: &Context) -> Result<bool, File
                 "kind": "file",
                 "fqn": file.rel,
                 "line": serde_json::Value::Null,
+                "start_line": 1,
+                "end_line": file.end_line,
+                "bytes": file.size,
+                "est_tokens": file.size / 4,
                 "package": file.package,
                 "types": file.types,
                 "included": bundled.is_some(),
@@ -506,6 +533,10 @@ fn search(root: &Path, args: SearchArgs, context: &Context) -> Result<bool, File
                 "kind": kind,
                 "fqn": class_fqn,
                 "line": symbol.line,
+                "start_line": symbol.line,
+                "end_line": symbol.end_line,
+                "bytes": symbol.end.saturating_sub(symbol.start),
+                "est_tokens": symbol.end.saturating_sub(symbol.start) / 4,
                 "package": file.package,
                 "types": file.types,
                 "included": bundled.is_some(),
@@ -534,6 +565,10 @@ fn search(root: &Path, args: SearchArgs, context: &Context) -> Result<bool, File
             "kind": "method",
             "fqn": fqn,
             "line": member.line,
+            "start_line": member.line,
+            "end_line": member.end_line,
+            "bytes": member.end.saturating_sub(member.start),
+            "est_tokens": member.end.saturating_sub(member.start) / 4,
             "package": file.package,
             "types": file.types,
             "included": bundled.is_some(),
@@ -552,6 +587,159 @@ fn search(root: &Path, args: SearchArgs, context: &Context) -> Result<bool, File
     }
 
     Ok(empty)
+}
+
+/// The wire shape shared by `resolve` and `locate`: one unit, its span, and a
+/// TOCTOU hash. `scope` is the same string `bundle --json` uses.
+struct UnitSpan<'a> {
+    file: &'a FileEntry,
+    scope: &'static str,
+    symbol: Option<&'a str>,
+    member: Option<&'a str>,
+    start: usize,
+    end: usize,
+    start_line: usize,
+    end_line: usize,
+}
+
+impl<'a> UnitSpan<'a> {
+    fn symbol(file: &'a FileEntry, symbol: &'a Symbol) -> Self {
+        Self {
+            file,
+            scope: Selection::Symbol.as_str(),
+            symbol: Some(symbol.name.as_str()),
+            member: None,
+            start: symbol.start,
+            end: symbol.end,
+            start_line: symbol.line,
+            end_line: symbol.end_line,
+        }
+    }
+
+    fn member(file: &'a FileEntry, class: &'a Symbol, member: &'a Member) -> Self {
+        Self {
+            file,
+            scope: Selection::Methods.as_str(),
+            symbol: Some(class.name.as_str()),
+            member: Some(member.name.as_str()),
+            start: member.start,
+            end: member.end,
+            start_line: member.line,
+            end_line: member.end_line,
+        }
+    }
+
+    fn whole_file(file: &'a FileEntry, end: usize, end_line: usize) -> Self {
+        Self {
+            file,
+            scope: Selection::File.as_str(),
+            symbol: None,
+            member: None,
+            start: 0,
+            end,
+            start_line: 1,
+            end_line,
+        }
+    }
+
+    fn to_json(&self, bytes: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "path": self.file.rel,
+            "scope": self.scope,
+            "symbol": self.symbol,
+            "member": self.member,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "hash": bundle::span_hash(bytes, self.start, self.end),
+            "granularity": granularity_of(self.file).as_str(),
+        })
+    }
+}
+
+fn read_source(file: &FileEntry) -> Result<Vec<u8>, FilerError> {
+    std::fs::read(&file.abs)
+        .map_err(|error| FilerError::internal(format!("cannot read {}: {error}", file.rel)))
+}
+
+/// `filer resolve app.Pricing.discount`: exact FQN lookup, never fuzzy.
+fn resolve_cmd(root: &Path, args: ResolveArgs, _context: &Context) -> Result<bool, FilerError> {
+    let index = Index::build(root);
+    let fqn = args.fqn.trim();
+    for file in &index.files {
+        for symbol in &file.symbols {
+            let class_fqn = class_fqn(file, symbol);
+            if class_fqn == fqn {
+                let bytes = read_source(file)?;
+                let value = UnitSpan::symbol(file, symbol).to_json(&bytes);
+                println!("{value}");
+                return Ok(false);
+            }
+            for member in &symbol.members {
+                if format!("{class_fqn}.{}", member.name) == fqn {
+                    let bytes = read_source(file)?;
+                    let value = UnitSpan::member(file, symbol, member).to_json(&bytes);
+                    println!("{value}");
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Err(FilerError::unit_not_found(format!("no unit has FQN {fqn}"))
+        .with_hint("run `filer search --query ...` to find the indexed name"))
+}
+
+/// `filer locate --at-line 61 src/Pricing.java`: line -> the unit that owns it.
+fn locate_cmd(root: &Path, args: LocateArgs, _context: &Context) -> Result<bool, FilerError> {
+    let index = Index::build(root);
+    let root = index.root.clone();
+    let Some(rel) = locate(&index, &root, &args.file) else {
+        return Err(FilerError::file_not_found(format!(
+            "{} is not inside {}",
+            args.file,
+            root.display()
+        )));
+    };
+    let Some(&position) = index.by_rel.get(&rel) else {
+        return Err(FilerError::not_indexed(format!(
+            "{rel} is not indexed (binary, skipped directory or unsupported language?)"
+        ))
+        .with_hint("run `filer index` to see what the index contains"));
+    };
+    let file = &index.files[position];
+    if args.at_line == 0 || args.at_line > file.end_line {
+        return Err(FilerError::unit_not_found(format!(
+            "{}:{} is not inside any unit",
+            file.rel, args.at_line
+        ))
+        .with_hint("lines are 1-based and must exist in the file"));
+    }
+    let bytes = read_source(file)?;
+    let source = String::from_utf8_lossy(&bytes);
+    let offset = offset_of_line(&source, args.at_line);
+
+    if let Some((class, member)) = file.member_at(offset) {
+        if member.kind == MemberKind::Method {
+            let value = UnitSpan::member(file, class, member).to_json(&bytes);
+            println!("{value}");
+            return Ok(false);
+        }
+    }
+    if let Some(symbol) = file.symbol_at(offset) {
+        let value = UnitSpan::symbol(file, symbol).to_json(&bytes);
+        println!("{value}");
+        return Ok(false);
+    }
+    if granularity_of(file) == Granularity::File {
+        let value = UnitSpan::whole_file(file, bytes.len(), file.end_line).to_json(&bytes);
+        println!("{value}");
+        return Ok(false);
+    }
+    Err(FilerError::unit_not_found(format!(
+        "{}:{} is not inside any unit",
+        file.rel, args.at_line
+    ))
+    .with_hint("use `filer search` to find a symbol, or bundle the whole file"))
 }
 
 /// One picker row: JSON for Telescope, or `marker<TAB>[kind] label<TAB>target`.
