@@ -1,42 +1,8 @@
 //! Java parsing via tree-sitter: package, top-level types and imports.
 
-use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ImportKind {
-    /// `import a.b.C;`
-    Type,
-    /// `import static a.b.C.member;`
-    Static,
-    /// `import a.b.*;` (includes static wildcard imports)
-    Wildcard,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Import {
-    /// Dotted name as written in the source, without `static` or `*`.
-    pub path: String,
-    pub kind: ImportKind,
-}
-
-impl Import {
-    pub fn is_wildcard(&self) -> bool {
-        self.kind == ImportKind::Wildcard
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct JavaSource {
-    pub package: Option<String>,
-    pub types: Vec<String>,
-    pub imports: Vec<Import>,
-    /// Type names referenced anywhere in the file (`DemoDocument.class`,
-    /// generic arguments, field types, ...). Catches same-package references,
-    /// which Java needs no import for.
-    pub uses: Vec<String>,
-}
+use crate::lang::{Import, ImportKind, Source};
 
 pub struct JavaParser {
     parser: Parser,
@@ -62,10 +28,10 @@ impl JavaParser {
     /// Parses a Java source file. Returns `None` only when the parser bails out
     /// (invalid encoding or cancelled parse). Files with syntax errors still
     /// yield whatever declarations tree-sitter could recover.
-    pub fn parse(&mut self, src: &str) -> Option<JavaSource> {
+    pub fn parse(&mut self, src: &str) -> Option<Source> {
         let tree = self.parser.parse(src, None)?;
         let root = tree.root_node();
-        let mut out = JavaSource::default();
+        let mut out = Source::default();
         let mut cursor = root.walk();
         for child in root.children(&mut cursor) {
             match child.kind() {
@@ -170,7 +136,7 @@ fn text_of<'a>(node: Node<'a>, src: &str) -> String {
 mod tests {
     use super::*;
 
-    fn parse(src: &str) -> JavaSource {
+    fn parse(src: &str) -> Source {
         JavaParser::new().parse(src).expect("parsed")
     }
 

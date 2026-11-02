@@ -1,9 +1,10 @@
 //! Markdown rendering of a code bundle that can be pasted into a chat.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::index::Index;
+use crate::lang::Language;
 use crate::resolve::Reason;
 
 pub struct BundleOptions {
@@ -112,9 +113,11 @@ fn fence_for(content: &str) -> String {
 }
 
 fn language_for(rel: &str) -> &'static str {
+    if let Some(language) = Language::from_path(Path::new(rel)) {
+        return language.fence();
+    }
     let extension = rel.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
     match extension {
-        "java" => "java",
         "kt" | "kts" => "kotlin",
         "groovy" | "gradle" => "groovy",
         "xml" | "pom" => "xml",

@@ -22,13 +22,13 @@ return {
     opts = {
       -- Path to the binary. nil = $PATH, then this repo's target/{release,debug}/filer.
       bin = nil,
-      -- Project root. nil = detect via .git / pom.xml / build.gradle(.kts) / gradlew / mvnw.
+      -- Project root. nil = detect via .git / pom.xml / build.gradle(.kts) / build.sbt / gradlew / mvnw.
       root = nil,
       -- Import hops to follow when bundling.
       depth = 2,
       -- Also include files sharing a package with a bundled file.
       same_package = false,
-      -- Also include pom.xml / build.gradle / settings.gradle.
+      -- Also include pom.xml / build.gradle / settings.gradle / build.sbt.
       with_config = false,
       -- How the bundle buffer opens: "vsplit", "split", "tabnew".
       split = "vsplit",

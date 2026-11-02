@@ -1,4 +1,4 @@
---- filer.nvim — bundle Java sources (plus their imports) for pasting into a chat.
+--- filer.nvim — bundle Java and Scala sources (plus their imports) for a chat.
 local M = {}
 
 M.config = {
@@ -10,7 +10,7 @@ M.config = {
   depth = 2,
   -- Also include files sharing a package with a bundled file.
   same_package = false,
-  -- Also include pom.xml / build.gradle / settings.gradle.
+  -- Also include pom.xml / build.gradle / settings.gradle / build.sbt.
   with_config = false,
   -- How the bundle buffer is opened ("vsplit", "split", "tabnew", ...).
   split = "vsplit",
@@ -52,6 +52,7 @@ function M.root()
     "build.gradle.kts",
     "settings.gradle",
     "settings.gradle.kts",
+    "build.sbt",
     "gradlew",
     "mvnw",
   }
@@ -106,7 +107,7 @@ local function run(args, root)
   return result.stdout or "", result.stderr or "", result.code
 end
 
---- Fuzzy-pick Java types and bundle them (plus imports) into a split.
+--- Fuzzy-pick types and bundle them (plus imports) into a split.
 function M.search(opts)
   opts = opts or {}
   local ok, pickers = pcall(require, "telescope.pickers")
@@ -153,7 +154,7 @@ function M.search(opts)
   end
 
   local picker = pickers.new({}, {
-    prompt_title = "filer: Java types (" .. vim.fn.fnamemodify(root, ":t") .. ")",
+    prompt_title = "filer: types (" .. vim.fn.fnamemodify(root, ":t") .. ")",
     results_title = "files · <Tab> to multi-select",
     finder = finders.new_job(function(prompt)
       local args = { M.bin(), "search", "--root", root, "--query", prompt or "" }

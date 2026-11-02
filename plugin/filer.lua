@@ -9,7 +9,7 @@ end
 
 vim.api.nvim_create_user_command("FilerSearch", function()
   filer().search()
-end, { desc = "filer: pick Java types and bundle them for chat" })
+end, { desc = "filer: pick types and bundle them for chat" })
 
 vim.api.nvim_create_user_command("FilerHere", function()
   filer().here()

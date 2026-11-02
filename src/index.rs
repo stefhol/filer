@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::java::{Import, JavaParser};
+use crate::lang::{Import, Language, SourceParser};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -27,7 +27,7 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -88,7 +88,7 @@ pub struct Index {
 impl Index {
     pub fn build(root: &Path) -> Index {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        let paths = collect_java_files(&root);
+        let paths = collect_source_files(&root);
 
         let mut cache = Cache::load(&root);
         let stale: HashMap<String, CacheEntry> = cache
@@ -122,11 +122,12 @@ impl Index {
                 index.by_fqn.entry(fqn).or_insert(position);
             }
             for ty in &file.types {
-                index
-                    .by_simple
-                    .entry(ty.clone())
-                    .or_default()
-                    .push(position);
+                // A Scala file can declare a class and its companion object
+                // (same name, same file); keep one entry per file.
+                let candidates = index.by_simple.entry(ty.clone()).or_default();
+                if candidates.last() != Some(&position) {
+                    candidates.push(position);
+                }
             }
         }
 
@@ -135,7 +136,7 @@ impl Index {
     }
 }
 
-fn collect_java_files(root: &Path) -> Vec<PathBuf> {
+fn collect_source_files(root: &Path) -> Vec<PathBuf> {
     WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -143,7 +144,7 @@ fn collect_java_files(root: &Path) -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "java"))
+        .filter(|path| Language::from_path(path).is_some())
         .collect()
 }
 
@@ -182,7 +183,7 @@ fn parse_all(
         for (chunk_index, slice) in paths.chunks(chunk).enumerate() {
             let base = chunk_index * chunk;
             handles.push(scope.spawn(move || {
-                let mut parser = JavaParser::new();
+                let mut parser = SourceParser::new();
                 let mut local = Vec::with_capacity(slice.len());
                 for (offset, path) in slice.iter().enumerate() {
                     if let Some(entry) = load_one(root, path, stale, &mut parser) {
@@ -210,7 +211,7 @@ fn load_one(
     root: &Path,
     path: &Path,
     stale: &HashMap<String, CacheEntry>,
-    parser: &mut JavaParser,
+    parser: &mut SourceParser,
 ) -> Option<(bool, FileEntry)> {
     let rel = relative(root, path);
     let metadata = fs::metadata(path).ok()?;
@@ -238,9 +239,10 @@ fn load_one(
         }
     }
 
+    let language = Language::from_path(path)?;
     let bytes = fs::read(path).ok()?;
     let source = String::from_utf8_lossy(&bytes);
-    let parsed = parser.parse(&source)?;
+    let parsed = parser.parse(language, &source)?;
     Some((
         false,
         FileEntry {
@@ -356,4 +358,50 @@ fn cache_path(root: &Path) -> Option<PathBuf> {
         base.join("filer")
             .join(format!("{:016x}.json", hasher.finish())),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolve::{closure_detailed, Reason, ResolveOptions};
+
+    #[test]
+    fn scala_companion_types_are_indexed_once_per_file() {
+        let root = std::env::temp_dir().join(format!("filer-index-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let app = root.join("src/main/scala/app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("DemoDocument.scala"),
+            "package app\ncase class DemoDocument()\nobject DemoDocument { def create() = new DemoDocument }\n",
+        )
+        .unwrap();
+        fs::write(
+            app.join("Service.scala"),
+            "package app\nclass Service { val doc = DemoDocument.create() }\n",
+        )
+        .unwrap();
+
+        let index = Index::build(&root);
+        assert_eq!(index.by_simple.get("DemoDocument").map(Vec::len), Some(1));
+
+        let service = index.by_rel["src/main/scala/app/Service.scala"];
+        let order = closure_detailed(
+            &index,
+            &[service],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+            },
+        );
+        assert!(
+            order.iter().any(|&(position, _, reason)| {
+                index.files[position].rel.ends_with("DemoDocument.scala")
+                    && reason == Reason::SamePackage
+            }),
+            "companion object use should pull its file in: {order:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

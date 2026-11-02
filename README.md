@@ -1,14 +1,14 @@
 # filer
 
-Select Java code in Neovim, get one pastable markdown blob for your chat LLM — with the
-files your selection imports, and the files those import, already included.
+Select Java or Scala code in Neovim, get one pastable markdown blob for your chat LLM —
+with the files your selection imports, and the files those import, already included.
 
 You have a chat interface but no agentic workflow. `filer` covers the boring part: finding
 the three or four files that belong together and formatting them so the model sees the
 whole picture instead of a fragment.
 
 ```
-┌─ Telescope: filer: Java types (demo) ────────────────┐
+┌─ Telescope: filer: types (demo) ─────────────────────┐
 │ > user                                               │
 │   com.example.repo.UserRepository        <Tab>       │
 │   com.example.model.User                 <Tab>       │
@@ -25,11 +25,16 @@ whole picture instead of a fragment.
 
 ## What it does
 
-- Indexes every `.java` file under the project root (tree-sitter based, no LSP, no classpath).
+- Indexes every `.java`, `.scala`, `.sbt` and `.sc` file under the project root
+  (tree-sitter based, no LSP, no classpath, no compiler).
 - Resolves `import a.b.C;`, `import a.b.C.member;` (static) and `import a.b.*;` against the
   files that actually exist in your repo.
+- Speaks Scala 2 and Scala 3 imports too: `import a.b.C`, wildcards (`._` and `.*`),
+  selector lists (`import a.b.{C, D}`), renames (`C => D` / `C as D`, including `=> _`),
+  `given` imports, comma-separated imports and nested or braced `package` clauses.
 - Follows type *usages* too, so a class that references a sibling in its own package — which
-  Java needs no import for, e.g. `indexOps(DemoDocument.class)` — still pulls that file in.
+  neither Java nor Scala needs an import for, e.g. `indexOps(DemoDocument.class)` or
+  `DemoDocument.create()` — still pulls that file in.
 - Walks the resulting graph to a configurable depth.
 - Remembers what is already bundled in a TOML state file, marks those files with `✓` in the
   picker, and grows the bundle instead of replacing it. Switching git branch kills the old
@@ -40,8 +45,9 @@ whole picture instead of a fragment.
   mtime + size. Re-indexing a 2000-file project takes ~40 ms, so the picker re-queries on
   every keystroke.
 
-Things it deliberately does not do: compile your project, read `pom.xml` dependencies, or
-pretend to resolve libraries. JDK and third-party imports are simply reported as unresolved.
+Things it deliberately does not do: compile your project, read `pom.xml` / `build.sbt`
+dependencies, or pretend to resolve libraries. JDK, Scala stdlib and third-party imports are
+simply reported as unresolved.
 
 ## Build
 
@@ -51,7 +57,7 @@ cargo build --release     # binary at target/release/filer
 cargo install --path .
 ```
 
-Requires a C compiler for the tree-sitter grammar (`gcc`/`clang`).
+Requires a C compiler for the tree-sitter grammars (`gcc`/`clang`).
 
 ## Install
 
@@ -71,6 +77,11 @@ irm https://github.com/stefhol/filer/releases/latest/download/filer-installer.ps
 
 Targets built per release: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `x86_64-pc-windows-msvc`. macOS is not built yet — use `cargo install --path .` there.
+
+`filer` needs the [tree-sitter CLI](https://tree-sitter.github.io/tree-sitter/creating-parsers#installation)
+at runtime — it is not bundled with the binary, so install it on every machine that runs
+`filer`: `cargo install tree-sitter-cli` (or your package manager, e.g.
+`pacman -S tree-sitter-cli`).
 
 ## Releases
 
@@ -121,10 +132,10 @@ cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
   },
   opts = {
     bin = nil,            -- $PATH, then this repo's target/{release,debug}/filer
-    root = nil,           -- detect via .git / pom.xml / build.gradle(.kts) / gradlew / mvnw
+    root = nil,           -- detect via .git / pom.xml / build.gradle(.kts) / build.sbt / ...
     depth = 2,            -- import hops to follow
     same_package = false, -- also pull in sibling files of the same package
-    with_config = false,  -- also add pom.xml / build.gradle
+    with_config = false,  -- also add pom.xml / build.gradle / build.sbt
     split = "vsplit",     -- or "split", "tabnew"
     copy = false,         -- true = also copy the bundle to the system clipboard
     state = true,         -- remember the bundle and mark it in the picker
@@ -152,7 +163,8 @@ disk. Bundling again — picker or `:FilerHere` — refills that same window and
 of opening another split; `q` closes it, and the next bundle opens a fresh one.
 
 Root detection uses `vim.fs.root` with markers `.git`, `pom.xml`, `build.gradle(.kts)`,
-`settings.gradle(.kts)`, `gradlew`, `mvnw`. Override with `opts.root` (string or function).
+`settings.gradle(.kts)`, `build.sbt`, `gradlew`, `mvnw`. Override with `opts.root` (string or
+function).
 
 ## Bundle state
 
@@ -247,6 +259,15 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C
 
 `bundle` flags: `--depth N` (0 = only the given files), `--with-same-package`,
 `--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`. Default depth is 2.
+`--with-config` adds `pom.xml`, the Gradle files and `build.sbt` / `project/*.sbt` when they
+exist.
+
+The same works for Scala:
+
+```sh
+filer --root ~/code/demo bundle --depth 2 \
+      src/main/scala/com/example/app/Application.scala > bundle.md
+```
 
 `show` takes no files: it reads the state file (default `<root>/.filer/bundle.toml`), picks the
 current branch's bundle (`--branch` overrides), re-reads the files from disk and renders it
@@ -258,31 +279,42 @@ do.
 
 1. Walk the tree, skipping `.git`, `target`, `build`, `out`, `bin`, `dist`, `.gradle`,
    `.idea`, `node_modules`.
-2. Parse each file with tree-sitter-java: package declaration, top-level type declarations
-   (class/interface/enum/record/annotation), import declarations.
+2. Parse each file with the tree-sitter grammar for its extension (`src/lang.rs`):
+   package declaration, top-level type declarations, import declarations. Java types are
+   classes/interfaces/enums/records/annotations; Scala types are classes, objects, traits,
+   enums and top-level type aliases. Sequential (`package a` / `package b`) and braced
+   (`package a.b { ... }`) clauses compose; `package object foo` counts as package `a.foo`.
 3. Build a `fqn -> file` map and a `package -> files` map.
 4. For an import, try the full name, then trim trailing segments one at a time
-   (`a.b.C.member` → `a.b.C`), which also covers nested types like `a.b.C.Inner`.
-   Wildcard imports expand to the whole package. Anything unresolved is JDK/third-party.
-5. For every `type_identifier` in the file (class literals, field types, generics, casts,
-   `new`) look the name up in the index. Names that are explicitly imported are left to
-   step 4; a same-package match wins; otherwise the name is only used when it is unique in
-   the repo. Ambiguous names are dropped rather than guessed.
+   (`a.b.C.member` → `a.b.C`), which also covers nested types like `a.b.C.Inner` and Scala
+   selectors / `given` imports. Wildcard imports expand to the whole package, or to the
+   object/type they name (`import a.b.C._`). Anything unresolved is JDK, Scala stdlib or
+   third-party.
+5. For every type name in the file (Java `type_identifier`s; Scala type positions plus
+   object receivers like `DemoDocument.create`) look the name up in the index. Names that
+   are explicitly imported are left to step 4; a same-package match wins; otherwise the name
+   is only used when it is unique in the repo. Ambiguous names are dropped rather than
+   guessed.
 6. Breadth-first walk from the seeds up to `--depth`, preserving discovery order so the
    bundle reads top-down from your entry point.
 
 ## Adding another language
 
-`src/java.rs` owns everything grammar-specific: it returns `package`, `types`, `imports`
-with an `ImportKind`, and the rest of the pipeline is language-agnostic. For Kotlin or
-TypeScript, add a sibling module that produces the same `JavaSource`-shaped struct, dispatch
-on file extension in `src/index.rs`, and teach `src/bundle.rs` the right fence language.
+`src/lang.rs` holds the language-neutral [`Source`](src/lang.rs) struct (`package`, `types`,
+`imports` with an `ImportKind`, `uses`) and the `Language` -> extension map. `src/java.rs`
+and `src/scala.rs` only translate their grammar into that struct. To add Kotlin or
+TypeScript: add a parser module returning `Source`, add an arm to `Language::from_path` and
+`SourceParser::parse`, and give the language a fence string. Indexing, resolution, state and
+rendering need no changes (import normalization, e.g. Scala selector expansion, belongs in
+the language module).
 
 ## Layout
 
 ```
 src/main.rs     CLI (search / bundle / deps / index)
+src/lang.rs     language detection, Source/Import model, parser dispatch
 src/java.rs     tree-sitter-java parsing + tests
+src/scala.rs    tree-sitter-scala parsing, import normalization + tests
 src/index.rs    tree walk, parallelism, disk cache
 src/resolve.rs  import resolution, closure, tests
 src/bundle.rs   markdown rendering, tests
@@ -292,6 +324,6 @@ plugin/filer.lua user commands
 examples/lazyvim.lua  copy-paste LazyVim spec with the defaults above
 ```
 
-`cargo test` covers parsing, static/wildcard imports, name inference without imports,
-closure depth, same-package expansion, fence selection, TOML round-trips and branch
-staleness.
+`cargo test` covers Java and Scala parsing (packages, Scala import forms, renames, `given`),
+static/wildcard imports, name inference without imports, closure depth, same-package
+expansion, fence selection, TOML round-trips and branch staleness.

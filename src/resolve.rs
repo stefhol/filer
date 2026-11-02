@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::index::{FileEntry, Index};
-use crate::java::{Import, ImportKind};
+use crate::lang::{Import, ImportKind};
 
 /// Why a file ended up in a bundle. Serialized as a kebab-case string in the
 /// state file, e.g. `reason = "same-package"`.
@@ -82,11 +82,21 @@ impl Default for ResolveOptions {
 /// trimming trailing segments until a known type name is hit.
 pub fn resolve_import(index: &Index, import: &Import) -> Vec<usize> {
     if import.is_wildcard() {
-        return index
+        // `a.b._` is usually a package, but Scala also lets you import the
+        // members of an object (`a.b.C._`, `a.b.C.given`) and Java has static
+        // wildcard imports. A path can be both a package and a type, so take
+        // the union instead of guessing.
+        let mut resolved = index
             .by_package
             .get(&import.path)
             .cloned()
             .unwrap_or_default();
+        if let Some(&position) = index.by_fqn.get(&import.path) {
+            if !resolved.contains(&position) {
+                resolved.push(position);
+            }
+        }
+        return resolved;
     }
 
     let segments: Vec<&str> = import.path.split('.').collect();
@@ -116,6 +126,18 @@ pub fn resolve_import(index: &Index, import: &Import) -> Vec<usize> {
                 .find(|&&position| index.files[position].types.iter().any(|ty| ty == name))
             {
                 return vec![position];
+            }
+
+            // Scala package objects and files with only top-level definitions
+            // declare no indexed type, but they are where the imported member
+            // lives (`import a.b.Version` with `package object b`).
+            let definition_only: Vec<usize> = files
+                .iter()
+                .copied()
+                .filter(|&position| index.files[position].types.is_empty())
+                .collect();
+            if !definition_only.is_empty() {
+                return definition_only;
             }
         }
     }
@@ -418,6 +440,43 @@ mod tests {
             2
         );
         assert!(resolve_import(&index, &import("java.util.List", ImportKind::Type)).is_empty());
+    }
+
+    #[test]
+    fn member_of_a_package_object_resolves_to_its_file() {
+        let files = vec![FileEntry {
+            rel: "src/main/scala/app/util/package.scala".to_string(),
+            abs: PathBuf::from("/repo/src/main/scala/app/util/package.scala"),
+            package: Some("app.util".to_string()),
+            types: Vec::new(),
+            imports: Vec::new(),
+            uses: Vec::new(),
+        }];
+        let mut index = Index {
+            root: PathBuf::from("/repo"),
+            files,
+            ..Default::default()
+        };
+        index.by_package.insert("app.util".to_string(), vec![0]);
+        assert_eq!(
+            resolve_import(&index, &import("app.util.Version", ImportKind::Type)),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn wildcard_can_resolve_to_an_object_path() {
+        let index = fixture();
+        // Scala's `import app.Service._` names a type, not a package.
+        assert_eq!(
+            resolve_import(&index, &import("app.Service", ImportKind::Wildcard)),
+            vec![0]
+        );
+        // A real package still expands to its files.
+        assert_eq!(
+            resolve_import(&index, &import("app.model", ImportKind::Wildcard)),
+            vec![2, 3]
+        );
     }
 
     #[test]

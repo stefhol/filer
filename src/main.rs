@@ -1,9 +1,11 @@
-//! `filer` — bundle Java sources and their import closure for a chat LLM.
+//! `filer` — bundle Java and Scala sources and their import closure for a chat LLM.
 
 mod bundle;
 mod index;
 mod java;
+mod lang;
 mod resolve;
+mod scala;
 mod state;
 
 use std::collections::HashMap;
@@ -20,7 +22,7 @@ use state::{BranchBundle, StateDoc, StateFile};
 #[command(
     name = "filer",
     version,
-    about = "Bundle Java sources and their import closure into chat-ready markdown"
+    about = "Bundle Java and Scala sources and their import closure into chat-ready markdown"
 )]
 struct Cli {
     /// Project root. Defaults to the current directory.
@@ -33,7 +35,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List Java types as JSON lines (used by the Neovim picker).
+    /// List source types as JSON lines (used by the Neovim picker).
     Search(SearchArgs),
     /// Emit a markdown bundle for the given files plus their import closure.
     Bundle(BundleArgs),
@@ -77,7 +79,7 @@ struct BundleArgs {
     /// Also include files that share a package with a bundled file.
     #[arg(long)]
     with_same_package: bool,
-    /// Also include build files (pom.xml, build.gradle, ...).
+    /// Also include build files (pom.xml, build.gradle, build.sbt, ...).
     #[arg(long)]
     with_config: bool,
     /// Bundle title shown in the header.
@@ -562,7 +564,15 @@ fn show_cmd(root: &Path, args: ShowArgs) {
 fn index_cmd(root: &Path) {
     let index = Index::build(root);
     println!("root:       {}", index.root.display());
-    println!("java files: {}", index.files.len());
+    println!("source files: {}", index.files.len());
+    for language in [lang::Language::Java, lang::Language::Scala] {
+        let count = index
+            .files
+            .iter()
+            .filter(|file| lang::Language::from_path(&file.abs) == Some(language))
+            .count();
+        println!("  {}: {count}", language.label());
+    }
     println!("packages:   {}", index.by_package.len());
     println!("types:      {}", index.by_fqn.len());
     println!(
@@ -710,6 +720,9 @@ fn config_files(root: &Path) -> Vec<BundleFile> {
         "settings.gradle",
         "settings.gradle.kts",
         "gradle.properties",
+        "build.sbt",
+        "project/build.properties",
+        "project/plugins.sbt",
     ];
     CANDIDATES
         .iter()
