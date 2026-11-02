@@ -37,5 +37,5 @@ vim.api.nvim_create_user_command("FilerBundle", function(args)
 end, {
   nargs = "+",
   complete = "file",
-  desc = "filer: bundle the given files with their imports",
+  desc = "filer: bundle given files or path::Symbol excerpts",
 })

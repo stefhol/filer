@@ -24,13 +24,13 @@ return {
     opts = {
       -- Path to the binary. nil = $PATH (where the release installer puts it).
       bin = nil,
-      -- Project root. nil = detect via .git / pom.xml / build.gradle(.kts) / build.sbt / gradlew / mvnw.
+      -- Project root. nil = detect via .git / pom.xml / build.gradle(.kts) / build.sbt / tsconfig / package.json / *.csproj.
       root = nil,
       -- Import hops to follow when bundling.
       depth = 2,
       -- Also include files sharing a package with a bundled file.
       same_package = false,
-      -- Also include pom.xml / build.gradle / settings.gradle / build.sbt.
+      -- Also include pom.xml / gradle / build.sbt / tsconfig / csproj.
       with_config = false,
       -- How the bundle buffer opens: "vsplit", "split", "tabnew".
       split = "vsplit",

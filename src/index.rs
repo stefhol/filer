@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::lang::{Import, Language, SourceParser};
+use crate::lang::{Import, Language, SourceParser, Symbol};
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -19,6 +19,12 @@ const SKIP_DIRS: &[&str] = &[
     ".mvn",
     ".filer",
     ".venv",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".turbo",
+    ".svelte-kit",
+    "coverage",
     "target",
     "build",
     "out",
@@ -27,7 +33,7 @@ const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -41,6 +47,13 @@ pub struct FileEntry {
     /// Type names referenced in the file (import-free same-package references
     /// included), sorted and deduplicated.
     pub uses: Vec<String>,
+    /// Top-level declarations with byte spans, in source order. Empty when the
+    /// file is the natural bundling unit (or the language has no parser for
+    /// symbols yet).
+    pub symbols: Vec<Symbol>,
+    /// End of the file header (license, package, imports): the first symbol's
+    /// start. Prepended to each symbol excerpt so it stands alone.
+    pub preamble_end: usize,
 }
 
 impl FileEntry {
@@ -60,6 +73,21 @@ impl FileEntry {
         })
     }
 
+    /// Language of the file, derived from its extension.
+    pub fn language(&self) -> Option<Language> {
+        Language::from_path(Path::new(&self.rel))
+    }
+
+    /// Symbol with this name, if the file declares one.
+    pub fn symbol(&self, name: &str) -> Option<&Symbol> {
+        self.symbols.iter().find(|symbol| symbol.name == name)
+    }
+
+    /// Symbol whose span contains `offset` (used by `--at-line`).
+    pub fn symbol_at(&self, offset: usize) -> Option<&Symbol> {
+        self.symbols.iter().find(|symbol| symbol.contains(offset))
+    }
+
     /// Name used as a single-line label in pickers.
     pub fn label(&self) -> String {
         let fqn = self.primary_fqn();
@@ -75,9 +103,15 @@ impl FileEntry {
 pub struct Index {
     pub root: PathBuf,
     pub files: Vec<FileEntry>,
-    pub by_fqn: HashMap<String, usize>,
+    /// Fully qualified type name -> files declaring it (one name can exist in
+    /// several languages, e.g. Java and Kotlin in the same package).
+    pub by_fqn: HashMap<String, Vec<usize>>,
     /// Simple type name -> files declaring it.
     pub by_simple: HashMap<String, Vec<usize>>,
+    /// Simple symbol name -> (file position, symbol index), for excerpt-level
+    /// resolution. Symbols are only in this map for languages that populate
+    /// them; whole-file bundles never look here.
+    pub by_symbol: HashMap<String, Vec<(usize, usize)>>,
     pub by_package: HashMap<String, Vec<usize>>,
     pub by_rel: HashMap<String, usize>,
     /// Number of files re-parsed on this run (for `filer index` stats).
@@ -119,7 +153,10 @@ impl Index {
                     .push(position);
             }
             for fqn in file.fqns() {
-                index.by_fqn.entry(fqn).or_insert(position);
+                let candidates = index.by_fqn.entry(fqn).or_default();
+                if candidates.last() != Some(&position) {
+                    candidates.push(position);
+                }
             }
             for ty in &file.types {
                 // A Scala file can declare a class and its companion object
@@ -128,6 +165,13 @@ impl Index {
                 if candidates.last() != Some(&position) {
                     candidates.push(position);
                 }
+            }
+            for (symbol_index, symbol) in file.symbols.iter().enumerate() {
+                index
+                    .by_symbol
+                    .entry(symbol.name.clone())
+                    .or_default()
+                    .push((position, symbol_index));
             }
         }
 
@@ -234,6 +278,8 @@ fn load_one(
                     types: cached.types.clone(),
                     imports: cached.imports.clone(),
                     uses: cached.uses.clone(),
+                    symbols: cached.symbols.clone(),
+                    preamble_end: cached.preamble_end,
                 },
             ));
         }
@@ -252,6 +298,8 @@ fn load_one(
             types: parsed.types,
             imports: parsed.imports,
             uses: parsed.uses,
+            symbols: parsed.symbols,
+            preamble_end: parsed.preamble_end,
         },
     ))
 }
@@ -290,6 +338,10 @@ struct CacheEntry {
     imports: Vec<Import>,
     #[serde(default)]
     uses: Vec<String>,
+    #[serde(default)]
+    symbols: Vec<Symbol>,
+    #[serde(default)]
+    preamble_end: usize,
 }
 
 impl Cache {
@@ -331,6 +383,8 @@ impl Cache {
                     types: file.types.clone(),
                     imports: file.imports.clone(),
                     uses: file.uses.clone(),
+                    symbols: file.symbols.clone(),
+                    preamble_end: file.preamble_end,
                 })
             })
             .collect();
@@ -364,6 +418,44 @@ fn cache_path(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::resolve::{closure_detailed, Reason, ResolveOptions};
+
+    #[test]
+    fn indexes_every_supported_extension() {
+        let root = std::env::temp_dir().join(format!("filer-langs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let files = [
+            ("A.java", "package p; class A {}"),
+            ("B.scala", "package p\nclass B"),
+            ("C.kt", "package p\nclass C"),
+            ("D.groovy", "package p\nclass D {}"),
+            ("E.cs", "namespace p; class E {}"),
+            ("F.ts", "export class F {}"),
+            ("G.jsx", "export class G {}"),
+            (
+                "H.vue",
+                "<script setup lang=\"ts\">import X from \"./x\"</script>",
+            ),
+            ("I.fe", "function i() { return 1; }"),
+        ];
+        for (name, source) in files {
+            fs::write(root.join(name), source).unwrap();
+        }
+
+        let index = Index::build(&root);
+        assert_eq!(index.files.len(), files.len());
+        assert_eq!(
+            index
+                .files
+                .iter()
+                .filter_map(FileEntry::language)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            Language::ALL.len()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn scala_companion_types_are_indexed_once_per_file() {

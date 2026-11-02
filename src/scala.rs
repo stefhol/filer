@@ -3,7 +3,7 @@
 
 use tree_sitter::{Node, Parser};
 
-use crate::lang::{Import, ImportKind, Source};
+use crate::lang::{finish_symbols, symbol_from_node, Import, ImportKind, Source, SymbolKind};
 
 pub struct ScalaParser {
     parser: Parser,
@@ -46,9 +46,7 @@ impl ScalaParser {
 
         let mut uses = Vec::new();
         collect_type_uses(root, src, &mut uses);
-        uses.sort();
-        uses.dedup();
-        out.uses = uses;
+        finish_symbols(&mut out, &uses);
 
         Some(out)
     }
@@ -120,6 +118,13 @@ fn walk_scope(
                 if let Some(name) = child.child_by_field_name("name") {
                     let text = text_of(name, src);
                     if !text.is_empty() {
+                        out.symbols.push(symbol_from_node(
+                            child,
+                            &text,
+                            SymbolKind::Type,
+                            &["comment"],
+                            src,
+                        ));
                         out.types.push(text);
                     }
                 }
@@ -302,14 +307,14 @@ fn wildcard(base: &str) -> Import {
 /// Collects type names (`type_identifier`) plus object-like receivers of field
 /// accesses (`DemoDocument.create`), which Scala needs no import for when the
 /// object lives in the same package.
-fn collect_type_uses(root: Node<'_>, src: &str, out: &mut Vec<String>) {
+fn collect_type_uses(root: Node<'_>, src: &str, out: &mut Vec<(String, usize)>) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match node.kind() {
             "type_identifier" => {
                 let text = text_of(node, src);
                 if !text.is_empty() {
-                    out.push(text);
+                    out.push((text, node.start_byte()));
                 }
             }
             "identifier" => {
@@ -322,7 +327,7 @@ fn collect_type_uses(root: Node<'_>, src: &str, out: &mut Vec<String>) {
                 if receiver {
                     let text = text_of(node, src);
                     if !text.is_empty() {
-                        out.push(text);
+                        out.push((text, node.start_byte()));
                     }
                 }
             }

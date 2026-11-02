@@ -1,14 +1,19 @@
 # filer
 
-Select Java or Scala code in Neovim, get one pastable markdown blob for your chat LLM —
+Select Java, Scala, Kotlin, Groovy, C#, TypeScript, JavaScript, Vue or Asset Control
+Formula Engine (`.fe`) code in Neovim, get one pastable markdown blob for your chat LLM —
 with the files your selection imports, and the files those import, already included.
+
+For `.fe` files — and, on request, for any language — the unit is not the file but the
+**function or type** you picked: `main.fe::riskValue` pulls in that function and the
+functions it calls, not the whole 20 000-line file.
 
 You have a chat interface but no agentic workflow. `filer` covers the boring part: finding
 the three or four files that belong together and formatting them so the model sees the
 whole picture instead of a fragment.
 
 ```
-┌─ Telescope: filer: types (demo) ─────────────────────┐
+┌─ Telescope: filer: symbols (demo) ───────────────────┐
 │ > user                                               │
 │   com.example.repo.UserRepository        <Tab>       │
 │   com.example.model.User                 <Tab>       │
@@ -25,29 +30,43 @@ whole picture instead of a fragment.
 
 ## What it does
 
-- Indexes every `.java`, `.scala`, `.sbt` and `.sc` file under the project root
-  (tree-sitter based, no LSP, no classpath, no compiler).
-- Resolves `import a.b.C;`, `import a.b.C.member;` (static) and `import a.b.*;` against the
-  files that actually exist in your repo.
-- Speaks Scala 2 and Scala 3 imports too: `import a.b.C`, wildcards (`._` and `.*`),
-  selector lists (`import a.b.{C, D}`), renames (`C => D` / `C as D`, including `=> _`),
-  `given` imports, comma-separated imports and nested or braced `package` clauses.
+- Indexes `.java`, `.scala` / `.sbt` / `.sc`, `.kt` / `.kts`, `.groovy` / `.gradle`, `.cs`,
+  `.ts` / `.tsx`, `.js` / `.jsx` / `.mjs` / `.cjs`, `.vue` and `.fe` files under the project
+  root (tree-sitter based except `.fe`, which has a small hand-written parser; no LSP, no
+  classpath, no compiler).
+- Resolves package-style imports against the files that actually exist in your repo:
+  Java `import a.b.C;` / `import static ...` / `import a.b.*;`, Scala 2 and 3 (selector
+  lists, renames, `given`, comma-separated imports, nested or braced packages, package
+  objects), Kotlin wildcards and aliases, Groovy wildcards, static imports and aliases, and
+  C# `using` namespaces, `using static` and aliases.
+- Resolves TypeScript/JavaScript/Vue module specifiers: relative imports and re-exports
+  (`./x`, `../y.js`), extensionless imports, directory `index` files, `.js` specifiers that
+  point at a `.ts` source, dynamic `import()` and CommonJS `require()`. Vue `<script>` and
+  `<script setup>` blocks are extracted and parsed as TypeScript/JavaScript.
 - Follows type *usages* too, so a class that references a sibling in its own package — which
-  neither Java nor Scala needs an import for, e.g. `indexOps(DemoDocument.class)` or
-  `DemoDocument.create()` — still pulls that file in.
+  Java, Scala, Kotlin, Groovy or C# needs no import for, e.g. `indexOps(DemoDocument.class)`,
+  `DemoDocument.create()` or `new DemoDocument()` — still pulls that file in. Module
+  languages rely on their explicit imports instead of repo-wide name guessing.
+- Extracts **symbols** (top-level functions, classes, objects, global declarations) with
+  their byte spans, so a bundle can carry one function out of a huge file. `.fe` functions
+  are the primary use case: they call each other across a project-wide namespace, exactly
+  like the language's IntelliJ plugin resolves them.
 - Walks the resulting graph to a configurable depth.
-- Remembers what is already bundled in a TOML state file, marks those files with `✓` in the
-  picker, and grows the bundle instead of replacing it. Switching git branch kills the old
-  state automatically.
+- Remembers what is already bundled in a TOML state file, marks those entries with `✓` in
+  the picker, and grows the bundle instead of replacing it. Switching git branch kills the
+  old state automatically.
 - Renders the selection as markdown: header, file list with import depths, then one fenced
-  block per file. Fences grow automatically if a file already contains backticks.
+  block per file or excerpt. Fences grow automatically if a file already contains backticks.
 - Caches the index in `~/.cache/filer/`, keyed by root path and invalidated per file by
   mtime + size. Re-indexing a 2000-file project takes ~40 ms, so the picker re-queries on
   every keystroke.
 
-Things it deliberately does not do: compile your project, read `pom.xml` / `build.sbt`
-dependencies, or pretend to resolve libraries. JDK, Scala stdlib and third-party imports are
-simply reported as unresolved.
+Things it deliberately does not do: compile your project, read `pom.xml` / `build.sbt` /
+`*.csproj` / `package.json` dependencies, or pretend to resolve libraries. JDK, Scala stdlib,
+npm packages, NuGet packages and other third-party imports are simply reported as unresolved
+(`tsconfig` path aliases are not read). Imports only resolve within the same language family
+(JVM-ish languages with each other, TS/JS/Vue with each other, FE with itself), never
+across.
 
 ## Build
 
@@ -138,7 +157,7 @@ cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
     root = nil,           -- detect via .git / pom.xml / build.gradle(.kts) / build.sbt / ...
     depth = 2,            -- import hops to follow
     same_package = false, -- also pull in sibling files of the same package
-    with_config = false,  -- also add pom.xml / build.gradle / build.sbt
+    with_config = false,  -- also add pom.xml / gradle / build.sbt / tsconfig / csproj
     split = "vsplit",     -- or "split", "tabnew"
     copy = false,         -- true = also copy the bundle to the system clipboard
     state = true,         -- remember the bundle and mark it in the picker
@@ -154,9 +173,9 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 
 | Command | Effect |
 | --- | --- |
-| `:FilerSearch` | Telescope picker. `<Tab>` multi-selects, `<CR>` bundles. |
-| `:FilerHere` | Bundles the current buffer's file with its imports. |
-| `:FilerBundle {files}` | Bundles the given files (relative to root or absolute). |
+| `:FilerSearch` | Telescope picker of symbols (functions for `.fe`, types elsewhere). `<Tab>` multi-selects, `<CR>` bundles. |
+| `:FilerHere` | Bundles the current buffer with its imports. In a `.fe` file, the function under the cursor is the seed. |
+| `:FilerBundle {files}` | Bundles the given files (relative to root or absolute) or excerpts (`path::Symbol`). |
 | `:FilerShow [branch]` | Re-renders the saved bundle (current file contents) without re-resolving. |
 | `:FilerReset` | Forgets this branch's bundle; the next bundle starts empty. |
 | `:FilerResetAll` | Forgets every branch's bundle. |
@@ -166,8 +185,40 @@ disk. Bundling again — picker or `:FilerHere` — refills that same window and
 of opening another split; `q` closes it, and the next bundle opens a fresh one.
 
 Root detection uses `vim.fs.root` with markers `.git`, `pom.xml`, `build.gradle(.kts)`,
-`settings.gradle(.kts)`, `build.sbt`, `gradlew`, `mvnw`. Override with `opts.root` (string or
-function).
+`settings.gradle(.kts)`, `build.sbt`, `gradlew`, `mvnw`, `tsconfig.json`, `jsconfig.json`,
+`package.json`, `*.csproj`, `*.sln`. Override with `opts.root` (string or function).
+
+## Excerpts, not whole files
+
+Every language now records its top-level declarations as *symbols* with byte spans
+(`src/fe.rs` for `.fe`, plus the tree-sitter parsers). A bundle entry is either a whole file
+or one symbol of it:
+
+```sh
+filer --root ~/ac bundle --depth 2 main.fe::riskValue     # one function + what it calls
+filer --root ~/ac bundle --at-line 120 main.fe            # the function at line 120
+filer --root ~/ac bundle main.fe                          # still the whole file
+```
+
+What that means in practice:
+
+- `.fe` has no imports and no packages. Functions and top-level `global` declarations live
+  in one project-wide namespace, so a call `clamp(...)` pulls in the file that defines
+  `clamp`; `local` names, parameters, loop variables and built-ins (`len`, `dict_get`, `ts`,
+  …) are ignored. Ambiguous names are dropped rather than guessed.
+- An FE function seed pulls in the functions it calls and the top-level declarations it
+  references, to `--depth`. Top-level declarations are selectable excerpts too.
+- Excerpts are rendered as `### path :: name (line N)` and contain the declaration plus the
+  file header (package/imports/`using`s, one time) so they stand alone. Braces left open by
+  a block namespace are closed at the end.
+- Other languages keep whole-file bundling when you pass a plain path. Java/Scala/Kotlin/
+  C#/Groovy/TS/JS types are selectable as excerpts (`Application.java::Application`), and
+  `:FilerSearch` lists one entry per symbol instead of one per file.
+- Vue symbols are not sliced out (script offsets are relative to the extracted `<script>`
+  block), so `.vue` stays whole-file.
+
+The seed under the cursor is what `:FilerHere` uses in a `.fe` buffer: put the cursor in a
+function, the bundle contains that function and its calls.
 
 ## Bundle state
 
@@ -205,6 +256,16 @@ depth = 0
 reason = "seed"
 ```
 
+An excerpt entry also carries the declaration name; whole-file entries omit it:
+
+```toml
+[[bundles.files]]
+path = "ac/main.fe"
+symbol = "riskValue"
+depth = 0
+reason = "seed"
+```
+
 What that buys you:
 
 - The picker shows the **current branch's** bundled files as
@@ -218,8 +279,8 @@ What that buys you:
   data only, no filer instructions or prose — so the model can see what came in and why.
   (The `.filer/bundle.toml` sidecar keeps its one-line comment; that file never goes to
   the chat.)
-- `reason` is one of `seed`, `import`, `static-import`, `wildcard-import`, `same-package`,
-  `usage`, `package`, `config`, `external`.
+- `reason` is one of `seed`, `import`, `static-import`, `wildcard-import`, `module-import`,
+  `same-package`, `usage`, `package`, `config`, `external`.
 
 Cleaning up:
 
@@ -241,8 +302,8 @@ on load.
 ## CLI
 
 ```sh
-filer --root ~/code/demo search --query user           # JSON lines, one per type
-filer --root ~/code/demo search --query user --plain   # fqn<TAB>path
+filer --root ~/code/demo search --query user           # JSON lines, one per symbol
+filer --root ~/code/demo search --query user --plain   # fqn<TAB>path[::symbol]
 filer --root ~/code/demo deps src/main/java/com/example/app/Application.java
 filer --root ~/code/demo bundle --depth 2 --with-config \
       src/main/java/com/example/app/Application.java > bundle.md
@@ -260,64 +321,99 @@ filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml B.java > 
 filer --root ~/code/demo bundle --state ~/code/demo/.filer/bundle.toml --reset C.java > c.md
 ```
 
-`bundle` flags: `--depth N` (0 = only the given files), `--with-same-package`,
-`--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`. Default depth is 2.
-`--with-config` adds `pom.xml`, the Gradle files and `build.sbt` / `project/*.sbt` when they
-exist.
+`bundle` flags: `--depth N` (0 = only the given units), `--with-same-package`,
+`--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`, `--at-line N`.
+Default depth is 2. Add `::Symbol` to a file to bundle one declaration:
+`filer --root ~/ac bundle 'main.fe::riskValue'`.
+`--with-config` adds, when they exist: `pom.xml`, the Gradle files, `build.sbt` /
+`project/*.sbt`, `tsconfig.json` / `jsconfig.json` / `package.json`, `Directory.Build.props`
+and root-level `*.csproj` / `*.sln`.
 
-The same works for Scala:
+Every indexed language works the same:
 
 ```sh
-filer --root ~/code/demo bundle --depth 2 \
-      src/main/scala/com/example/app/Application.scala > bundle.md
+filer --root ~/code/demo bundle --depth 2 src/main/scala/com/example/app/Application.scala
+filer --root ~/code/demo bundle --depth 2 src/main/kotlin/com/example/App.kt
+filer --root ~/code/demo bundle --depth 2 src/web/app.ts
 ```
 
 `show` takes no files: it reads the state file (default `<root>/.filer/bundle.toml`), picks the
 current branch's bundle (`--branch` overrides), re-reads the files from disk and renders it
-again — useful after a restart, or to pipe a bundle into another tool. Files that vanished
-since are dropped with a notice; asking for a branch that has no bundle lists the ones that
-do.
+again — useful after a restart, or to pipe a bundle into another tool. Files or excerpts
+that vanished since are dropped with a notice; asking for a branch that has no bundle lists
+the ones that do.
 
 ## How resolution works
 
-1. Walk the tree, skipping `.git`, `target`, `build`, `out`, `bin`, `dist`, `.gradle`,
-   `.idea`, `node_modules`.
-2. Parse each file with the tree-sitter grammar for its extension (`src/lang.rs`):
-   package declaration, top-level type declarations, import declarations. Java types are
-   classes/interfaces/enums/records/annotations; Scala types are classes, objects, traits,
-   enums and top-level type aliases. Sequential (`package a` / `package b`) and braced
-   (`package a.b { ... }`) clauses compose; `package object foo` counts as package `a.foo`.
-3. Build a `fqn -> file` map and a `package -> files` map.
-4. For an import, try the full name, then trim trailing segments one at a time
+1. Walk the tree, skipping `.git`, `.gradle`, `.idea`, `.filer`, `.venv`, `.next`, `.nuxt`,
+   `.output`, `.turbo`, `.svelte-kit`, `target`, `build`, `out`, `bin`, `dist`, `coverage`
+   and `node_modules`.
+2. Parse each file with the tree-sitter grammar for its extension (`src/lang.rs`; Vue uses
+   the TypeScript grammar on its `<script>` blocks). Java types are
+   classes/interfaces/enums/records/annotations; Scala adds objects, traits and top-level
+   type aliases; Kotlin adds objects and type aliases; Groovy adds traits; C# adds structs,
+   records and delegates; TS/JS add interfaces, type aliases and enums. Sequential and braced
+   package/namespace clauses compose; `package object foo` counts as package `a.foo`;
+   C# file-scoped namespaces apply to the rest of the file.
+3. Build `fqn -> files`, `package -> files`, simple-name and `symbol -> (file, index)` maps.
+   A name can exist in several languages, so lookups are filtered by language family:
+   JVM-ish (Java, Scala, Kotlin, Groovy, C#) only resolve against each other, TS/JS/Vue only
+   against each other, and Asset Control Formula Engine is its own family with a single
+   global namespace: calls and top-level declarations resolve by unique name across `.fe`
+   files (the IDE plugin's stub indexes do the same, and index a top-level declaration
+   whether it says `local` or `global`).
+4. For a package-style import, try the full name, then trim trailing segments one at a time
    (`a.b.C.member` → `a.b.C`), which also covers nested types like `a.b.C.Inner` and Scala
-   selectors / `given` imports. Wildcard imports expand to the whole package, or to the
-   object/type they name (`import a.b.C._`). Anything unresolved is JDK, Scala stdlib or
-   third-party.
-5. For every type name in the file (Java `type_identifier`s; Scala type positions plus
-   object receivers like `DemoDocument.create`) look the name up in the index. Names that
-   are explicitly imported are left to step 4; a same-package match wins; otherwise the name
-   is only used when it is unique in the repo. Ambiguous names are dropped rather than
-   guessed.
-6. Breadth-first walk from the seeds up to `--depth`, preserving discovery order so the
+   selectors / `given` imports. Wildcards expand to the package, or to the object/type they
+   name (`import a.b.C._`); C# `using Some.Namespace;` is a package wildcard. Anything
+   unresolved is JDK, stdlib, npm, NuGet or another third party.
+5. For a module import, join the specifier onto the importing file's directory, reject paths
+   that escape the root, then probe in order: the exact path, TS extensions (`.ts`, `.tsx`,
+   then JS `.js`, `.jsx`, `.mjs`, `.cjs`, then `.vue`), and `<dir>/index.*`. A `.js`
+   specifier prefers the matching `.ts`/`.tsx` source. Bare specifiers (`react`) are treated
+   as third-party.
+6. For every type name used in the file (Java/Scala type positions, Kotlin user types,
+   Groovy/C# type positions, object receivers like `DemoDocument.create`) look the name up in
+   the index. Names that are explicitly imported are left to step 4; a same-package match
+   wins; otherwise the name is only used when it is unique in the repo. Ambiguous names are
+   dropped rather than guessed.
+7. For a symbol seed, do the same with the names used *inside that symbol*, and map each hit
+   to the symbol that declares it (a sibling in the same file first). A whole-file unit that
+   ends up in the same bundle supersedes its symbol units.
+8. Breadth-first walk from the seeds up to `--depth`, preserving discovery order so the
    bundle reads top-down from your entry point.
 
 ## Adding another language
 
 `src/lang.rs` holds the language-neutral [`Source`](src/lang.rs) struct (`package`, `types`,
-`imports` with an `ImportKind`, `uses`) and the `Language` -> extension map. `src/java.rs`
-and `src/scala.rs` only translate their grammar into that struct. To add Kotlin or
-TypeScript: add a parser module returning `Source`, add an arm to `Language::from_path` and
-`SourceParser::parse`, and give the language a fence string. Indexing, resolution, state and
-rendering need no changes (import normalization, e.g. Scala selector expansion, belongs in
-the language module).
+`imports` with an `ImportKind`, `uses`, `symbols` with byte spans, `preamble_end`), the
+`Language` -> extension map and the `Language::family` grouping that keeps resolution
+between compatible languages only. The per-language modules (`java`, `scala`, `kotlin`,
+`groovy`, `csharp`, `web`, `fe`) only translate their grammar into that struct. To add
+another package+import language: add a parser module returning `Source`, add an arm to
+`Language::from_path` and `SourceParser::parse`, and pick a fence string. Indexing, closure,
+state and rendering need no changes. A language with a different import model (like TS/JS
+module paths) needs its own resolver branch in `src/resolve.rs` — that is where
+`ImportKind::Module` is handled.
+
+Populating `symbols` is optional: use `symbol_from_node` for a tree-sitter declaration (it
+extends the span over the doc comment and records the line) and `finish_symbols` to assign
+per-symbol uses. Return no symbols and the language keeps whole-file bundling. `.fe` is the
+opposite extreme: a hand-written lexer in `src/fe.rs` because no tree-sitter grammar exists
+and filer only needs function boundaries, not statements.
 
 ## Layout
 
 ```
 src/main.rs     CLI (search / bundle / deps / index)
-src/lang.rs     language detection, Source/Import model, parser dispatch
+src/lang.rs     language detection, families, Source/Import model, parser dispatch
 src/java.rs     tree-sitter-java parsing + tests
 src/scala.rs    tree-sitter-scala parsing, import normalization + tests
+src/kotlin.rs   tree-sitter-kotlin parsing + tests
+src/groovy.rs   tree-sitter-groovy parsing + tests
+src/csharp.rs   tree-sitter-c-sharp parsing (namespaces, usings) + tests
+src/web.rs      TypeScript/JavaScript parsing, Vue SFC extraction + tests
+src/fe.rs       Asset Control Formula Engine lexer/parser + tests
 src/index.rs    tree walk, parallelism, disk cache
 src/resolve.rs  import resolution, closure, tests
 src/bundle.rs   markdown rendering, tests
@@ -327,6 +423,9 @@ plugin/filer.lua user commands
 examples/lazyvim.lua  copy-paste LazyVim spec with the defaults above
 ```
 
-`cargo test` covers Java and Scala parsing (packages, Scala import forms, renames, `given`),
-static/wildcard imports, name inference without imports, closure depth, same-package
-expansion, fence selection, TOML round-trips and branch staleness.
+`cargo test` covers parsing for every language (packages/namespaces, Scala import forms,
+Kotlin/Groovy/C# imports, TS/JS module specifiers, Vue scripts, FE functions/declarations),
+static/wildcard/module resolution, family isolation, name inference without imports, closure
+depth, same-package expansion, symbol extraction and symbol closure (including depth bounds
+and whole-file supersession), preamble brace balancing, fence selection, TOML round-trips
+with `symbol` entries, and branch staleness.

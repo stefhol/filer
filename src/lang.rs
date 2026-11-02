@@ -8,25 +8,78 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::csharp::CSharpParser;
+use crate::fe::FeParser;
+use crate::groovy::GroovyParser;
 use crate::java::JavaParser;
+use crate::kotlin::KotlinParser;
 use crate::scala::ScalaParser;
+use crate::web::WebParser;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Java,
     Scala,
+    Kotlin,
+    Groovy,
+    CSharp,
+    TypeScript,
+    JavaScript,
+    Vue,
+    /// Asset Control Formula Engine code (`.fe`).
+    Fe,
+}
+
+/// Languages that share an import model and may resolve each other's files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Family {
+    /// Package + `Type` imports (Java, Scala, Kotlin, Groovy, C#).
+    Jvm,
+    /// Module specifiers and relative paths (TypeScript, JavaScript, Vue).
+    Web,
+    /// One global namespace, no imports at all (Asset Control Formula Engine).
+    Fe,
 }
 
 impl Language {
+    /// Every language the index understands, for stats and docs.
+    pub const ALL: [Language; 9] = [
+        Language::Java,
+        Language::Scala,
+        Language::Kotlin,
+        Language::Groovy,
+        Language::CSharp,
+        Language::TypeScript,
+        Language::JavaScript,
+        Language::Vue,
+        Language::Fe,
+    ];
+
     /// Language for a source file, or `None` when the extension is not indexed.
     ///
-    /// `.sbt` (build definitions) and `.sc` (Scala scripts, Scala CLI) are
-    /// parsed as Scala: they are ordinary Scala syntax, just without a package.
+    /// `.sbt` (sbt build definitions) and `.sc` (Scala scripts) are Scala;
+    /// `.gradle` files are Groovy; `.vue` files are Vue single-file components.
     pub fn from_path(path: &Path) -> Option<Language> {
         match path.extension()?.to_str()? {
             "java" => Some(Language::Java),
             "scala" | "sbt" | "sc" => Some(Language::Scala),
+            "kt" | "kts" => Some(Language::Kotlin),
+            "groovy" | "gradle" => Some(Language::Groovy),
+            "cs" => Some(Language::CSharp),
+            "ts" | "tsx" => Some(Language::TypeScript),
+            "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
+            "vue" => Some(Language::Vue),
+            "fe" => Some(Language::Fe),
             _ => None,
+        }
+    }
+
+    /// Imports and name inference only cross files inside the same family.
+    pub fn family(self) -> Family {
+        match self {
+            Language::TypeScript | Language::JavaScript | Language::Vue => Family::Web,
+            Language::Fe => Family::Fe,
+            _ => Family::Jvm,
         }
     }
 
@@ -35,6 +88,23 @@ impl Language {
         match self {
             Language::Java => "java",
             Language::Scala => "scala",
+            Language::Kotlin => "kotlin",
+            Language::Groovy => "groovy",
+            Language::CSharp => "csharp",
+            Language::TypeScript => "typescript",
+            Language::JavaScript => "javascript",
+            Language::Vue => "vue",
+            Language::Fe => "fe",
+        }
+    }
+
+    /// Fence for a specific extension (TSX/JSX differ from their base language).
+    pub fn fence_for(path: &Path) -> &'static str {
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("tsx") => "tsx",
+            Some("jsx") => "jsx",
+            Some("mjs" | "cjs") => "javascript",
+            _ => Language::from_path(path).map(Language::fence).unwrap_or(""),
         }
     }
 
@@ -42,6 +112,13 @@ impl Language {
         match self {
             Language::Java => "java",
             Language::Scala => "scala",
+            Language::Kotlin => "kotlin",
+            Language::Groovy => "groovy",
+            Language::CSharp => "csharp",
+            Language::TypeScript => "typescript",
+            Language::JavaScript => "javascript",
+            Language::Vue => "vue",
+            Language::Fe => "fe",
         }
     }
 }
@@ -49,18 +126,21 @@ impl Language {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportKind {
-    /// `import a.b.C;` / `import a.b.C`
+    /// `import a.b.C;` / `import a.b.C` / `using static a.b.C;`
     Type,
     /// Java's `import static a.b.C.member;`
     Static,
-    /// `import a.b.*;` / `import a.b._` / Scala selector wildcards
+    /// `import a.b.*;` / `import a.b._` / Scala selector wildcards /
+    /// C#'s `using Some.Namespace;`
     Wildcard,
+    /// A TypeScript/JavaScript module specifier (`./x`, `../y.js`, `react`).
+    Module,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Import {
-    /// Dotted name as written in the source, without `static`, `_`, `*` or
-    /// selector braces. Scala selectors are expanded to one import per name.
+    /// Dotted name as written in the source, or the raw module specifier for
+    /// [`ImportKind::Module`]. Selector imports are expanded to one per name.
     pub path: String,
     pub kind: ImportKind,
 }
@@ -71,18 +151,147 @@ impl Import {
     }
 }
 
+/// What kind of thing a [`Symbol`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolKind {
+    /// A Formula Engine function.
+    Function,
+    /// A class/interface/enum/record/object/trait/struct/type alias.
+    Type,
+    /// A top-level Formula Engine variable declaration (`global dict x = ...`).
+    Declaration,
+}
+
+/// One bundlable excerpt of a file: a top-level declaration with its byte span.
+///
+/// File-level bundling stays the default; a symbol is what `path::Name` and the
+/// picker select when you only want one 20 000-line file's function.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    /// Byte offset of the first byte of the excerpt (leading doc comment included).
+    pub start: usize,
+    /// Byte offset one past the last byte.
+    pub end: usize,
+    /// 1-based line of `start`, cached so the picker needs no file reads.
+    #[serde(default)]
+    pub line: usize,
+    /// Names referenced inside the symbol, deduplicated and sorted.
+    #[serde(default)]
+    pub uses: Vec<String>,
+    /// Function names invoked from inside the symbol (Formula Engine).
+    #[serde(default)]
+    pub calls: Vec<String>,
+}
+
+impl Symbol {
+    pub fn contains(&self, offset: usize) -> bool {
+        (self.start..self.end).contains(&offset)
+    }
+}
+
 /// What the index needs from a parsed file, independent of its language.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Source {
     pub package: Option<String>,
     /// Top-level type declarations (classes, interfaces, enums, records,
-    /// objects, traits, type aliases).
+    /// objects, traits, structs, type aliases).
     pub types: Vec<String>,
     pub imports: Vec<Import>,
     /// Type names referenced anywhere in the file (`DemoDocument.class`,
     /// generic arguments, field types, `Object.member` receivers, ...).
-    /// Catches same-package references, which need no import.
+    /// Catches same-package references, which need no import. Module languages
+    /// leave this empty and rely on explicit imports.
     pub uses: Vec<String>,
+    /// Top-level declarations in source order, with byte spans. Empty for
+    /// languages whose files are the natural bundling unit.
+    #[serde(default)]
+    pub symbols: Vec<Symbol>,
+    /// End of the file header (package/imports/license) — the first symbol's
+    /// start. Repeated in front of each symbol excerpt so it stands alone.
+    #[serde(default)]
+    pub preamble_end: usize,
+}
+
+/// Assigns each `(name, byte offset)` use to the symbol that contains it.
+/// Uses outside every symbol (imports, package clause) are dropped.
+pub fn attribute_uses(uses: &[(String, usize)], symbols: &[Symbol]) -> Vec<Vec<String>> {
+    let mut buckets = vec![Vec::new(); symbols.len()];
+    for (name, offset) in uses {
+        if let Some(index) = symbols.iter().position(|symbol| symbol.contains(*offset)) {
+            buckets[index].push(name.clone());
+        }
+    }
+    for bucket in &mut buckets {
+        bucket.sort();
+        bucket.dedup();
+    }
+    buckets
+}
+
+/// Builds the [`Symbol`] for one top-level declaration node.
+pub fn symbol_from_node(
+    node: tree_sitter::Node<'_>,
+    name: &str,
+    kind: SymbolKind,
+    comment_kinds: &[&str],
+    src: &str,
+) -> Symbol {
+    let start = leading_comment_start(node, comment_kinds);
+    Symbol {
+        name: name.to_string(),
+        kind,
+        start,
+        end: node.end_byte(),
+        line: line_of(src, start),
+        uses: Vec::new(),
+        calls: Vec::new(),
+    }
+}
+
+/// 1-based line of a byte offset.
+pub fn line_of(src: &str, offset: usize) -> usize {
+    src.as_bytes()[..offset.min(src.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1
+}
+
+/// Assigns `(name, offset)` uses to the symbols that contain them and fills in
+/// the file-level fields derived from them (`uses`, `preamble_end`).
+pub fn finish_symbols(out: &mut Source, uses: &[(String, usize)]) {
+    let mut names: Vec<String> = uses.iter().map(|(name, _)| name.clone()).collect();
+    names.sort();
+    names.dedup();
+    let buckets = attribute_uses(uses, &out.symbols);
+    for (symbol, bucket) in out.symbols.iter_mut().zip(buckets) {
+        symbol.uses = bucket;
+    }
+    out.uses = names;
+    out.preamble_end = out
+        .symbols
+        .iter()
+        .map(|symbol| symbol.start)
+        .min()
+        .unwrap_or(0);
+}
+
+/// Start of a declaration, walking backwards over contiguous comment siblings
+/// so an excerpt carries its doc comment.
+pub fn leading_comment_start(node: tree_sitter::Node<'_>, comment_kinds: &[&str]) -> usize {
+    let mut start = node.start_byte();
+    let mut current = node;
+    while let Some(previous) = current.prev_named_sibling() {
+        if !comment_kinds.contains(&previous.kind()) {
+            break;
+        }
+        start = previous.start_byte();
+        current = previous;
+    }
+    start
 }
 
 /// Parses source files of any supported language. Holds one tree-sitter parser
@@ -90,6 +299,11 @@ pub struct Source {
 pub struct SourceParser {
     java: JavaParser,
     scala: ScalaParser,
+    kotlin: KotlinParser,
+    groovy: GroovyParser,
+    csharp: CSharpParser,
+    web: WebParser,
+    fe: FeParser,
 }
 
 impl SourceParser {
@@ -97,6 +311,11 @@ impl SourceParser {
         Self {
             java: JavaParser::new(),
             scala: ScalaParser::new(),
+            kotlin: KotlinParser::new(),
+            groovy: GroovyParser::new(),
+            csharp: CSharpParser::new(),
+            web: WebParser::new(),
+            fe: FeParser::new(),
         }
     }
 
@@ -107,6 +326,13 @@ impl SourceParser {
         match language {
             Language::Java => self.java.parse(src),
             Language::Scala => self.scala.parse(src),
+            Language::Kotlin => self.kotlin.parse(src),
+            Language::Groovy => self.groovy.parse(src),
+            Language::CSharp => self.csharp.parse(src),
+            Language::Fe => self.fe.parse(src),
+            Language::TypeScript | Language::JavaScript | Language::Vue => {
+                self.web.parse(language, src)
+            }
         }
     }
 }
@@ -129,6 +355,16 @@ mod tests {
             ("App.scala", Some(Language::Scala)),
             ("build.sbt", Some(Language::Scala)),
             ("script.sc", Some(Language::Scala)),
+            ("App.kt", Some(Language::Kotlin)),
+            ("build.gradle.kts", Some(Language::Kotlin)),
+            ("build.gradle", Some(Language::Groovy)),
+            ("App.cs", Some(Language::CSharp)),
+            ("App.ts", Some(Language::TypeScript)),
+            ("App.tsx", Some(Language::TypeScript)),
+            ("App.js", Some(Language::JavaScript)),
+            ("App.jsx", Some(Language::JavaScript)),
+            ("App.vue", Some(Language::Vue)),
+            ("Risk.fe", Some(Language::Fe)),
             ("README.md", None),
             ("Makefile", None),
         ];
@@ -142,20 +378,39 @@ mod tests {
     }
 
     #[test]
-    fn parses_both_languages_through_one_parser() {
+    fn families_are_isolated() {
+        assert_eq!(Language::Kotlin.family(), Family::Jvm);
+        assert_eq!(Language::CSharp.family(), Family::Jvm);
+        assert_eq!(Language::TypeScript.family(), Family::Web);
+        assert_eq!(Language::Vue.family(), Family::Web);
+        assert_eq!(Language::Fe.family(), Family::Fe);
+    }
+
+    #[test]
+    fn extension_specific_fences() {
+        assert_eq!(Language::fence_for(Path::new("A.ts")), "typescript");
+        assert_eq!(Language::fence_for(Path::new("A.tsx")), "tsx");
+        assert_eq!(Language::fence_for(Path::new("A.jsx")), "jsx");
+        assert_eq!(Language::fence_for(Path::new("A.cjs")), "javascript");
+        assert_eq!(Language::fence_for(Path::new("A.cs")), "csharp");
+    }
+
+    #[test]
+    fn parses_every_language_through_one_parser() {
         let mut parser = SourceParser::new();
-        let java = parser
-            .parse(Language::Java, "package a; class A {}")
-            .unwrap();
-        assert_eq!(java.package.as_deref(), Some("a"));
-        assert_eq!(java.types, vec!["A"]);
-
-        let scala = parser.parse(Language::Scala, "package b\nclass B").unwrap();
-        assert_eq!(scala.package.as_deref(), Some("b"));
-        assert_eq!(scala.types, vec!["B"]);
-
-        // Switching back works too.
-        let java = parser.parse(Language::Java, "class C {}").unwrap();
-        assert_eq!(java.types, vec!["C"]);
+        let cases = [
+            (Language::Java, "package a; class A {}"),
+            (Language::Scala, "package b\nclass B"),
+            (Language::Kotlin, "package c\nclass C"),
+            (Language::Groovy, "package d\nclass D {}"),
+            (Language::CSharp, "namespace e; class E {}"),
+            (Language::TypeScript, "export class F {}"),
+            (Language::JavaScript, "export class G {}"),
+            (Language::Fe, "function g() { return 1; }"),
+        ];
+        for (language, source) in cases {
+            let parsed = parser.parse(language, source).expect("parsed");
+            assert!(!parsed.types.is_empty(), "{language:?}: {parsed:?}");
+        }
     }
 }

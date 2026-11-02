@@ -1,4 +1,4 @@
---- filer.nvim — bundle Java and Scala sources (plus their imports) for a chat.
+--- filer.nvim — bundle sources (plus their imports) for a chat.
 local M = {}
 
 M.config = {
@@ -45,6 +45,9 @@ function M.root()
   if configured then
     return configured
   end
+  local function dotnet_project(name)
+    return name:match("%.csproj$") ~= nil or name:match("%.sln$") ~= nil
+  end
   local markers = {
     ".git",
     "pom.xml",
@@ -53,8 +56,12 @@ function M.root()
     "settings.gradle",
     "settings.gradle.kts",
     "build.sbt",
+    "tsconfig.json",
+    "jsconfig.json",
+    "package.json",
     "gradlew",
     "mvnw",
+    dotnet_project,
   }
   -- The bundle buffer has no path of its own, so fall back to the root the
   -- last bundle was built from before giving up on the cwd.
@@ -136,29 +143,54 @@ function M.search(opts)
       return nil
     end
     local fqn = item.fqn or ""
+    local symbol = item.symbol
+    if symbol == vim.NIL then
+      symbol = nil
+    end
+    local line_number = item.line
+    if line_number == vim.NIL then
+      line_number = nil
+    end
+    local depth = item.depth
+    if depth == vim.NIL then
+      depth = nil
+    end
+    local reason = item.reason
+    if reason == vim.NIL then
+      reason = nil
+    end
     local label = fqn ~= "" and fqn or item.path
+    -- Functions are not unique across files (one .fe file holds thousands),
+    -- so show where the function lives.
+    if symbol and item.kind == "function" then
+      label = label .. "  (" .. item.path .. ")"
+    end
     local included = item.included == true
     if included then
-      local detail = item.reason or (item.depth and ("depth " .. item.depth)) or nil
-      if item.depth and item.reason then
-        detail = "depth " .. item.depth .. ", " .. item.reason
+      local detail = reason or (depth and ("depth " .. depth)) or nil
+      if depth and reason then
+        detail = "depth " .. depth .. ", " .. reason
       end
       label = "✓ " .. label .. (detail and ("  (" .. detail .. ")") or "")
     end
     return {
       value = item,
       path = item.path,
+      symbol = symbol,
+      kind = item.kind,
+      line = line_number,
       fqn = fqn,
       included = included,
       filename = root .. "/" .. item.path,
-      ordinal = (fqn ~= "" and (fqn .. " ") or "") .. item.path,
+      lnum = line_number or 1,
+      ordinal = (fqn ~= "" and (fqn .. " ") or "") .. item.path .. (symbol and (" " .. symbol) or ""),
       display = label,
     }
   end
 
   local picker = pickers.new({}, {
-    prompt_title = "filer: types (" .. vim.fn.fnamemodify(root, ":t") .. ")",
-    results_title = "files · <Tab> to multi-select",
+    prompt_title = "filer: symbols (" .. vim.fn.fnamemodify(root, ":t") .. ")",
+    results_title = "excerpts · <Tab> to multi-select",
     finder = finders.new_job(function(prompt)
       local args = { M.bin(), "search", "--root", root, "--query", prompt or "" }
       if use_state then
@@ -182,6 +214,8 @@ function M.search(opts)
         for _, entry in ipairs(selected) do
           if entry.included then
             already = already + 1
+          elseif entry.symbol then
+            paths[#paths + 1] = entry.path .. "::" .. entry.symbol
           else
             paths[#paths + 1] = entry.path
           end
@@ -233,6 +267,10 @@ function M.bundle(paths, opts)
       table.insert(args, "--reset")
     end
   end
+  if opts.at_line then
+    table.insert(args, "--at-line")
+    table.insert(args, tostring(opts.at_line))
+  end
   table.insert(args, "--")
 
   local stdout, stderr, code = run(vim.list_extend(args, paths), root)
@@ -246,7 +284,8 @@ function M.bundle(paths, opts)
   M.open(stdout, vim.tbl_extend("force", opts, { root = root }))
 end
 
---- Bundles the file in the current buffer together with its imports.
+--- Bundles the current buffer together with its imports. In a `.fe` file the
+--- function under the cursor is the seed, not the whole 20 000-line file.
 function M.here(opts)
   opts = opts or {}
   local name = vim.api.nvim_buf_get_name(0)
@@ -254,7 +293,14 @@ function M.here(opts)
     notify("current buffer is not a file", vim.log.levels.WARN)
     return
   end
-  M.bundle({ name }, opts)
+  -- `.fe` files are usually tens of thousands of lines: seed the function under
+  -- the cursor. Other languages keep whole-file `:FilerHere`; use the picker or
+  -- `:FilerBundle path::Type` for a single excerpt.
+  local options = opts
+  if options.at_line == nil and name:match("%.fe$") then
+    options = vim.tbl_extend("force", { at_line = vim.api.nvim_win_get_cursor(0)[1] }, opts)
+  end
+  M.bundle({ name }, options)
 end
 
 --- Re-renders the saved bundle (same files, current contents) into the buffer.

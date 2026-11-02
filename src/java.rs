@@ -2,7 +2,7 @@
 
 use tree_sitter::{Node, Parser};
 
-use crate::lang::{Import, ImportKind, Source};
+use crate::lang::{finish_symbols, symbol_from_node, Import, ImportKind, Source, SymbolKind};
 
 pub struct JavaParser {
     parser: Parser,
@@ -45,6 +45,13 @@ impl JavaParser {
                     if let Some(name) = child.child_by_field_name("name") {
                         let text = text_of(name, src);
                         if !text.is_empty() {
+                            out.symbols.push(symbol_from_node(
+                                child,
+                                &text,
+                                SymbolKind::Type,
+                                &["line_comment", "block_comment"],
+                                src,
+                            ));
                             out.types.push(text);
                         }
                     }
@@ -54,9 +61,7 @@ impl JavaParser {
         }
         let mut uses = Vec::new();
         collect_type_uses(root, src, &mut uses);
-        uses.sort();
-        uses.dedup();
-        out.uses = uses;
+        finish_symbols(&mut out, &uses);
         Some(out)
     }
 }
@@ -112,13 +117,13 @@ fn parse_import(node: Node<'_>, src: &str) -> Option<Import> {
 
 /// Walks the whole tree collecting every `type_identifier` (class names in
 /// type positions, class literals, generics, casts, `new` expressions).
-fn collect_type_uses(root: Node<'_>, src: &str, out: &mut Vec<String>) {
+fn collect_type_uses(root: Node<'_>, src: &str, out: &mut Vec<(String, usize)>) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.kind() == "type_identifier" {
             let text = text_of(node, src);
             if !text.is_empty() {
-                out.push(text);
+                out.push((text, node.start_byte()));
             }
         }
         let mut cursor = node.walk();

@@ -45,6 +45,10 @@ pub struct BranchBundle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFile {
     pub path: String,
+    /// Top-level declaration that was bundled, when the entry is an excerpt
+    /// (`path::symbol`). `None` means the whole file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
     #[serde(default)]
     pub depth: u32,
     /// `seed`, `import`, `static-import`, `wildcard-import`, `same-package`,
@@ -221,6 +225,7 @@ mod tests {
     fn file(path: &str, depth: u32, reason: &str) -> StateFile {
         StateFile {
             path: path.to_string(),
+            symbol: None,
             depth,
             reason: reason.to_string(),
         }
@@ -244,6 +249,32 @@ mod tests {
         assert_eq!(parsed.bundle("main").unwrap().files[0].path, "A.java");
         assert_eq!(parsed.bundle("ticket-42").unwrap().files[0].path, "B.java");
         assert!(parsed.bundle("other").is_none());
+    }
+
+    #[test]
+    fn symbol_entries_round_trip() {
+        let mut doc = StateDoc::new(Path::new("/repo"));
+        doc.upsert(BranchBundle {
+            name: "main".to_string(),
+            created: 1,
+            depth: 2,
+            files: vec![
+                StateFile {
+                    path: "main.fe".to_string(),
+                    symbol: Some("riskValue".to_string()),
+                    depth: 0,
+                    reason: "seed".to_string(),
+                },
+                file("lib.fe", 1, "usage"),
+            ],
+        });
+
+        let text = to_toml(&doc);
+        assert!(text.contains("symbol = \"riskValue\""), "{text}");
+        let parsed: StateDoc = toml::from_str(&text).expect("valid toml");
+        let files = &parsed.bundle("main").unwrap().files;
+        assert_eq!(files[0].symbol.as_deref(), Some("riskValue"));
+        assert_eq!(files[1].symbol, None);
     }
 
     #[test]
