@@ -206,6 +206,103 @@ impl Index {
         Cache::store(&root, &index, &stale);
         index
     }
+
+    /// Reparses only the named paths and folds them into the cached index, so a
+    /// burst of edits does not need a full tree walk per run. Nothing else is
+    /// touched: entries for files that were not named keep their memo (or are
+    /// dropped when the file is gone), and the returned count is the cache size
+    /// after the write.
+    ///
+    /// `Ok` carries unreadable/outside-root/unparsable inputs as warnings; those
+    /// are expected (an editor may save a file type filer does not parse).
+    pub fn update_cache(root: &Path, inputs: &[String]) -> (UpdateStats, Vec<String>) {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let mut stale: HashMap<String, CacheEntry> = Cache::load(&root)
+            .entries
+            .into_iter()
+            .map(|entry| (entry.rel.clone(), entry))
+            .collect();
+        let mut stats = UpdateStats::default();
+        let mut warnings = Vec::new();
+        let mut parser = SourceParser::new();
+        let mut files: Vec<FileEntry> = Vec::new();
+
+        for input in inputs {
+            let path = Path::new(input);
+            let abs = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            };
+            // `strip_prefix` keeps `..` segments, and a symlink can point outside
+            // the root, so both are checked before anything is updated.
+            let outside = abs.strip_prefix(&root).is_err()
+                || relative(&root, &abs).split('/').any(|part| part == "..")
+                || (abs.is_file()
+                    && abs
+                        .canonicalize()
+                        .map(|path| !path.starts_with(&root))
+                        .unwrap_or(true));
+            if outside {
+                warnings.push(format!("skipping {input}: not inside {}", root.display()));
+                stats.skipped += 1;
+                continue;
+            }
+            let rel = relative(&root, &abs);
+
+            if !abs.is_file() {
+                if stale.remove(&rel).is_some() {
+                    stats.removed += 1;
+                } else {
+                    warnings.push(format!("skipping {input}: no such file"));
+                    stats.skipped += 1;
+                }
+                continue;
+            }
+            if Language::from_path(&abs).is_none() {
+                warnings.push(format!("skipping {input}: not a source file"));
+                stats.skipped += 1;
+                continue;
+            }
+            match load_one(&root, &abs, &stale, &mut parser) {
+                Some((from_cache, entry)) => {
+                    if from_cache {
+                        stats.reused += 1;
+                    } else {
+                        stats.parsed += 1;
+                    }
+                    files.push(entry);
+                }
+                None => {
+                    warnings.push(format!("skipping {input}: cannot parse"));
+                    stats.skipped += 1;
+                }
+            }
+        }
+
+        let index = Index {
+            root: root.clone(),
+            files,
+            ..Default::default()
+        };
+        stats.entries = Cache::store(&root, &index, &stale);
+        (stats, warnings)
+    }
+}
+
+/// What `index --update` did, one counter per named path.
+#[derive(Debug, Default)]
+pub struct UpdateStats {
+    /// Named paths that were parsed (new or changed).
+    pub parsed: usize,
+    /// Named paths whose cache memo was still valid.
+    pub reused: usize,
+    /// Named paths that no longer exist and left the cache.
+    pub removed: usize,
+    /// Named paths that were not updated (outside root, not source, unreadable).
+    pub skipped: usize,
+    /// Cache entries after the write.
+    pub entries: usize,
 }
 
 fn collect_source_files(root: &Path, filter: &Filter) -> Vec<PathBuf> {
@@ -437,9 +534,9 @@ impl Cache {
     /// `--include`/`--exclude` keeps its parse memo (it is only ever used when the
     /// path is walked again, and mtime+size still decide whether it is valid), so
     /// un-hiding it costs no parse. A file that no longer exists is dropped.
-    fn store(root: &Path, index: &Index, stale: &HashMap<String, CacheEntry>) {
+    fn store(root: &Path, index: &Index, stale: &HashMap<String, CacheEntry>) -> usize {
         let Some(path) = cache_path(root) else {
-            return;
+            return 0;
         };
         let mut entries: Vec<CacheEntry> = index
             .files
@@ -480,9 +577,11 @@ impl Cache {
             root: root.to_string_lossy().to_string(),
             entries,
         };
+        let count = cache.entries.len();
         if let Ok(json) = serde_json::to_vec(&cache) {
             let _ = atomic::write(&path, &json);
         }
+        count
     }
 }
 
