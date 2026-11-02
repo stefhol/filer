@@ -71,6 +71,10 @@ whole picture instead of a fragment.
 - Caches the index in `~/.cache/filer/`, keyed by root path and invalidated per file by
   mtime + size. Re-indexing a 2000-file project takes ~40 ms, so the picker re-queries on
   every keystroke.
+- Writes the bundle state and the index cache atomically: hidden temp file in the same
+  directory, `fsync`, then `rename`, serialized by an advisory lock on a `.name.lock`
+  sidecar. A crash or two concurrent `filer` runs leave the old or the new file, never a
+  torn one; a corrupt file is reported and rebuilt instead of aborting.
 
 Things it deliberately does not do: compile your project, read `pom.xml` / `build.sbt` /
 `*.csproj` / `Cargo.toml` / `package.json` dependencies, or pretend to resolve libraries. JDK,
@@ -87,7 +91,8 @@ cargo build --release     # binary at target/release/filer
 cargo install --path .
 ```
 
-Requires a C compiler for the tree-sitter grammars (`gcc`/`clang`).
+Requires Rust 1.89 or newer (the state and cache writes use std's file locks) and a
+C compiler for the tree-sitter grammars (`gcc`/`clang`).
 
 ## Install
 
@@ -400,7 +405,8 @@ Cleaning up:
 | Reopen yesterday's bundle | `:FilerShow` / `:FilerShow main` / `filer show --branch main` |
 
 `.filer/.gitignore` containing `*` is created automatically, so the state never shows up in
-`git status` and your own `.gitignore` is left alone. Branch names come straight from
+`git status` and your own `.gitignore` is left alone. Next to it, `.bundle.toml.lock` is the
+advisory write lock (kept on purpose; the kernel releases the lock when the process exits). Branch names come straight from
 `.git/HEAD` (no git subprocess); detached HEADs are stored as `detached@<sha>`, and repos
 without git use a single `(no branch)` bundle. Older single-branch state files are migrated
 on load.
