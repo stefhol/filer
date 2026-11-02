@@ -1,0 +1,30 @@
+# filer bundle state — `:FilerReset` clears the current branch, `:FilerResetAll` everything
+root = "<root>"
+version = 3
+
+[[bundles]]
+name = "<branch>"
+created = <timestamp>
+depth = 2
+
+[[bundles.entries]]
+path = "src/main/java/com/example/file/Service.java"
+scope = "file"
+depth = 0
+reason = "seed"
+
+[[bundles.entries]]
+path = "src/main/java/com/example/file/Store.java"
+scope = "methods"
+symbol = "Store"
+methods = ["raw"]
+depth = 1
+reason = "call"
+
+[[bundles.entries]]
+path = "src/main/java/com/example/file/util/Helper.java"
+scope = "methods"
+symbol = "Helper"
+methods = ["twice"]
+depth = 1
+reason = "call"

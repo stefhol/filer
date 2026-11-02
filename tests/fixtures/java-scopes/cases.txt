@@ -1,0 +1,12 @@
+# case                fixture      seed
+#
+# One case per expected-output triple in expected/. Fields are
+# whitespace-separated: case name, fixture root, CLI seed argument.
+# The seed is passed to `filer bundle` as-is (path, path::Class or
+# path::Class.method).
+file-seed             file-seed    src/main/java/com/example/file/Service.java
+class-seed            class-seed   src/main/java/com/example/shop/Service.java::Service
+method-seed.intra     method-seed  src/main/java/com/example/method/Pipeline.java::Pipeline.run
+method-seed.abstract  method-seed  src/main/java/com/example/method/base/Job.java::Job.runOnce
+method-seed.enum      method-seed  src/main/java/com/example/method/Level.java::Level.scaled
+fallback              fallback     src/main/java/com/example/fallback/Controller.java::Controller
