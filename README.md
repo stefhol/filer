@@ -431,6 +431,43 @@ advisory write lock (kept on purpose; the kernel releases the lock when the proc
 without git use a single `(no branch)` bundle. Older single-branch state files are migrated
 on load.
 
+## Deltas: only what is new
+
+An agent that already pasted half the closure into its context does not need it again. Two
+flags describe what the caller already holds, at the same granularity the bundle uses:
+
+```sh
+# the units already in context: path, path::Symbol or path::Class.method, repeatable
+filer --root ~/code/demo bundle --skip 'app/Repo.java::Repo.size' app/Service.java
+
+# a manifest instead: `-` for stdin, `@FILE` or a bare path
+filer --root ~/code/demo bundle --only-new @manifest.txt app/Service.java
+filer --root ~/code/demo --json bundle --only-new - app/Service.java < manifest.txt
+```
+
+The manifest accepts two formats, picked by the first character:
+
+- JSON (`{`/`[`): `bundle --json` output, or just its `entries` array. `scope` decides the
+  granularity, so a `methods` entry covers exactly the listed methods.
+- Anything else: one `path`, `path::Symbol` or `path::Class.method` per line. Blank lines and
+  `#` comments are skipped, whitespace and CRLF are trimmed (`--seeds-from` rules).
+
+```sh
+# pipe a bundle straight back in; with everything covered the answer is "nothing new"
+filer --root ~/code/demo --json bundle --only-new @manifest.json app/Service.java
+```
+
+Rules:
+
+- `--skip` and `--only-new` filter the **output**, not the resolution: a skipped unit stays in
+  the graph, so what it pulls in can still be new.
+- Coverage is coarse on purpose. A bare path covers everything in that file, a symbol covers
+  its methods too, and a method covers exactly that method.
+- An empty manifest is a plain bundle. A manifest that covers everything is `nothing new`
+  (exit `4`, `empty_result`, with a hint), never an error.
+- The saved state file keeps the **full** bundle: a delta run with `--state` records what
+  filer resolved, not just the part that was new.
+
 ## Order and budget
 
 The bundle has one documented order, and it is the same order the budget truncates:
@@ -511,10 +548,11 @@ filer --root ~/code/demo bundle --seeds-from @seeds.txt --depth 2 > seeds.md
 `bundle` flags: `--depth N` (0 = only the given units), `--with-same-package`,
 `--with-config`, `--title`, `--out FILE`, `--state FILE`, `--reset`,
 `--seeds-from -|@FILE` (repeatable), `--at-line N`,
-`--max-bytes N`, `--max-tokens N` (see [Order and budget](#order-and-budget)). `show`
-takes the same two budget flags. With `--seeds-from` the positional files become optional
-and both sources are combined; reading that list is a plain file read — filer never runs
-`git`, so `git diff --name-only | filer bundle --seeds-from -` is your own pipeline.
+`--max-bytes N`, `--max-tokens N` (see [Order and budget](#order-and-budget)), `--skip UNIT`,
+`--only-new -|@FILE` (see [Deltas: only what is new](#deltas-only-what-is-new)). `show` takes
+the same two budget flags. With `--seeds-from` the positional files become optional and both
+sources are combined; reading that list is a plain file read — filer never runs `git`, so
+`git diff --name-only | filer bundle --seeds-from -` is your own pipeline.
 Default depth is 2. Global flags: `--json`, `--quiet`, `--include GLOB`, `--exclude GLOB`,
 `--no-ignore` (see below). Add `::Symbol` for one declaration and `::Class.method` for a Java or
 Rust method scope: `filer --root ~/ac bundle 'main.fe::riskValue'`,
