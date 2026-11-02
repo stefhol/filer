@@ -3,6 +3,12 @@
 Status: **implemented** (see `a9b81a1`). Supersedes the implicit `path::symbol` + "method seed
 forces the whole file" behaviour that was in `main.rs`/`state.rs` before v3.
 
+Follow-up shipped: the member tier is no longer Java-only. Kotlin, Groovy, C#, Scala and
+TypeScript/JavaScript all populate members, fields, supertypes and typed call receivers, so
+they expose the same `[file]`/`[class]`/`[method]` rows and call-graph closure as Java. Vue
+stays whole-file; `.fe` stays function-level. The "other languages stay at symbol tier" notes
+below are the original rollout plan, not the current behaviour.
+
 ## Problem
 
 The bundle currently infers granularity from which fields happen to be set:
@@ -308,8 +314,9 @@ only. `--with-same-package` remains a whole-class expansion; not part of the min
 
 ## Non-goals / known limitations
 
-- Method scopes for Kotlin/Scala/C#/Groovy (Java only in this cut).
 - Overload resolution by arity; interface dispatch; chained receiver typing.
+- Inferred types (`val x = Local()`, `var x = ...`, `const x = new X()`): only explicit
+  annotations or `val`/`var`/constructor-property declarations type a receiver.
 - Type-only dependencies in minimal mode.
 - Nested classes are rendered whole inside their enclosing class.
 - Enum methods are extracted; annotation-type elements are not.

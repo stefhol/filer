@@ -39,8 +39,6 @@ pub enum Language {
 pub enum Granularity {
     /// Whole files only (Vue, files without symbols).
     File,
-    /// `[file]` plus one row per top-level symbol.
-    Symbol,
     /// One row per top-level function, no `[file]` row (Formula Engine).
     Function,
     /// `[file]`, `[class]` and `[method]` rows, with a call graph (Java).
@@ -112,8 +110,8 @@ impl Language {
             | Language::Groovy
             | Language::CSharp
             | Language::Scala => Granularity::Member,
+            Language::TypeScript | Language::JavaScript => Granularity::Member,
             Language::Vue => Granularity::File,
-            _ => Granularity::Symbol,
         }
     }
 
@@ -499,7 +497,8 @@ mod tests {
         assert_eq!(Language::Groovy.granularity(), Granularity::Member);
         assert_eq!(Language::CSharp.granularity(), Granularity::Member);
         assert_eq!(Language::Scala.granularity(), Granularity::Member);
-        assert_eq!(Language::TypeScript.granularity(), Granularity::Symbol);
+        assert_eq!(Language::TypeScript.granularity(), Granularity::Member);
+        assert_eq!(Language::JavaScript.granularity(), Granularity::Member);
         assert!(!Language::Fe.granularity().file_row());
         assert!(Language::Fe.granularity().symbol_rows());
         assert!(Language::Java.granularity().symbol_rows());

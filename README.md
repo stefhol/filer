@@ -53,8 +53,7 @@ whole picture instead of a fragment.
 - Extracts **symbols** (top-level functions, classes, objects, global declarations, Java
   methods) with their byte spans, so a bundle can carry one function out of a huge file.
   `.fe` functions are the primary use case: they call each other across a project-wide
-  namespace, exactly like the language's IntelliJ plugin resolves them. Java, Kotlin, Groovy, C# and Scala
-  methods add a second one: class shell for context, call-path bodies for content.
+  namespace, exactly like the language's IntelliJ plugin resolves them. Class methods add a second one: class shell for context, call-path bodies for content.
 - Every entry has an explicit **scope** — `file`, `symbol` or `methods` — so the picker,
   the state file and the renderer agree on what was included and why.
 - Walks the resulting graph to a configurable depth.
@@ -179,7 +178,7 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 
 | Command | Effect |
 | --- | --- |
-| `:FilerSearch` | Telescope picker of bundle scopes: `[file]` for every file, `[class]`/`[method]` for JVM languages, `[type]`/`[function]` elsewhere. `<Tab>` multi-selects, `<CR>` bundles. |
+| `:FilerSearch` | Telescope picker of bundle scopes: `[file]` for every file, `[class]`/`[method]` for class-based languages, `[type]`/`[function]` elsewhere. `<Tab>` multi-selects, `<CR>` bundles. |
 | `:FilerHere` | Bundles the current buffer with its closure. In a `.fe` file the function under the cursor is the seed; in Java, the method under the cursor (or its class); elsewhere the whole file. |
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute) or excerpts (`path::Symbol`). |
 | `:FilerShow [branch]` | Re-renders the saved bundle (current file contents) without re-resolving. |
@@ -202,8 +201,8 @@ each language exposes only the ones it has.
 | Scope | Languages | Rendered | Closure |
 | --- | --- | --- | --- |
 | `file` | all but `.fe` | the whole file | Java: the calls of every method in the file; others: the import/type closure |
-| `symbol` | all parsed languages | one top-level declaration plus the file header | JVM-family class: the calls of its methods; other symbols: the symbol closure |
-| `methods` | Java, Kotlin, Groovy, C#, Scala | class shell plus the listed methods; the rest as signature stubs | the seed method(s) and their calls |
+| `symbol` | all parsed languages (Vue stays whole-file) | one top-level declaration plus the file header | class: the calls of its methods; other symbols: the symbol closure |
+| `methods` | Java, Kotlin, Groovy, C#, Scala, TS/JS | class shell plus the listed methods; the rest as signature stubs | the seed method(s) and their calls |
 
 Picker rows map 1:1 to scopes, and the CLI accepts the same targets:
 
@@ -229,7 +228,7 @@ a `[file]` row, so the whole file is always selectable explicitly.
 ### Member scopes: class shell + call path
 
 A method seed (`app.Service.used`, `filer bundle 'app/Service.java::Service.used'`, or
-`:FilerHere` inside a method) renders, in Java, Kotlin, Groovy, C# and Scala:
+`:FilerHere` inside a method) renders, in every language with classes:
 
 - the seeded class as a **shell** — package, imports, fields, constructors, annotations —
   with only the methods on the call path in full,
@@ -274,8 +273,8 @@ type `Repo` that is never called) are not bundled; the import line and the field
 still give the reader the name. Nested classes are rendered inside their enclosing class.
 
 `--depth` counts method hops for method scopes, and unit hops for file/class seeds. A
-`[file]` or `[class]` seed uses the **same call graph** for Java, Kotlin, Groovy, C# and
-Scala, not the import/type closure:
+`[file]` or `[class]` seed uses the **same call graph** for Java, Kotlin, Groovy, C#, Scala,
+TS/JS — not the import/type closure:
 you get the files that are actually called, nothing else. `--with-same-package` is a
 whole-class expansion and is not applied to that minimal path. A Java file without parsed
 symbols (and every other language) keeps the import/type closure.
@@ -289,17 +288,18 @@ symbols (and every other language) keeps the import/type closure.
   selectable excerpts too.
 - An FE function seed pulls in the functions it calls and the top-level declarations it
   references, to `--depth`.
-- TS/JS and Vue keep today's behaviour: top-level type excerpts with the file-level
-  import closure. They gain the explicit `[file]` row; there are no `[method]`
-  scopes for them in this cut.
+- TypeScript/JavaScript classes get the same `[class]`/`[method]` tiers. Type annotations on
+  fields, parameters and locals type the receivers, and module imports (`./Repo`) resolve the
+  classes. JavaScript has no annotations, so only `this.x()` and bare calls create edges.
+- Vue stays whole-file: its script offsets are relative to the extracted `<script>` block, so
+  `.vue` is never sliced.
 
 Excerpts are rendered as `### path :: name (line N)` and contain the declaration plus the
 file header (package/imports/`using`s, one time) so they stand alone. Braces left open by
-a block namespace are closed at the end. Vue symbols are not sliced out (script offsets are
-relative to the extracted `<script>` block), so `.vue` stays whole-file.
+a block namespace are closed at the end.
 
 The seed under the cursor is what `:FilerHere` uses: in a `.fe` buffer the function under the
-cursor, in Java the method or class, elsewhere the whole file.
+cursor, in a class-based language the method or class, elsewhere the whole file.
 
 ## Bundle state
 

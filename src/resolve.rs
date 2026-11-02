@@ -808,6 +808,25 @@ fn resolve_class(
         return Some((position, index_in_file));
     }
 
+    // Module languages resolve types only through their explicit imports.
+    if family == Some(Family::Web) {
+        for import in &file.imports {
+            if import.kind != ImportKind::Module {
+                continue;
+            }
+            for target in resolve_import(index, file, import) {
+                if let Some(symbol_index) = index.files[target]
+                    .symbols
+                    .iter()
+                    .position(|symbol| symbol.name == name)
+                {
+                    return Some((target, symbol_index));
+                }
+            }
+        }
+        return None;
+    }
+
     for import in &file.imports {
         if import.kind == ImportKind::Module || import.is_wildcard() {
             continue;
@@ -1295,6 +1314,73 @@ mod tests {
             std::fs::write(path, source).unwrap();
         }
         root
+    }
+
+    #[test]
+    fn typescript_method_and_file_seeds_use_the_call_graph() {
+        let root = index_from_disk(
+            "typescript",
+            &[
+                (
+                    "app/Service.ts",
+                    "import { Repo } from \"./Repo\";\nimport { Helper } from \"./Helper\";\nimport { Base } from \"./Base\";\n\nexport class Service extends Base {\n  private repo: Repo;\n\n  constructor(repo: Repo) { this.repo = repo; }\n\n  used(helper: Helper): number {\n    helper.pong();\n    return this.repo.size();\n  }\n\n  omitted(): number { return 1; }\n}\n",
+                ),
+                (
+                    "app/Repo.ts",
+                    "export class Repo {\n  size(): number { return 0; }\n  unused(): number { return 1; }\n}\n",
+                ),
+                (
+                    "app/Helper.ts",
+                    "export class Helper {\n  pong(): void {}\n  quiet(): void {}\n}\n",
+                ),
+                (
+                    "app/Base.ts",
+                    "export class Base {\n  parent(): void {}\n}\n",
+                ),
+            ],
+        );
+        let index = Index::build(&root);
+        let service = index.by_rel["app/Service.ts"];
+
+        let order = closure_units(
+            &index,
+            &[member_seed(service, "Service", "used")],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        let members = member_names(&order);
+        for expected in [("Helper", "pong"), ("Repo", "size")] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(class, member)| class == expected.0 && member == expected.1),
+                "missing {expected:?} in {members:?}"
+            );
+        }
+        assert!(!members
+            .iter()
+            .any(|(class, member)| class == "Repo" && member == "unused"));
+
+        let order = closure_units(
+            &index,
+            &[Unit::File(service)],
+            ResolveOptions {
+                depth: 1,
+                same_package: false,
+                minimal: true,
+            },
+        );
+        assert!(order.iter().any(|(unit, _, _)| {
+            unit.symbol() == Some("Repo") && unit.member() == Some("size")
+        }));
+        assert!(!order
+            .iter()
+            .any(|(unit, _, _)| unit.member() == Some("unused")));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
