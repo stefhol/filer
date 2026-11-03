@@ -41,10 +41,12 @@ pi -e ./pi-extension
 | `src/operations.ts` | typed operations: run, classify the exit status, guard the version, return `{ data, text, warnings }` |
 | `src/commands.ts` | `/filer` subcommands, `M new` diff, why-chain text, status line |
 | `src/session.ts` | `filer-overrides` session state: save, restore, last branch entry wins |
-| `src/guidance.ts` | steering: the `tool_guidance` prompt section and the `read` nudge, both gated on the usability flag |
+| `src/guidance.ts` | steering: the `tool_guidance` prompt section and the numbered `read` nudge, both gated on the usability flag; memoizes the closure probe per path |
+| `src/seeds.ts` | directory seeds: expand a crate directory to its source files, with the root/`$HOME`/40-file refusals |
+| `src/source.ts` | which extensions filer parses, shared by the steering and the seed expansion |
 | `src/schema.ts` | `schema_version` 1 guard and the shared mismatch message |
 | `src/errors.ts` | exit codes and `{"error": ...}` payloads → `FilerToolError` with a hint |
-| `src/format.ts` | envelope → markdown (the README `jq` recipe) and the 32 KiB / 2000-line cap |
+| `src/format.ts` | envelope → markdown (the README `jq` recipe), the closure summary (`diagnosticsSummary`, `## Closure`), and the 32 KiB / 2000-line cap |
 | `test/` | unit tests per module plus `integration.test.ts` against the real binary and `tests/fixtures/java-scopes` |
 
 ## Rules
@@ -62,8 +64,9 @@ pi -e ./pi-extension
   quoted, split or interpolated.
 - Bumping `schema_version` in `src/schema.rs` means bumping `SUPPORTED_SCHEMA_VERSION` in
   `src/schema.ts` in the same change.
-- `SOURCE_EXTENSIONS` in `src/guidance.ts` mirrors `Language::from_path` in `src/lang.rs`; a new
-  language needs the extension listed there too, or the model gets no nudge for its files.
+- `SOURCE_EXTENSIONS` in `src/source.ts` mirrors `Language::from_path` in `src/lang.rs`; a new
+  language needs the extension listed there too, or the model gets no nudge for its files and
+  a directory seed skips them.
 - Steering never blocks a tool: `read` always succeeds and the nudge is appended, so a wrong
   guess costs one extra sentence, not a failed turn.
 

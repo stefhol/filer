@@ -14,6 +14,7 @@ import {
 } from "../src/operations";
 import { FilerToolError, ERROR_HINT_SEARCH } from "../src/errors";
 import { renderBundleMarkdown } from "../src/format";
+import { MAX_DIRECTORY_SEEDS, type SeedFilesystem } from "../src/seeds";
 
 const root = "/repo";
 
@@ -94,6 +95,27 @@ function fake(
   return { client, calls };
 }
 
+/** `crates/hub` as a directory seed: three source files, one crate entry. */
+const HUB_FILES = [
+  "crates/hub/src/lib.rs",
+  "crates/hub/src/client.rs",
+  "crates/hub/src/nested/deep.rs",
+];
+
+function directorySeed(
+  files: string[] = HUB_FILES,
+  directory = "/repo/crates/hub",
+  home = "/home/me",
+): SeedFilesystem {
+  return {
+    home: () => home,
+    async listSourceFiles(dir) {
+      if (dir !== directory) return null;
+      return files.map((file) => (file.startsWith("/") ? file : `/repo/${file}`));
+    },
+  };
+}
+
 async function capture(promise: Promise<unknown>): Promise<unknown> {
   try {
     await promise;
@@ -105,7 +127,7 @@ async function capture(promise: Promise<unknown>): Promise<unknown> {
 
 describe("bundle", () => {
   test("maps the envelope and rebuilds the markdown", async () => {
-    const payload = envelopeBundle();
+    const payload = envelopeBundle({ diagnostics: [] });
     const { client, calls } = fake(() => ({
       stdout: JSON.stringify(payload),
       stderr: `${JSON.stringify({ warning: "dropping a stale unit" })}\n`,
@@ -151,6 +173,81 @@ describe("bundle", () => {
     expect((error as FilerToolError).code).toBe("invalid_arguments");
   });
 
+  test("a partial closure ends the markdown with ## Closure (#68)", async () => {
+    const payload = envelopeBundle({
+      diagnostics: [
+        { kind: "unresolved-import", path: "a/A.java", import: "protocol::Message" },
+        { kind: "unresolved-import", path: "a/A.java", import: "model::Tree" },
+      ],
+    });
+    const { client } = fake(() => ({ stdout: JSON.stringify(payload) }));
+    const result = await bundle({ client }, { seeds: ["a/A.java"] });
+    expect(result.text).toContain("## Closure\n2 imports unresolved: model 1, protocol 1");
+    expect(result.text).toContain("this bundle is partial");
+    // A complete closure keeps the plain recipe, byte for byte.
+    const complete = envelopeBundle({ diagnostics: [] });
+    const plain = fake(() => ({ stdout: JSON.stringify(complete) }));
+    expect((await bundle({ client: plain.client }, { seeds: ["a/A.java"] })).text).toBe(
+      renderBundleMarkdown(complete),
+    );
+  });
+
+  test("a directory seed expands to its source files before argv (#68)", async () => {
+    const payload = envelopeBundle({ diagnostics: [] });
+    const expanded = fake(() => ({ stdout: JSON.stringify(payload) }));
+    const explicit = fake(() => ({ stdout: JSON.stringify(payload) }));
+    const directory = await bundle(
+      { client: expanded.client, seedFilesystem: directorySeed() },
+      { seeds: ["crates/hub"], depth: 1 },
+    );
+    const files = await bundle(
+      { client: explicit.client },
+      { seeds: HUB_FILES, depth: 1 },
+    );
+    const positionals = (argv: string[]) => argv.slice(argv.indexOf("--") + 1);
+    expect(positionals(expanded.calls[0]!)).toEqual(positionals(explicit.calls[0]!));
+    // The entry file leads, the rest is sorted, and `depth` is untouched.
+    expect(positionals(expanded.calls[0]!)).toEqual([
+      "crates/hub/src/lib.rs",
+      "crates/hub/src/client.rs",
+      "crates/hub/src/nested/deep.rs",
+    ]);
+    expect(directory.text).toBe(files.text);
+  });
+
+  test("a file seed next to a directory seed is passed through", async () => {
+    const { client, calls } = fake(() => ({ stdout: JSON.stringify(envelopeBundle()) }));
+    await bundle(
+      { client, seedFilesystem: directorySeed() },
+      { seeds: ["crates/hub", "a/A.java::A.use"] },
+    );
+    expect(calls[0]!.slice(calls[0]!.indexOf("--") + 1)).toContain("a/A.java::A.use");
+    expect(calls[0]!).toContain("crates/hub/src/client.rs");
+  });
+
+  test("refuses the project root, the home directory and a huge directory", async () => {
+    const { client } = fake(() => ({}));
+    const filesystem = directorySeed();
+    for (const [seed, hint] of [
+      [".", "narrower path"],
+      ["/home/me", "narrower path"],
+    ] as const) {
+      const error = await capture(bundle({ client, seedFilesystem: filesystem }, { seeds: [seed] }));
+      expect(error).toBeInstanceOf(FilerToolError);
+      expect((error as FilerToolError).code).toBe("invalid_arguments");
+      expect((error as FilerToolError).hint).toContain(hint);
+    }
+    const many = Array.from(
+      { length: MAX_DIRECTORY_SEEDS + 1 },
+      (_, index) => `crates/hub/src/f${index}.rs`,
+    );
+    const error = await capture(
+      bundle({ client, seedFilesystem: directorySeed(many) }, { seeds: ["crates/hub"] }),
+    );
+    expect((error as FilerToolError).code).toBe("invalid_arguments");
+    expect((error as FilerToolError).message).toContain(String(MAX_DIRECTORY_SEEDS));
+  });
+
   test("a schema mismatch fails loudly", async () => {
     const { client } = fake(() => ({
       stdout: JSON.stringify({ ...envelopeBundle(), schema_version: 2 }),
@@ -190,7 +287,7 @@ describe("bundle", () => {
 
 describe("show", () => {
   test("passes --branch and rebuilds the saved bundle", async () => {
-    const payload = envelopeBundle();
+    const payload = envelopeBundle({ diagnostics: [] });
     const { client, calls } = fake(() => ({ stdout: JSON.stringify(payload) }));
     const result = await show({ client }, { branch: "main" });
     expect(result.text).toBe(renderBundleMarkdown(payload));
@@ -314,7 +411,70 @@ describe("deps / callers / why / refs", () => {
     expect(result.data.seed).toBe("a/A.java::A.use");
     expect(result.data.granularity).toBe("unit");
     expect(result.data.edges).toEqual(payload.edges);
-    expect(result.text).toBe("a/B.java::B.size (depth 1, call)");
+    expect(result.text).toBe(
+      "a/B.java::B.size (depth 1, call)\n\n1 unit from 1 seed, depth 1",
+    );
+  });
+
+  test("deps appends exactly one closure line, grouped and ordered (#68)", async () => {
+    const payload = {
+      schema_version: 1,
+      seed: "a/A.java",
+      granularity: "file",
+      deps: [
+        { path: "a/B.java", fqn: "app.B", depth: 1, reason: "import" },
+        { path: "a/C.java", fqn: "app.C", depth: 2, reason: "import" },
+      ],
+      edges: [],
+      diagnostics: [
+        { kind: "unresolved-import", path: "a/A.java", import: "protocol::Message" },
+        { kind: "unresolved-import", path: "a/A.java", import: "protocol::Frame" },
+        { kind: "unresolved-import", path: "a/A.java", import: "model::Tree" },
+      ],
+    };
+    const { client } = fake(() => ({ stdout: JSON.stringify(payload) }));
+    const result = await deps({ client }, { seed: "a/A.java" });
+    const lines = result.text.split("\n");
+    expect(lines.filter((line) => line.startsWith("closure incomplete:"))).toEqual([
+      "closure incomplete: 3 unresolved imports (protocol 2, model 1)",
+    ]);
+    expect(lines.at(-1)).toBe("closure incomplete: 3 unresolved imports (protocol 2, model 1)");
+    expect(result.text).toContain("2 units from 1 seed, depth 2");
+  });
+
+  test("deps with a clean closure prints no closure line", async () => {
+    const payload = {
+      schema_version: 1,
+      seed: "a/A.java",
+      granularity: "file",
+      deps: [{ path: "a/B.java", fqn: "app.B", depth: 1, reason: "import" }],
+      edges: [],
+      diagnostics: [],
+    };
+    const { client } = fake(() => ({ stdout: JSON.stringify(payload) }));
+    const result = await deps({ client }, { seed: "a/A.java" });
+    expect(result.text).not.toContain("closure incomplete");
+    expect(result.text).toBe("a/B.java (depth 1, import)\n\n1 unit from 1 seed, depth 1");
+  });
+
+  test("a directory seed answers the whole crate through its entry file (#68)", async () => {
+    const payload = {
+      schema_version: 1,
+      seed: "crates/hub/src/lib.rs",
+      granularity: "file",
+      deps: [{ path: "crates/hub/src/client.rs", fqn: "crate::client", depth: 1, reason: "import" }],
+      edges: [],
+      diagnostics: [],
+    };
+    const { client, calls } = fake(() => ({ stdout: JSON.stringify(payload) }));
+    const result = await deps(
+      { client, seedFilesystem: directorySeed() },
+      { seed: "crates/hub" },
+    );
+    expect(calls[0]!.at(-1)).toBe("crates/hub/src/lib.rs");
+    expect(result.data.seed).toBe("crates/hub/src/lib.rs");
+    expect(result.text.startsWith("seed crates/hub -> crates/hub/src/lib.rs (3 source files)\n"))
+      .toBe(true);
   });
 
   test("deps exit 4 is an empty closure", async () => {

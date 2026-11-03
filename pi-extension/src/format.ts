@@ -10,6 +10,8 @@
 export const MAX_TEXT_BYTES = 32 * 1024;
 /** Second dimension of the same cap, for bundles full of short units. */
 export const MAX_TEXT_LINES = 2000;
+/** How many diagnostic groups the closure section and `details` carry. */
+export const MAX_DIAGNOSTIC_GROUPS = 5;
 
 export interface BundleEntryMarkdown {
   label: string;
@@ -25,8 +27,40 @@ export interface BundleMarkdownInput {
   methods: number;
   depth: number;
   entries: readonly BundleEntryMarkdown[];
+  /** What the traversal could not resolve; never part of the size budget. */
+  diagnostics?: readonly DiagnosticInput[];
   /** The saved bundle's TOML appendix, `null`/absent when there is none. */
   state_toml?: string | null;
+}
+
+/**
+ * One envelope diagnostic, reduced to what the closure summary reads. The JSON
+ * surface documents the payload field per kind (`import`, `call`, `name`, ...);
+ * only unresolved imports make a closure partial, so the rest are ignored.
+ */
+export interface DiagnosticInput {
+  kind?: unknown;
+  path?: unknown;
+  import?: unknown;
+  /** The payload of the other kinds (`call`, `name`, `symbol`, ...). */
+  [payload: string]: unknown;
+}
+
+/** One group of unresolved imports, keyed by the name's leading segment. */
+export interface DiagnosticsGroup {
+  group: string;
+  count: number;
+}
+
+/**
+ * The closure's completeness, in the shape both tools put in `details` and
+ * render: `total` is the number of unresolved imports, `groups` the leading
+ * name segments in descending count order, `more` the groups the cap dropped.
+ */
+export interface DiagnosticsSummary {
+  total: number;
+  groups: DiagnosticsGroup[];
+  more: number;
 }
 
 export interface Truncation {
@@ -78,11 +112,90 @@ function takeBytes(text: string, maxBytes: number): string {
 }
 
 /**
+ * The unresolved import a diagnostic carries, or null when it does not make
+ * the closure partial. `type-only-skipped` is deliberate in call-path bundles
+ * and the call kinds describe calls, not imports, so both stay out.
+ */
+function unresolvedImport(diagnostic: DiagnosticInput): string | null {
+  if (diagnostic.kind !== undefined && diagnostic.kind !== "unresolved-import") return null;
+  return typeof diagnostic.import === "string" ? diagnostic.import : null;
+}
+
+/**
+ * The first segment of an import name, so `model::ChannelRef`, `model.Channel`
+ * and `model/client` group together. Relative specifiers (`./client`) lose
+ * their leading dots, which keeps them out of a meaningless `.` group.
+ */
+function leadingSegment(name: string): string {
+  const first = name.split(/[.:/\\]+/).find((segment) => segment.length > 0);
+  return first ?? name;
+}
+
+/**
+ * Group a closure's unresolved imports once, for both the text and `details`
+ * of every tool that reports them (#68).
+ */
+export function diagnosticsSummary(
+  diagnostics: readonly DiagnosticInput[],
+): DiagnosticsSummary {
+  const counts = new Map<string, number>();
+  let total = 0;
+  for (const diagnostic of diagnostics) {
+    const name = unresolvedImport(diagnostic);
+    if (name === null) continue;
+    total += 1;
+    const group = leadingSegment(name);
+    counts.set(group, (counts.get(group) ?? 0) + 1);
+  }
+  const ranked = [...counts.entries()]
+    .map(([group, count]) => ({ group, count }))
+    .sort((a, b) => b.count - a.count || a.group.localeCompare(b.group));
+  return {
+    total,
+    groups: ranked.slice(0, MAX_DIAGNOSTIC_GROUPS),
+    more: Math.max(0, ranked.length - MAX_DIAGNOSTIC_GROUPS),
+  };
+}
+
+/** `model 22, protocol 38 (+2 more)`, shared by both renderings. */
+function groupList(summary: DiagnosticsSummary): string {
+  const listed = summary.groups.map(({ group, count }) => `${group} ${count}`).join(", ");
+  if (summary.more > 0) return `${listed}, +${summary.more} more`;
+  return listed;
+}
+
+/**
+ * The one line `filer_deps` appends after its rows, or null on a complete
+ * closure: an incomplete result must never look like the whole answer.
+ */
+export function diagnosticsLine(summary: DiagnosticsSummary): string | null {
+  if (summary.total === 0) return null;
+  const imports = summary.total === 1 ? "import" : "imports";
+  return `closure incomplete: ${summary.total} unresolved ${imports} (${groupList(summary)})`;
+}
+
+/**
+ * The `## Closure` section a partial bundle ends with, or null when every
+ * import resolved. It is appended after the truncation note, so a bundle cut
+ * for size still says it is partial (#68).
+ */
+export function closureSection(summary: DiagnosticsSummary): string | null {
+  if (summary.total === 0) return null;
+  const imports = summary.total === 1 ? "import" : "imports";
+  return [
+    "## Closure",
+    `${summary.total} ${imports} unresolved: ${groupList(summary)}`,
+    "(this bundle is partial — the CLI could not resolve these)",
+  ].join("\n");
+}
+
+/**
  * The CLI-compatible markdown for a bundle envelope.
  *
  * Mirrors the README recipe byte for byte: the header, the `## Files` list,
  * every entry's `markdown` under `## Contents`, and the state appendix when
- * `state_toml` is a string.
+ * `state_toml` is a string. The closure section is added by `formatBundle`,
+ * not here: this stays the literal `jq` recipe.
  */
 export function renderBundleMarkdown(
   bundle: BundleMarkdownInput,
@@ -140,10 +253,15 @@ export function formatBundle(
   const maxLines = options.maxLines ?? MAX_TEXT_LINES;
   const includeState = options.includeState ?? true;
   const total = bundle.entries.length;
+  // The closure is deliberately outside the budget: a cut bundle that is also
+  // partial has to say both, so this section always survives the cap.
+  const closure = closureSection(diagnosticsSummary(bundle.diagnostics ?? []));
+  const withClosure = (text: string): string =>
+    closure === null ? text : `${text}\n\n${closure}`;
   const full = renderBundleMarkdown(bundle, { includeState });
   if (fits(full, maxBytes, maxLines)) {
     return {
-      text: full,
+      text: withClosure(full),
       truncation: { truncated: false, totalUnits: total, maxBytes, maxLines },
     };
   }
@@ -158,7 +276,7 @@ export function formatBundle(
     else high = middle - 1;
   }
   const shown = low;
-  const text = partialBundleText(bundle, shown, total, true);
+  const text = withClosure(partialBundleText(bundle, shown, total, true));
   const oneMore = partialBundleText(bundle, Math.min(shown + 1, total), total, false);
   const reason: "bytes" | "lines" =
     byteLength(oneMore) > maxBytes ? "bytes" : "lines";

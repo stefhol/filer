@@ -399,6 +399,26 @@ describe("registration", () => {
 // --- argv and result mapping ---------------------------------------------
 
 describe("bundle", () => {
+  test("details carry the grouped closure, not the raw diagnostics (#68)", async () => {
+    const payload = {
+      ...bundleEnvelope,
+      diagnostics: [
+        { kind: "unresolved-import", path: "a/A.java", import: "protocol::Message" },
+        { kind: "unknown-receiver", path: "a/A.java", call: "go" },
+      ],
+    };
+    const pi = setup(() => ({ stdout: JSON.stringify(payload) }));
+    const result = await run<BundleToolDetails>(pi, pi.ctx, "filer_bundle", {
+      seeds: ["a/A.java"],
+    });
+    expect(result.details.diagnostics).toEqual({
+      total: 1,
+      groups: [{ group: "protocol", count: 1 }],
+      more: 0,
+    });
+    expect(textOf(result)).toContain("## Closure\n1 import unresolved: protocol 1");
+  });
+
   test("passes words as positionals after --, with an absolute state path", async () => {
     const pi = setup(jsonHandler());
     const result = await run<BundleToolDetails>(pi, pi.ctx, "filer_bundle", {
@@ -562,6 +582,34 @@ describe("show / search / deps / callers / why / refs / state", () => {
     ]);
     expect(Value.Check(tool.outputSchema as never, result.structuredContent)).toBe(true);
     expect(result.details.summary).toBe("filer deps: 1 units, 1 edges");
+    // A clean closure is a zero summary, never an omitted one.
+    expect(result.details.diagnostics).toEqual({ total: 0, groups: [], more: 0 });
+  });
+
+  test("deps puts the grouped diagnostics in details and keeps the raw rows (#68)", async () => {
+    const payload = {
+      ...depsEnvelope,
+      diagnostics: [
+        { kind: "unresolved-import", path: "a/A.java", import: "protocol::Message" },
+        { kind: "unresolved-import", path: "a/A.java", import: "protocol::Frame" },
+        { kind: "unresolved-import", path: "a/A.java", import: "model::Tree" },
+      ],
+    };
+    const pi = setup(() => ({ stdout: JSON.stringify(payload) }));
+    const result = await run(pi, pi.ctx, "filer_deps", { seed: "a/A.java::A.use" });
+    expect(result.details.diagnostics).toEqual({
+      total: 3,
+      groups: [
+        { group: "protocol", count: 2 },
+        { group: "model", count: 1 },
+      ],
+      more: 0,
+    });
+    // The per-diagnostic rows stay available to a consumer that keeps data.
+    expect((result.structuredContent as { diagnostics: unknown[] }).diagnostics).toHaveLength(3);
+    expect(textOf(result)).toContain(
+      "closure incomplete: 3 unresolved imports (protocol 2, model 1)",
+    );
   });
 
   test("callers and refs keep -- before the unit/name", async () => {

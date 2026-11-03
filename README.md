@@ -1122,6 +1122,21 @@ The extension registers the eight `filer_*` tools (`bundle`, `show`, `search`, `
 `session_tree`. The documented precedence still holds (`--filer-bin`/`FILER_BIN` over a
 session bin), and the status line shows `<units> units · <root>` after a bundle/show.
 
+A seed may also be a directory, which is the natural seed for "how is this crate built":
+`filer_bundle({ seeds: ["crates/hub"] })` expands it to the source files below it
+(`src/lib.rs` / `src/main.rs` first) at depth 0, so the closure is the answer. Expansions are
+bounded — the project root, `$HOME` and directories with more than 40 source files are refused
+with an `invalid_arguments` hint, since a bundle of those would spend its budget before the
+resolver ran. `filer_deps` takes one seed, so a directory seed there answers through the
+crate's `src/lib.rs` (or `src/main.rs`) and says which file it used.
+
+When the CLI could not resolve every import, the results say so instead of looking complete:
+a partial `filer_bundle` ends with a `## Closure` section after the truncation note (so a cut
+bundle still reports both), `filer_deps` appends one `closure incomplete:` line, and both put
+the same summary in `details.diagnostics` as `{ total, groups, more }` — unresolved imports
+grouped by leading name segment, descending, capped at five groups. A complete closure adds
+nothing to either.
+
 ### Steering
 
 The tools only help when the model reaches for them, so the extension steers two cases. Both
@@ -1129,13 +1144,17 @@ are silent until `--version` succeeded, and neither blocks a call:
 
 - Before every run it adds a `tool_guidance` section to the system prompt: load a source file
 you need to understand with `filer_bundle` — the file *and* its import/call closure — instead
-of `read`, and answer "what does this function or class do" with `filer_deps`/`filer_callers`
-on the unit instead of grepping call sites. The `filer_bundle`, `filer_deps`,
-`filer_callers` and `filer_refs` tools carry matching `promptGuidelines`.
+of `read`, seed a workspace crate by its directory or `src/lib.rs` rather than one file, and
+answer "what does this function or class do" with `filer_deps`/`filer_callers` on the unit
+instead of grepping call sites. The `filer_bundle`, `filer_deps`, `filer_callers` and
+`filer_refs` tools carry matching `promptGuidelines`.
 - A full `read` of a file whose extension `src/lang.rs` parses gets one appended paragraph
-pointing at `filer_bundle` for that path. Ranged reads (`offset`/`limit`), images, failed
-reads and unsupported files are left untouched, so quick peeks and `/skill` file loads keep
-working.
+pointing at `filer_bundle` for that path — with numbers, because the tradeoff is otherwise
+invisible: the read's own size (`725 lines / 24 KB`, free from the result it already holds)
+and, from one memoized `filer deps --depth 2 --json` probe per path, the closure size and its
+unresolved-import count. A probe that fails or takes longer than 2 s is dropped from the
+sentence rather than guessed. Ranged reads (`offset`/`limit`), images, failed reads and
+unsupported files are left untouched, so quick peeks and `/skill` file loads keep working.
 
 Without a usable binary — missing, not `filer`, or timing out — the prompt and every tool
 result are exactly what they are without the extension.
