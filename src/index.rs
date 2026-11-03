@@ -11,6 +11,7 @@ use ignore::{DirEntry, WalkBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic;
+use crate::cargo::{self, Workspace};
 use crate::filter::Filter;
 use crate::lang::{end_line_of, Import, Language, Member, SourceParser, Symbol};
 use crate::tsconfig::{self, TsConfig};
@@ -134,6 +135,9 @@ pub struct Index {
     /// are re-read on every build (a config is tiny) instead of being cached
     /// per file, so editing one takes effect without invalidating the index.
     pub tsconfigs: Vec<TsConfig>,
+    /// Crate map of the repository's Cargo workspace (empty for projects
+    /// without a readable `Cargo.toml`). See [`crate::cargo`].
+    pub workspace: Workspace,
     /// Number of files re-parsed on this run (for `filer index` stats).
     pub parsed_count: usize,
     pub reused_count: usize,
@@ -170,6 +174,10 @@ impl Index {
         let mut index = Index {
             root: root.clone(),
             tsconfigs: tsconfig::collect(&root, &files),
+            // Cargo workspace members are intra-repo crates: reading the
+            // manifests is what lets `use <member>::…` resolve. Re-read on
+            // every build, like tsconfig, so editing one takes effect at once.
+            workspace: cargo::Workspace::discover(&root),
             files,
             ..Default::default()
         };

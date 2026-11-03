@@ -1,12 +1,14 @@
 //! Import resolution and transitive closure.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::index::{FileEntry, Index};
-use crate::lang::{Family, Granularity, Import, ImportKind, Member, MemberKind, Receiver, Symbol};
+use crate::lang::{
+    Family, Granularity, Import, ImportKind, Language, Member, MemberKind, Receiver, Symbol,
+};
 use crate::tsconfig::TsConfig;
 
 /// Extensions tried when resolving a TypeScript/JavaScript module specifier,
@@ -413,11 +415,18 @@ fn rust_direct_import(index: &Index, rel: &str, path: &str) -> Vec<usize> {
                 resolved.push(position);
             }
         }
-        // A 2018+ path that does not start with crate/self/super is usually an
-        // external crate. Try it as a local module anyway, but never fall back
-        // to the crate root: `use std::fmt::Debug` must stay unresolved.
+        // A 2018+ path that does not start with crate/self/super either names a
+        // workspace member or an external crate. A member is intra-repo: resolve
+        // it by Cargo layout (`use model::channel::Channel` ->
+        // crates/model/src/channel.rs), never from this crate's own root. Any
+        // other name keeps the local-module attempt, but never the degenerate
+        // crate root: `use std::fmt::Debug` must stay unresolved.
         _ => {
-            if let Some(position) = rust_find_module(index, &root, &root, &segments, false)
+            if let Some(krate) = index.workspace.crate_named(&segments[0]) {
+                if let Some(position) = resolve_crate_import(index, krate, &segments[1..]) {
+                    resolved.push(position);
+                }
+            } else if let Some(position) = rust_find_module(index, &root, &root, &segments, false)
                 .or_else(|| rust_find_module(index, &current, &root, &segments, false))
             {
                 resolved.push(position);
@@ -428,6 +437,21 @@ fn rust_direct_import(index: &Index, rel: &str, path: &str) -> Vec<usize> {
     // The module file is the import target; symbol-level resolution picks the
     // imported item out of it via the import's last path segment.
     resolved
+}
+
+/// Resolves the module part of `use <crate>::a::b::Thing` inside the library
+/// sources of a Cargo workspace member. The lib root is tried explicitly first,
+/// because `[lib] path` is free-form (`lib/main.rs`); the remaining segments use
+/// the same longest-prefix module lookup as `crate::`.
+fn resolve_crate_import(
+    index: &Index,
+    krate: &crate::cargo::Crate,
+    segments: &[String],
+) -> Option<usize> {
+    if segments.is_empty() {
+        return index.by_rel.get(&krate.lib).copied();
+    }
+    rust_find_module(index, &krate.src, &krate.src, segments, true)
 }
 
 /// Crate root directory and current module directory for a source file.
@@ -763,8 +787,11 @@ pub fn resolve_uses(index: &Index, file: &FileEntry) -> Vec<(usize, Reason)> {
             .filter(|&position| compatible(index, position, family))
             .collect();
         // FE has one global namespace, so "same package" would match every
-        // `.fe` file in the project. Fall through to unique-name lookup.
-        let same_package: Vec<usize> = if family == Some(Family::Fe) {
+        // `.fe` file in the project. Rust has no packages at all (`package` is
+        // always `None`, so comparing would label every name hit
+        // `same-package`). Both fall through to the unique-name lookup, whose
+        // honest label is `usage`.
+        let same_package: Vec<usize> = if matches!(family, Some(Family::Fe | Family::Rust)) {
             Vec::new()
         } else {
             candidates
@@ -923,18 +950,17 @@ impl Diagnostic {
         }
     }
 
-    /// One human line for stderr, so text mode is as honest as JSON mode.
-    pub fn to_line(&self) -> String {
+    /// One human line for stderr, so text mode is as honest as JSON mode. The
+    /// index is needed to tell a Rust workspace member from a third-party
+    /// crate: only the first kind is a bug in filer's own resolution.
+    pub fn to_line(&self, index: &Index) -> String {
         let location = if self.line == 0 {
             self.path.clone()
         } else {
             format!("{}:{}", self.path, self.line)
         };
         match self.kind {
-            DiagnosticKind::UnresolvedImport => format!(
-                "unresolved import {} ({}): probably JDK/third-party",
-                self.name, location
-            ),
+            DiagnosticKind::UnresolvedImport => unresolved_import_line(index, self, &location),
             DiagnosticKind::UnknownReceiver => {
                 format!("unknown receiver for {}() ({location})", self.name)
             }
@@ -957,6 +983,124 @@ impl Diagnostic {
             ),
         }
     }
+}
+
+/// The Rust wording names the crate and why it did not resolve; the JVM
+/// wording is unchanged, because a missing `com.acme.Tax` really is a library.
+fn unresolved_import_line(index: &Index, diagnostic: &Diagnostic, location: &str) -> String {
+    let rust = Language::from_path(Path::new(&diagnostic.path))
+        .is_some_and(|language| language.family() == Family::Rust);
+    if !rust {
+        return format!(
+            "unresolved import {} ({location}): probably JDK/third-party",
+            diagnostic.name
+        );
+    }
+    let crate_name = diagnostic
+        .name
+        .split('.')
+        .next()
+        .unwrap_or(&diagnostic.name);
+    let reason = if index.workspace.crate_named(crate_name).is_some() {
+        "workspace member, but no such module or lib root is indexed"
+    } else if index.workspace.crate_of(&diagnostic.path).is_some() {
+        "not a member of this Cargo workspace; crates.io dependencies are not resolved"
+    } else {
+        "no Cargo package here; crates.io dependencies are not resolved"
+    };
+    format!("unresolved crate '{crate_name}' ({location}): {reason}")
+}
+
+/// The grouped "the closure is incomplete" line for `deps` / `bundle` stderr,
+/// or `None` when every import resolved. In-repo misses (a known workspace
+/// crate that still did not resolve) are called out separately from
+/// third-party ones: only the first kind means filer was supposed to find it.
+pub fn incomplete_summary(index: &Index, diagnostics: &[Diagnostic]) -> Option<String> {
+    let mut workspace: BTreeMap<String, usize> = BTreeMap::new();
+    let mut third_party: BTreeMap<String, usize> = BTreeMap::new();
+    let mut total = 0;
+    for diagnostic in diagnostics {
+        if diagnostic.kind != DiagnosticKind::UnresolvedImport {
+            continue;
+        }
+        total += 1;
+        let group = diagnostic
+            .name
+            .split('.')
+            .next()
+            .unwrap_or(&diagnostic.name)
+            .to_string();
+        let rust = Language::from_path(Path::new(&diagnostic.path))
+            .is_some_and(|language| language.family() == Family::Rust);
+        let bucket = if rust && index.workspace.crate_named(&group).is_some() {
+            &mut workspace
+        } else {
+            &mut third_party
+        };
+        *bucket.entry(group).or_default() += 1;
+    }
+    if total == 0 {
+        return None;
+    }
+
+    let noun = if total == 1 { "import" } else { "imports" };
+    let mut line = format!("closure incomplete: {total} unresolved {noun}");
+    let workspace_total: usize = workspace.values().sum();
+    let third_party_total: usize = third_party.values().sum();
+    let mut parts: Vec<String> = Vec::new();
+    if !workspace.is_empty() {
+        let crates = if workspace.len() == 1 {
+            "crate"
+        } else {
+            "crates"
+        };
+        parts.push(format!(
+            "{workspace_total} from {} workspace {crates} ({})",
+            workspace.len(),
+            group_list(&workspace)
+        ));
+    }
+    if !third_party.is_empty() {
+        let label = if workspace.is_empty() {
+            "all third-party"
+        } else {
+            "third-party"
+        };
+        let count = if workspace.is_empty() {
+            String::new()
+        } else {
+            format!("{third_party_total} ")
+        };
+        parts.push(format!("{count}{label} ({})", group_list(&third_party)));
+    }
+    if !parts.is_empty() {
+        line.push_str(": ");
+        line.push_str(&parts.join(", "));
+    }
+    Some(line)
+}
+
+/// How many groups a summary names before it says "+N more".
+const SUMMARY_GROUPS: usize = 6;
+
+/// `protocol 38, model 22, ...`, biggest first, ties by name.
+fn group_list(groups: &BTreeMap<String, usize>) -> String {
+    let mut ranked: Vec<(&str, usize)> = groups
+        .iter()
+        .map(|(name, count)| (name.as_str(), *count))
+        .collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    let hidden = ranked.len().saturating_sub(SUMMARY_GROUPS);
+    ranked.truncate(SUMMARY_GROUPS);
+    let mut list = ranked
+        .iter()
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if hidden > 0 {
+        list.push_str(&format!(", +{hidden} more"));
+    }
+    list
 }
 
 /// One incoming call edge found by [`callers`]. `line` is the call site in
@@ -2983,6 +3127,243 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Two-member Cargo workspace: `b` depends on `a` by path. `crates/b/src/a.rs`
+    /// exists on purpose, so a wrong "same crate root" guess would be visible.
+    fn cargo_workspace(name: &str) -> std::path::PathBuf {
+        index_from_disk(
+            name,
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+                ),
+                (
+                    "crates/a/Cargo.toml",
+                    "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "crates/a/src/lib.rs",
+                    "pub mod sub;\n\npub struct Root;\n\npub struct Helper;\n\npub struct Dup;\n",
+                ),
+                ("crates/a/src/sub.rs", "pub struct Thing;\n"),
+                (
+                    "crates/b/Cargo.toml",
+                    "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\na = { path = \"../a\" }\n",
+                ),
+                ("crates/b/src/a.rs", "pub struct Shadow;\n\npub struct Dup;\n"),
+                (
+                    "crates/b/src/lib.rs",
+                    "use a::sub::Thing;\nuse a::Root;\nuse std::fmt::Debug;\nuse serde::Serialize;\n\npub fn run(_thing: Thing, _root: Root) -> Helper { Helper }\n\npub fn shadow(_dup: Dup) {}\n",
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn rust_workspace_members_resolve_by_cargo_layout() {
+        let root = cargo_workspace("workspace");
+        let index = Index::build(&root);
+        let member = index.by_rel["crates/b/src/lib.rs"];
+        let file = &index.files[member];
+        let resolved = |path: &str| resolve_import(&index, file, &import(path, ImportKind::Type));
+
+        // `use a::sub::Thing` is the member's module, not `crates/b/src/a.rs`.
+        assert_eq!(
+            resolved("a.sub.Thing"),
+            vec![index.by_rel["crates/a/src/sub.rs"]]
+        );
+        // A type declared in the lib root resolves to the crate root.
+        assert_eq!(
+            resolved("a.Root"),
+            vec![index.by_rel["crates/a/src/lib.rs"]]
+        );
+        // Not a member: still third-party, no false positives.
+        assert!(resolved("std.fmt.Debug").is_empty());
+        assert!(resolved("serde.Serialize").is_empty());
+
+        // `depth` counts the crate edge like any other import, and depth 0
+        // pulls nothing new.
+        let order = closure_detailed(
+            &index,
+            &[member],
+            ResolveOptions {
+                depth: 1,
+                ..Default::default()
+            },
+        );
+        let rows: Vec<(&str, u32, Reason)> = order
+            .iter()
+            .map(|(position, depth, reason)| (index.files[*position].rel.as_str(), *depth, *reason))
+            .collect();
+        assert!(
+            rows.contains(&("crates/a/src/lib.rs", 1, Reason::Import)),
+            "{rows:?}"
+        );
+        assert!(
+            rows.contains(&("crates/a/src/sub.rs", 1, Reason::Import)),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(path, _, _)| *path == "crates/b/src/a.rs"),
+            "never guessed from the importing crate's own root: {rows:?}"
+        );
+        let seeds_only = closure_detailed(
+            &index,
+            &[member],
+            ResolveOptions {
+                depth: 0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(seeds_only.len(), 1, "{seeds_only:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rust_name_usage_is_usage_never_same_package() {
+        let root = cargo_workspace("workspace-usage");
+        let index = Index::build(&root);
+        let member = index.by_rel["crates/b/src/lib.rs"];
+        let uses = resolve_uses(&index, &index.files[member]);
+
+        assert!(
+            !uses.is_empty(),
+            "the fixture references Helper by name without importing it"
+        );
+        // Rust has no packages; labeling a name hit `same-package` used to
+        // happen for every file because `package` is always None.
+        assert!(
+            uses.iter()
+                .all(|(_, reason)| *reason != Reason::SamePackage),
+            "{uses:?}"
+        );
+        assert!(
+            uses.iter().any(
+                |(position, reason)| *position == index.by_rel["crates/a/src/lib.rs"]
+                    && *reason == Reason::Usage
+            ),
+            "Helper resolves by unique name as usage: {uses:?}"
+        );
+        // Unresolved direction: `Dup` exists twice, so the name is ambiguous and
+        // filer does not guess (it used to be called `same-package`).
+        assert!(
+            !uses
+                .iter()
+                .any(|(position, _)| *position == index.by_rel["crates/b/src/a.rs"]),
+            "an ambiguous name is not guessed: {uses:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unresolved_rust_imports_name_the_crate() {
+        let root = cargo_workspace("workspace-message");
+        let index = Index::build(&root);
+        let file = &index.files[index.by_rel["crates/b/src/lib.rs"]];
+        let lines: Vec<String> = file
+            .imports
+            .iter()
+            .filter(|import| resolve_import(&index, file, import).is_empty())
+            .map(|import| {
+                Diagnostic {
+                    kind: DiagnosticKind::UnresolvedImport,
+                    path: file.rel.clone(),
+                    line: 0,
+                    name: import.path.clone(),
+                }
+                .to_line(&index)
+            })
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line
+                == "unresolved crate 'std' (crates/b/src/lib.rs): not a member of this Cargo workspace; crates.io dependencies are not resolved"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("JDK/third-party")),
+            "Rust wording must not borrow the JVM sentence: {lines:?}"
+        );
+
+        // Without any Cargo manifest the reason changes, the crate name does not.
+        let plain = index_from_disk("rust-plain", &[("src/lib.rs", "use std::fmt::Debug;\n")]);
+        let plain_index = Index::build(&plain);
+        let plain_file = &plain_index.files[0];
+        let line = Diagnostic {
+            kind: DiagnosticKind::UnresolvedImport,
+            path: plain_file.rel.clone(),
+            line: 0,
+            name: plain_file.imports[0].path.clone(),
+        }
+        .to_line(&plain_index);
+        assert_eq!(
+            line,
+            "unresolved crate 'std' (src/lib.rs): no Cargo package here; crates.io dependencies are not resolved"
+        );
+
+        // JVM wording is untouched.
+        let java = Diagnostic {
+            kind: DiagnosticKind::UnresolvedImport,
+            path: "app/Pricing.java".to_string(),
+            line: 0,
+            name: "com.acme.Tax".to_string(),
+        };
+        assert_eq!(
+            java.to_line(&index),
+            "unresolved import com.acme.Tax (app/Pricing.java): probably JDK/third-party"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn incomplete_summary_groups_unresolved_imports_by_crate() {
+        let root = cargo_workspace("workspace-summary");
+        let index = Index::build(&root);
+        let unresolved = |name: &str| Diagnostic {
+            kind: DiagnosticKind::UnresolvedImport,
+            path: "crates/b/src/lib.rs".to_string(),
+            line: 0,
+            name: name.to_string(),
+        };
+
+        // Everything resolved: no line at all.
+        assert_eq!(incomplete_summary(&index, &[]), None);
+
+        let diagnostics = vec![
+            unresolved("a.Missing"),
+            unresolved("a.AlsoMissing"),
+            unresolved("b.Missing"),
+            unresolved("std.fmt.Debug"),
+            unresolved("serde.Serialize"),
+        ];
+        assert_eq!(
+            incomplete_summary(&index, &diagnostics).as_deref(),
+            Some(
+                "closure incomplete: 5 unresolved imports: 3 from 2 workspace crates (a 2, b 1), 2 third-party (serde 1, std 1)"
+            )
+        );
+
+        // Third-party only, and the singular form.
+        assert_eq!(
+            incomplete_summary(&index, &[unresolved("std.fmt.Debug")]).as_deref(),
+            Some("closure incomplete: 1 unresolved import: all third-party (std 1)")
+        );
+        // Other diagnostic kinds are not imports and are not counted here.
+        let ambiguous = Diagnostic {
+            kind: DiagnosticKind::Ambiguous,
+            path: "crates/b/src/lib.rs".to_string(),
+            line: 7,
+            name: "Thing".to_string(),
+        };
+        assert_eq!(incomplete_summary(&index, &[ambiguous]), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn python_imports_and_method_call_graph() {
         let root = index_from_disk(
@@ -4041,7 +4422,7 @@ mod tests {
                 !json[field].is_null(),
                 "{kind:?} must carry {field}: {json}"
             );
-            assert!(!diagnostic.to_line().is_empty());
+            assert!(!diagnostic.to_line(&Index::default()).is_empty());
         }
     }
 
