@@ -34,6 +34,7 @@ const theme: FakeTheme = {
 
 interface RegisteredTool {
   name: string;
+  exposure?: "direct" | "model-only" | "codemode" | "deferred" | "hidden";
   annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
   namespace?: { name?: string };
   outputSchema?: unknown;
@@ -69,7 +70,12 @@ function fakePi(flags: Record<string, string> = {}): FakePi {
   const api = {
     registerTool(tool: RegisteredTool) {
       tools.set(tool.name, tool);
-      activeTools.push(tool.name);
+      // Mirrors pi: `direct` and `model-only` activate on registration; every
+      // other exposure needs `tool_search` or `setActiveTools`.
+      const exposure = tool.exposure ?? "direct";
+      if (exposure === "direct" || exposure === "model-only") {
+        activeTools.push(tool.name);
+      }
     },
     on(event: string, handler: (event: unknown, ctx: ExtensionToolContext) => unknown) {
       handlers.set(event, handler);
@@ -358,6 +364,27 @@ describe("registration", () => {
       expect(typeof tool.renderCall).toBe("function");
       expect(typeof tool.renderResult).toBe("function");
     }
+  });
+
+  // #71: bundle bookkeeping stays reachable through `tool_search`, but it is
+  // not one of the five tools declared to the model.
+  test("declares the five exploration tools and defers the other three", () => {
+    const pi = setup(jsonHandler());
+    for (const name of [
+      "filer_bundle",
+      "filer_search",
+      "filer_deps",
+      "filer_callers",
+      "filer_refs",
+    ]) {
+      expect(pi.tools.get(name)?.exposure).toBeUndefined();
+      expect(pi.activeTools).toContain(name);
+    }
+    for (const name of ["filer_show", "filer_why", "filer_state"]) {
+      expect(pi.tools.get(name)?.exposure).toBe("deferred");
+      expect(pi.activeTools).not.toContain(name);
+    }
+    expect(pi.activeTools).toHaveLength(5);
   });
 
   test("read-only hints: everything but a persisting bundle", () => {
@@ -709,7 +736,8 @@ describe("session_start usability check", () => {
     expect(pi.calls[0]!.argv).toEqual(["--version"]);
     expect(pi.calls[0]!.timeoutMs).toBe(5_000);
     expect(pi.notifications).toEqual([]);
-    expect(pi.activeTools).toHaveLength(8);
+    // #71: five direct tools; the three deferred ones were never active.
+    expect(pi.activeTools).toHaveLength(5);
     // #61: the guidance binds to this flag, so it must turn on here.
     expect(pi.availability.usable).toBe(true);
   });

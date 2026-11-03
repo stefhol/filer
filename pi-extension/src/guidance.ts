@@ -1,26 +1,42 @@
 //! Steering: teach the model when the filer tools beat `read` and grep (#61).
 //!
-//! Two registrations, both gated on the binary being usable:
+//! Three registrations, all gated on the binary being usable:
 //!
 //! - `before_agent_start` adds a `tool_guidance` section so the model knows
 //!   that `filer_bundle` returns a source file *plus* its import/call closure,
-//!   and that symbol questions belong to `filer_deps`/`filer_callers`;
-//! - `tool_result` appends one paragraph to a full `read` of a source file, so
-//!   a model that already reached for `read` is corrected within the same turn.
+//!   and that symbol questions belong to `filer_search`/`filer_deps`/
+//!   `filer_callers`;
+//! - `tool_result` on a full `read` of a source file appends the closure facts
+//!   for that path, so a model that reached for `read` is corrected in the turn;
+//! - `tool_result` on a `bash` declaration search (`grep -n "fn to_toml"`)
+//!   appends the units `filer_search` resolves for that name (#71). That is the
+//!   event that actually happens: ranged peeks dominate `read` (981 of 1,134
+//!   reads in the sessions measured for #71), while 432 searches were declared
+//!   as declarations.
 //!
-//! The paragraph carries numbers (#68): the read's own size is free (it is the
-//! result this handler already holds), and the closure comes from one memoized
-//! `filer deps --depth 2` probe per path. If the probe fails or runs long, the
-//! closure sentence is dropped rather than guessed.
+//! Both paragraphs carry numbers (#68) and never guess: the read's own size is
+//! free (it is the result the handler already holds), the closure comes from
+//! one memoized `filer deps --depth 2` probe per path, and the symbol rows come
+//! from one memoized `filer search` per name. A failed or slow probe drops the
+//! claim instead of inventing one, and a search that finds no declaration stays
+//! silent, so log and text greps are never annotated.
 //!
-//! Nothing is blocked: ranged reads, images and non-source files are untouched,
-//! so quick peeks and `/skill` file loads keep working. The usability flag is
-//! owned by the `session_start` probe in `src/tools.ts`; until it passes, this
-//! module adds nothing to the prompt and leaves results alone.
+//! Nothing is blocked: images, non-source files and non-declaration searches
+//! are untouched, so quick peeks and `/skill` file loads keep working. The
+//! usability flag is owned by the `session_start` probe in `src/tools.ts`;
+//! until it passes, this module adds nothing to the prompt and leaves results
+//! alone. `filer_show`, `filer_state` and `filer_why` are registered as
+//! `deferred`, so no nudge points at them without `tool_search` first (#71).
 
 import type { ExtensionAPI, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { diagnosticsSummary } from "./format";
-import { deps, type DepsEnvelope } from "./operations";
+import {
+  deps,
+  search,
+  type DepsEnvelope,
+  type SearchData,
+  type SearchRow,
+} from "./operations";
 import {
   SOURCE_EXTENSIONS,
   extensionOf,
@@ -37,8 +53,14 @@ type ContentPart = ToolResultEvent["content"][number];
 /** The prompt section key; reusing it replaces our earlier text, never stacks. */
 export const GUIDANCE_SECTION = "tool_guidance";
 
-/** Marks a result this module already annotated, so a second pass is a no-op. */
-export const READ_NUDGE_MARKER = "[filer]";
+/**
+ * Marks a result this module already annotated, so a second pass is a no-op.
+ * The read nudge introduced the prefix (#68); the symbol nudge reuses it, so a
+ * result is annotated at most once whichever handler sees it first.
+ */
+export const NUDGE_MARKER = "[filer]";
+/** The name the read nudge introduced (#68); kept for its tests and callers. */
+export const READ_NUDGE_MARKER = NUDGE_MARKER;
 
 /** The cross-tool guidance added to the system prompt while filer is usable. */
 export const TOOL_GUIDANCE = [
@@ -186,9 +208,8 @@ export function readNudge(
 ): string {
   const seed = JSON.stringify(path);
   const bundle = `\`filer_bundle({ seeds: [${seed}] })\``;
-  const why = "`filer_why` explains what pulled a unit into a bundle.";
   if (size === undefined) {
-    return `${READ_NUDGE_MARKER} \`${path}\` is a source file filer parses. ${bundle} returns it together with its import/call closure, so you also see what it depends on; ${why}`;
+    return `${READ_NUDGE_MARKER} \`${path}\` is a source file filer parses. ${bundle} returns it together with its import/call closure, so you also see what it depends on.`;
   }
   const lines = `${size.lines} line${size.lines === 1 ? "" : "s"} / ${formatSize(size.bytes)}`;
   const closure =
@@ -203,7 +224,7 @@ export function readNudge(
                 facts.unresolved === 1 ? "" : "s"
               })`
         }`;
-  return `${READ_NUDGE_MARKER} \`${path}\` is a source file filer parses — ${lines}. ${closure}; ${bundle} returns it all, and ${why}`;
+  return `${READ_NUDGE_MARKER} \`${path}\` is a source file filer parses — ${lines}. ${closure}; ${bundle} returns it all.`;
 }
 
 /**
@@ -219,18 +240,287 @@ export function nudgeForRead(input: Record<string, unknown>): string | null {
   return readNudge(path);
 }
 
+// --- symbol nudge ---------------------------------------------------------
+
+/** Commands that search file contents; the first operand is the pattern. */
+export const SEARCH_COMMANDS: readonly string[] = ["rg", "grep", "ag", "ack"];
+
+/** Keywords whose operand names a declaration, not arbitrary text. */
+export const DECLARATION_KEYWORDS: readonly string[] = [
+  "fn",
+  "struct",
+  "enum",
+  "trait",
+  "impl",
+  "class",
+  "interface",
+  "def",
+  "func",
+  "fun",
+  "type",
+];
+
+const DECLARATION = new RegExp(
+  `\\b(?:${DECLARATION_KEYWORDS.join("|")})\\s+([A-Za-z_][A-Za-z0-9_]*)`,
+  "g",
+);
+
+/** Options whose next word is a value, not the search pattern. */
+const OPTIONS_WITH_VALUE = new Set([
+  "-e",
+  "-f",
+  "--regexp",
+  "--file",
+  "-g",
+  "--glob",
+  "--iglob",
+  "--include",
+  "--exclude",
+  "--type",
+  "-t",
+  "-T",
+  "--type-not",
+  "-A",
+  "-B",
+  "-C",
+  "-m",
+  "--max-count",
+  "--after-context",
+  "--before-context",
+  "--context",
+  "--ignore-file",
+]);
+
+/** Words that may sit between a segment start and the search command. */
+const COMMAND_PREFIXES = new Set([
+  "cd",
+  "sudo",
+  "env",
+  "time",
+  "command",
+  "unbuffer",
+]);
+
+/** Names one command may contribute; three is already generous. */
+export const MAX_DECLARATION_NAMES = 3;
+
+/**
+ * Split one shell segment into words, dropping quotes. This is deliberately not
+ * a shell parser: it only needs to find `rg`/`grep` and read its pattern.
+ */
+export function shellWords(segment: string): string[] {
+  const words: string[] = [];
+  const word = /"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+)/g;
+  for (const match of segment.matchAll(word)) {
+    if (match[1] !== undefined) words.push(match[1].replace(/\\(.)/g, "$1"));
+    else if (match[2] !== undefined) words.push(match[2]);
+    else if (match[3] !== undefined) words.push(match[3]);
+  }
+  return words;
+}
+
+/**
+ * Split a command line into segments at `;`, `&&`, `||`, `|` and newlines,
+ * ignoring separators inside quotes so a pattern like `'fn a|fn b'` stays one
+ * word.
+ */
+export function shellSegments(command: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!;
+    if (quote !== null) {
+      current += char;
+      if (char === "\\" && quote === '"') {
+        current += command[index + 1] ?? "";
+        index += 1;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === "\\") {
+      current += char + (command[index + 1] ?? "");
+      index += 1;
+      continue;
+    }
+    const next = command[index + 1];
+    if ((char === "|" && next === "|") || (char === "&" && next === "&")) {
+      segments.push(current);
+      current = "";
+      index += 1;
+      continue;
+    }
+    if (char === "|" || char === ";" || char === "\n") {
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  segments.push(current);
+  return segments;
+}
+
+/**
+ * The names a command greps for as declarations, in order of appearance.
+ *
+ * Only declaration-shaped patterns count: `grep -n "fn to_toml"` yields
+ * `to_toml`, while `grep -iE "error"` and `rg '\.walk\('` yield nothing, so
+ * ordinary text and log searches are never annotated.
+ */
+export function declarationNames(command: string): string[] {
+  const names: string[] = [];
+  for (const segment of shellSegments(command)) {
+    const words = shellWords(segment);
+    const at = words.findIndex((word) => SEARCH_COMMANDS.includes(word));
+    if (at < 0) continue;
+    if (!words.slice(0, at).every((word) => COMMAND_PREFIXES.has(word))) continue;
+    const pattern = searchPattern(words.slice(at + 1));
+    if (pattern === null) continue;
+    for (const match of pattern.matchAll(DECLARATION)) {
+      const name = match[1];
+      if (name !== undefined && !names.includes(name)) names.push(name);
+    }
+  }
+  return names.slice(0, MAX_DECLARATION_NAMES);
+}
+
+/** The first operand that is not an option or an option's value. */
+function searchPattern(args: readonly string[]): string | null {
+  for (let index = 0; index < args.length; index += 1) {
+    const word = args[index]!;
+    // `-e`/`--regexp` *are* the pattern; `-f`/`--file` keep it in a file.
+    if (word === "-e" || word === "--regexp") return args[index + 1] ?? null;
+    if (word === "-f" || word === "--file") return null;
+    if (word.startsWith("-")) {
+      // Skip the option's value too: `--glob '*.rs'` is not the pattern.
+      if (OPTIONS_WITH_VALUE.has(word)) index += 1;
+      continue;
+    }
+    return word;
+  }
+  return null;
+}
+
+/** One unit `filer_search` resolved for a name. */
+export interface SymbolFacts {
+  /** The seed the tools accept: `path::Symbol` or `path::Class.method`. */
+  unit: string;
+  kind: string;
+  path: string;
+  line: number | null;
+  tokens: number;
+}
+
+/** Rows asked of the probe: enough for three declarations plus file rows. */
+export const SYMBOL_PROBE_LIMIT = 8;
+/** How long the symbol nudge may wait before it stays silent. */
+export const SYMBOL_PROBE_TIMEOUT_MS = 2000;
+
+/** The declaration rows of a search envelope, deduplicated and capped. */
+export function symbolFacts(data: SearchData): SymbolFacts[] {
+  const facts: SymbolFacts[] = [];
+  for (const row of data.rows) {
+    const fact = symbolFact(row);
+    if (fact === null) continue;
+    if (facts.some((seen) => seen.unit === fact.unit)) continue;
+    facts.push(fact);
+    if (facts.length === MAX_DECLARATION_NAMES) break;
+  }
+  return facts;
+}
+
+function symbolFact(row: SearchRow): SymbolFacts | null {
+  // A file row is a path hit, not a declaration: `grep` already found the file.
+  if (row.symbol === null || row.scope === "file") return null;
+  // `fqn` is language-dependent (bare in Rust, package-qualified in Java); the
+  // tools take the `path::Symbol` form, so build that from the row.
+  const unit =
+    row.member === null
+      ? `${row.path}::${row.symbol}`
+      : `${row.path}::${row.symbol}.${row.member}`;
+  return {
+    unit,
+    kind: row.kind,
+    path: row.path,
+    line: row.line,
+    tokens: row.est_tokens,
+  };
+}
+
+/** One lookup per name: the units, or null when it could not be known. */
+export type SymbolProbe = (
+  name: string,
+  ctx: { cwd: string },
+) => Promise<SymbolFacts[] | null>;
+
+/**
+ * The real probe, over the same client resolver the tools use. A failure (no
+ * binary, unindexed root, bad JSON) is "unknown", never "no declarations".
+ */
+export function createSymbolProbe(resolve: ClientResolver): SymbolProbe {
+  return async (name, ctx) => {
+    try {
+      const context = await resolve(ctx, undefined);
+      const result = await search(context, {
+        query: name,
+        limit: SYMBOL_PROBE_LIMIT,
+      });
+      return symbolFacts(result.data);
+    } catch {
+      return null;
+    }
+  };
+}
+
+/** Memoize a probe per project and name, failures included. */
+export function memoizedSymbolProbe(probe: SymbolProbe): SymbolProbe {
+  const cache = new Map<string, Promise<SymbolFacts[] | null>>();
+  return (name, ctx) => {
+    const key = `${ctx.cwd}\u0000${name}`;
+    const cached = cache.get(key);
+    if (cached !== undefined) return cached;
+    const pending = timed(probe(name, ctx), SYMBOL_PROBE_TIMEOUT_MS);
+    cache.set(key, pending);
+    return pending;
+  };
+}
+
+/** The note appended to a `bash` declaration search. */
+export function symbolNudge(name: string, facts: readonly SymbolFacts[]): string {
+  const rows = facts
+    .slice(0, MAX_DECLARATION_NAMES)
+    .map((fact) => {
+      const where = fact.line === null ? fact.path : `${fact.path}:${fact.line}`;
+      return `${fact.unit} (${fact.kind}, ${where}, ${fact.tokens} tokens)`;
+    })
+    .join("; ");
+  return `${NUDGE_MARKER} \`${name}\` is a declaration: ${rows}. \`filer_search({ query: ${JSON.stringify(
+    name,
+  )} })\` returns each unit's path, kind, span and size; \`filer_callers({ unit })\` takes that seed as-is, and \`filer_refs({ name })\` lists every recorded use.`;
+}
+
 export interface FilerGuidanceDeps {
   availability: FilerAvailability;
   /** The tool the guidance points at; defaults to `filer_bundle`. */
   bundleTool?: string;
   /** Closure probe for the `read` nudge; absent means "say less". */
   probe?: ClosureProbe;
+  /** Symbol probe for the `bash` nudge; absent means "say nothing". */
+  symbolProbe?: SymbolProbe;
 }
 
 /**
- * Register the prompt section and the `read` nudge.
+ * Register the prompt section and the two result nudges.
  *
- * Both handlers are no-ops until `availability.usable` is true, and the prompt
+ * Every handler is a no-op until `availability.usable` is true, and the prompt
  * section also requires the bundle tool to be active, so a session that
  * removed the tools (see `registerFilerTools`) is never told to call them.
  */
@@ -240,6 +530,8 @@ export function registerFilerGuidance(
 ): void {
   const bundleTool = deps.bundleTool ?? "filer_bundle";
   const probe = deps.probe === undefined ? undefined : memoizedProbe(deps.probe);
+  const symbolProbe =
+    deps.symbolProbe === undefined ? undefined : memoizedSymbolProbe(deps.symbolProbe);
 
   pi.on("before_agent_start", (event) => {
     if (!deps.availability.usable) return;
@@ -252,23 +544,51 @@ export function registerFilerGuidance(
 
   pi.on("tool_result", async (event, ctx) => {
     if (!deps.availability.usable) return;
-    if (event.toolName !== "read" || event.isError) return;
-    if (nudgeForRead(event.input) === null) return;
-    if (
-      event.content.some(
-        (part) => part.type === "text" && part.text.includes(READ_NUDGE_MARKER),
-      )
-    ) {
-      return;
+    if (event.isError) return;
+    if (alreadyAnnotated(event.content)) return;
+
+    // #71: the event that actually happens is a declaration grep, not a read.
+    if (event.toolName === "bash") {
+      const command = event.input["command"];
+      if (typeof command !== "string" || symbolProbe === undefined) return;
+      const name = declarationNames(command)[0];
+      if (name === undefined) return;
+      // One memoized spawn per project and name; null means "unknown".
+      const facts = await symbolProbe(name, ctx);
+      if (facts === null || facts.length === 0) return;
+      return annotate(event.content, symbolNudge(name, facts));
     }
+
+    if (event.toolName !== "read") return;
+    if (nudgeForRead(event.input) === null) return;
     const path = event.input["path"] as string;
     // One memoized spawn per path; null means "the number is unknown".
     const facts = probe === undefined ? undefined : await probe(path, ctx);
     const nudge = readNudge(path, readSize(event.content), facts);
-    const annotated = event.content.map((part): ContentPart => {
-      if (part.type !== "text") return part;
-      return { ...part, text: `${part.text}\n\n${nudge}` };
-    });
-    return { content: annotated };
+    return annotate(event.content, nudge);
   });
+}
+
+/** A result this module already annotated is left exactly as it is. */
+function alreadyAnnotated(content: readonly ContentPart[]): boolean {
+  return content.some(
+    (part) => part.type === "text" && part.text.includes(NUDGE_MARKER),
+  );
+}
+
+/** The tool-result shape a nudge returns: replaced content, nothing else. */
+interface NudgeResult {
+  content: ContentPart[];
+}
+
+/** Append one paragraph to every text block, leaving images untouched. */
+function annotate(
+  content: readonly ContentPart[],
+  nudge: string,
+): NudgeResult {
+  return {
+    content: content.map((part) =>
+      part.type === "text" ? { ...part, text: `${part.text}\n\n${nudge}` } : part,
+    ),
+  };
 }

@@ -1,4 +1,6 @@
-//! The eight model-callable filer tools (#41).
+//! The eight filer tools (#41): five exploration tools declared to the model
+//! and three bundle-bookkeeping tools (`show`, `why`, `state`) registered as
+//! `deferred`, so `tool_search` reaches them without diluting the choice (#71).
 //!
 //! Thin wrappers over `src/operations.ts`: argument mapping, spawning and the
 //! JSON guards live there. This module maps typed parameters onto one operation
@@ -433,6 +435,11 @@ function registerTool<P extends TSchema, D extends FilerToolDetails>(
 /**
  * Register the eight `filer_*` tools and the session-start usability check.
  *
+ * `filer_bundle`, `filer_search`, `filer_deps`, `filer_callers` and
+ * `filer_refs` are `direct` (declared to the model). `filer_show`,
+ * `filer_why` and `filer_state` are `deferred`: they read the saved bundle
+ * state, and declaring them cost a choice without ever winning one (#71).
+ *
  * The factory never spawns; the first lookup happens when a tool runs or when
  * pi emits `session_start`. A failed `filer --version` notifies once and
  * removes the `filer_*` tools from the active set, so calls fail fast instead
@@ -536,6 +543,8 @@ export function registerFilerTools(
     description:
       "Re-render the saved bundle for a branch from <root>/.filer/bundle.toml without resolving anything. Large bundles are truncated with a note.",
     parameters: ShowParams,
+    // Bundle bookkeeping, not exploration: `tool_search` activates it (#71).
+    exposure: "deferred",
     namespace: FILER_NAMESPACE,
     annotations: READ_ONLY,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -589,6 +598,9 @@ export function registerFilerTools(
     namespace: FILER_NAMESPACE,
     annotations: READ_ONLY,
     outputSchema: SearchOutput,
+    promptGuidelines: [
+      "Call filer_search before grepping for a declaration: one call returns the units with FQN, kind, span and size, so it replaces grep-then-read.",
+    ],
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
         const result = await runTool(ctx, signal, (context) =>
@@ -740,6 +752,8 @@ export function registerFilerTools(
     description:
       "Explain how a unit entered this branch's saved bundle: the reason, the depth, and the chain back to the seed that pulled it in. Reads the state file; it does not resolve.",
     parameters: WhyParams,
+    // Bundle bookkeeping, not exploration: `tool_search` activates it (#71).
+    exposure: "deferred",
     namespace: FILER_NAMESPACE,
     annotations: READ_ONLY,
     outputSchema: WhyOutput,
@@ -831,6 +845,8 @@ export function registerFilerTools(
     description:
       "Show what the saved bundle state holds: the state file, the current branch, every stored branch, and the current branch's entries (path, scope, depth, reason). Read-only; clearing stays a `/filer reset` command.",
     parameters: StateParams,
+    // Bundle bookkeeping, not exploration: `tool_search` activates it (#71).
+    exposure: "deferred",
     namespace: FILER_NAMESPACE,
     annotations: READ_ONLY,
     outputSchema: StateOutput,

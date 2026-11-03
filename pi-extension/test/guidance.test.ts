@@ -5,22 +5,32 @@ import { describe, expect, test } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   GUIDANCE_SECTION,
+  MAX_DECLARATION_NAMES,
+  NUDGE_MARKER,
   READ_NUDGE_MARKER,
   READ_PROBE_TIMEOUT_MS,
+  SYMBOL_PROBE_TIMEOUT_MS,
   TOOL_GUIDANCE,
   closureFacts,
   createAvailability,
+  declarationNames,
   extensionOf,
   formatSize,
   memoizedProbe,
+  memoizedSymbolProbe,
   nudgeForRead,
   readNudge,
   readSize,
   registerFilerGuidance,
+  shellWords,
   sourceExtensionOf,
+  symbolFacts,
+  symbolNudge,
   type ClosureProbe,
   type FilerAvailability,
+  type SymbolProbe,
 } from "../src/guidance";
+import type { SearchData, SearchRow } from "../src/operations";
 
 // --- fakes ----------------------------------------------------------------
 
@@ -91,12 +101,18 @@ function readEvent(path: string, overrides: Partial<ReadResultEvent> = {}): Read
 function setup(
   availability: FilerAvailability = createAvailability(),
   probe?: ClosureProbe,
+  symbolProbe?: SymbolProbe,
 ) {
   const { api, handlers } = fakePi();
-  registerFilerGuidance(api, { availability, ...(probe === undefined ? {} : { probe }) });
+  registerFilerGuidance(api, {
+    availability,
+    ...(probe === undefined ? {} : { probe }),
+    ...(symbolProbe === undefined ? {} : { symbolProbe }),
+  });
   const prompt = handlers.get("before_agent_start") as (event: PromptEvent) => unknown;
   const result = handlers.get("tool_result") as (
     event: ReadResultEvent,
+    ctx?: { cwd: string },
   ) => Promise<{ content: ContentPart[] } | undefined>;
   return { availability, prompt, result };
 }
@@ -327,6 +343,247 @@ describe("read nudge with numbers", () => {
 });
 
 // --- path helpers ---------------------------------------------------------
+
+// --- symbol nudge ---------------------------------------------------------
+
+function searchRow(overrides: Partial<SearchRow> = {}): SearchRow {
+  return {
+    schema_version: 1,
+    path: "src/state.rs",
+    scope: "function",
+    symbol: "to_toml",
+    member: null,
+    kind: "function",
+    fqn: "src/state.rs::to_toml",
+    line: 12,
+    start_line: 12,
+    end_line: 40,
+    bytes: 640,
+    est_tokens: 160,
+    package: null,
+    included: false,
+    depth: null,
+    reason: null,
+    ...overrides,
+  };
+}
+
+function searchData(rows: SearchRow[]): SearchData {
+  return { schema_version: 1, query: "a", results: rows.length, rows };
+}
+
+function bashEvent(
+  command: string,
+  overrides: Partial<ReadResultEvent> = {},
+): ReadResultEvent {
+  return {
+    type: "tool_result",
+    toolName: "bash",
+    toolCallId: "call-2",
+    input: { command },
+    content: [{ type: "text", text: "src/state.rs:12:fn to_toml() {}" }],
+    isError: false,
+    details: undefined,
+    ...overrides,
+  };
+}
+
+describe("declaration searches", () => {
+  test("reads the pattern the way grep and rg do", () => {
+    expect(shellWords(`grep -n "a b" 'c d'`)).toEqual(["grep", "-n", "a b", "c d"]);
+    expect(shellWords(`rg -n 'fn to_toml'`)).toEqual(["rg", "-n", "fn to_toml"]);
+  });
+
+  test("extracts the declared name", () => {
+    expect(declarationNames(`rg -n "fn to_toml" -A6 src/state.rs`)).toEqual([
+      "to_toml",
+    ]);
+    expect(
+      declarationNames(`grep -nE '^interface Subscribable' /tmp/schema.graphql`),
+    ).toEqual(["Subscribable"]);
+    expect(declarationNames(`grep -rn "class HazelcastProperties" .`)).toEqual([
+      "HazelcastProperties",
+    ]);
+    expect(declarationNames(`grep -e "fn nested" src/a.rs`)).toEqual(["nested"]);
+    expect(declarationNames(`rg --glob '*.rs' "struct Index" src`)).toEqual([
+      "Index",
+    ]);
+  });
+
+  test("stays silent on text, log and call searches", () => {
+    expect(declarationNames(`grep -iE "error|panic" /var/log/x`)).toEqual([]);
+    expect(declarationNames(`rg -n '\.walk\(' src`)).toEqual([]);
+    expect(declarationNames(`rg -n "snapshot" crates`)).toEqual([]);
+    expect(declarationNames(`grep -f patterns.txt file`)).toEqual([]);
+    expect(declarationNames(`echo grep -n "fn not_a_search"`)).toEqual([]);
+    expect(declarationNames("cat README.md")).toEqual([]);
+  });
+
+  test("follows separators and caps the names", () => {
+    expect(declarationNames(`cd src && rg 'fn a' ; grep 'def b'`)).toEqual([
+      "a",
+      "b",
+    ]);
+    const many = declarationNames(`rg 'fn a|fn b|fn c|fn d' src`);
+    expect(many).toHaveLength(MAX_DECLARATION_NAMES);
+    expect(many).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("symbol facts", () => {
+  test("keeps declarations, drops file rows and duplicates", () => {
+    const facts = symbolFacts(
+      searchData([
+        searchRow({ scope: "file", symbol: null, fqn: "src/state.rs", line: null }),
+        searchRow(),
+        searchRow({ fqn: "src/state.rs::to_toml" }),
+        searchRow({
+          fqn: "src/state.rs::State.to_toml",
+          kind: "method",
+          member: "to_toml",
+          symbol: "State",
+          line: 90,
+        }),
+      ]),
+    );
+    expect(facts).toHaveLength(2);
+    expect(facts[0]).toEqual({
+      unit: "src/state.rs::to_toml",
+      kind: "function",
+      path: "src/state.rs",
+      line: 12,
+      tokens: 160,
+    });
+  });
+
+  test("caps the facts at three", () => {
+    const facts = symbolFacts(
+      searchData([
+        searchRow({ path: "a", symbol: "one" }),
+        searchRow({ path: "a", symbol: "two" }),
+        searchRow({ path: "a", symbol: "three" }),
+        searchRow({ path: "a", symbol: "four" }),
+      ]),
+    );
+    expect(facts.map((fact) => fact.unit)).toEqual(["a::one", "a::two", "a::three"]);
+  });
+
+  test("the note carries the units, the size and the next tool", () => {
+    const text = symbolNudge("to_toml", [
+      {
+        unit: "src/state.rs::to_toml",
+      kind: "function",
+        path: "src/state.rs",
+        line: 12,
+        tokens: 160,
+      },
+    ]);
+    expect(text).toContain(NUDGE_MARKER);
+    expect(text).toContain("src/state.rs::to_toml (function, src/state.rs:12, 160 tokens)");
+    expect(text).toContain('`filer_search({ query: "to_toml" })`');
+    expect(text).toContain("`filer_callers({ unit })`");
+    expect(text).toContain("`filer_refs({ name })`");
+  });
+});
+
+describe("symbol nudge", () => {
+  const facts = [
+    {
+      unit: "src/state.rs::to_toml",
+      kind: "function",
+      path: "src/state.rs",
+      line: 12,
+      tokens: 160,
+    },
+  ];
+
+  test("appends the units to a declaration grep", async () => {
+    const probe: SymbolProbe = async () => facts;
+    const { availability, result } = setup(createAvailability(), undefined, probe);
+    availability.usable = true;
+    const event = bashEvent(`rg -n "fn to_toml" -A6 src/state.rs`);
+    const updated = await result(event, { cwd: "/repo" });
+
+    expect(updated).toBeDefined();
+    expect(updated!.content[0]?.text).toContain("fn to_toml() {}");
+    expect(updated!.content[0]?.text).toContain("src/state.rs::to_toml");
+    // The input event is not mutated in place.
+    expect(event.content[0]?.text).toBe("src/state.rs:12:fn to_toml() {}");
+  });
+
+  test("probes once per name, memoized across calls", async () => {
+    const seen: string[] = [];
+    const probe: SymbolProbe = async (name) => {
+      seen.push(name);
+      return facts;
+    };
+    const { availability, result } = setup(createAvailability(), undefined, probe);
+    availability.usable = true;
+    await result(bashEvent(`rg "fn to_toml" src`), { cwd: "/repo" });
+    await result(bashEvent(`grep "fn to_toml" src/a.rs`), { cwd: "/repo" });
+    expect(seen).toEqual(["to_toml"]);
+  });
+
+  test("stays silent while unusable, on errors, and without a probe", async () => {
+    let calls = 0;
+    const probe: SymbolProbe = async () => {
+      calls += 1;
+      return facts;
+    };
+    const off = setup(createAvailability(), undefined, probe);
+    expect(await off.result(bashEvent(`rg "fn to_toml" src`))).toBeUndefined();
+
+    const { availability, result } = setup(createAvailability(), undefined, probe);
+    availability.usable = true;
+    expect(
+      await result(bashEvent(`rg "fn to_toml" src`, { isError: true }), { cwd: "/repo" }),
+    ).toBeUndefined();
+    expect(calls).toBe(0);
+
+    const bare = setup();
+    bare.availability.usable = true;
+    expect(await bare.result(bashEvent(`rg "fn to_toml" src`), { cwd: "/repo" })).toBeUndefined();
+  });
+
+  test("says nothing when the search finds nothing", async () => {
+    const empty: SymbolProbe = async () => [];
+    const unknown: SymbolProbe = async () => null;
+    const emptySetup = setup(createAvailability(), undefined, empty);
+    emptySetup.availability.usable = true;
+    expect(await emptySetup.result(bashEvent(`rg "fn ghost" src`), { cwd: "/repo" })).toBeUndefined();
+
+    const unknownSetup = setup(createAvailability(), undefined, unknown);
+    unknownSetup.availability.usable = true;
+    expect(
+      await unknownSetup.result(bashEvent(`rg "fn ghost" src`), { cwd: "/repo" }),
+    ).toBeUndefined();
+  });
+
+  test("does not annotate a log grep or an annotated result", async () => {
+    let calls = 0;
+    const probe: SymbolProbe = async () => {
+      calls += 1;
+      return facts;
+    };
+    const { availability, result } = setup(createAvailability(), undefined, probe);
+    availability.usable = true;
+    expect(await result(bashEvent(`grep -iE "error" /var/log/x`), { cwd: "/repo" })).toBeUndefined();
+    expect(calls).toBe(0);
+    const already = bashEvent(`rg "fn to_toml" src`, {
+      content: [{ type: "text", text: `${NUDGE_MARKER} already there` }],
+    });
+    expect(await result(already, { cwd: "/repo" })).toBeUndefined();
+    expect(calls).toBe(0);
+  });
+
+  test("a memoized probe never waits longer than its budget", async () => {
+    const slow: SymbolProbe = () => new Promise(() => {});
+    const probe = memoizedSymbolProbe(slow);
+    const started = Date.now();
+    expect(await probe("to_toml", { cwd: "/repo" })).toBeNull();
+    expect(Date.now() - started).toBeLessThan(SYMBOL_PROBE_TIMEOUT_MS + 1_000);
+  });
+});
 
 describe("extension matching", () => {
   test("reads the extension of a path", () => {
