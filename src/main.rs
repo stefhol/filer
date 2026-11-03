@@ -2,6 +2,7 @@
 
 mod atomic;
 mod bundle;
+mod cargo;
 mod config;
 mod csharp;
 mod error;
@@ -31,7 +32,7 @@ use error::{FilerError, EXIT_EMPTY, EXIT_INTERNAL};
 use filter::Filter;
 use index::{FileEntry, Index};
 use lang::{Granularity, Language, Member, MemberKind, Symbol, SymbolKind};
-use resolve::{build_graph, drop_covered_symbols, Reason, ResolveOptions, Unit};
+use resolve::{build_graph, drop_covered_symbols, Diagnostic, Reason, ResolveOptions, Unit};
 use schema::SCHEMA_VERSION;
 use state::{BranchBundle, Selection, StateDoc, StateFile};
 
@@ -227,7 +228,8 @@ struct BundleArgs {
 
 #[derive(Args)]
 struct DepsArgs {
-    /// File or unit to inspect: `path`, `path::Symbol` or `path::Class.method`.
+    /// File or unit to inspect: `path`, `path::Symbol`, `path::Class.method`
+    /// or a crate directory (`crates/hub`).
     #[arg(value_name = "UNIT")]
     file: String,
     /// Import/call hops to follow.
@@ -451,6 +453,17 @@ impl Context {
         if self.quiet {
             return;
         }
+        if self.json {
+            eprintln!("{}", serde_json::json!({ "warning": message.to_string() }));
+        } else {
+            eprintln!("filer: {message}");
+        }
+    }
+
+    /// A notice that survives `--quiet`. A partial closure that looks complete
+    /// is the failure mode these lines exist for, so `--quiet` only silences the
+    /// per-import detail, never the grouped "closure incomplete" line.
+    fn notice(&self, message: impl std::fmt::Display) {
         if self.json {
             eprintln!("{}", serde_json::json!({ "warning": message.to_string() }));
         } else {
@@ -1176,6 +1189,15 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
             context.warn(format!("skipping {path}: not inside {}", root.display()));
             continue;
         };
+        // `crates/hub` names a whole crate: seed every source of it at once.
+        if symbol.is_none() {
+            if let Some(units) = crate_seed_units(&index, &rel) {
+                for unit in units {
+                    push_unique(&mut seeds, unit);
+                }
+                continue;
+            }
+        }
         let Some(&position) = index.by_rel.get(&rel) else {
             // Not walked: outside the root, filtered out, or not a source file.
             // The text is still bundled as-is, but a supported extension means
@@ -1377,12 +1399,7 @@ fn bundle_cmd(root: &Path, args: BundleArgs, context: &Context) -> Result<(), Fi
     } else {
         // Markdown cannot carry the lists; at least say the slice is incomplete.
         warn_budget(&rendered, context);
-        if !rendered.diagnostics.is_empty() {
-            context.warn(format!(
-                "{} diagnostics: the bundle is an incomplete slice (see --json)",
-                rendered.diagnostics.len()
-            ));
-        }
+        report_incomplete(&index, &rendered.diagnostics, context, false);
         rendered.markdown
     };
 
@@ -1831,8 +1848,8 @@ fn offset_of_line(source: &str, line: usize) -> usize {
 fn deps(root: &Path, args: DepsArgs, context: &Context) -> Result<(), FilerError> {
     let index = Index::build_with(root, &context.filter);
     let root = index.root.clone();
-    let seed = resolve_unit(&index, &root, &args.file)?;
-    let seeds = [seed.clone()];
+    // A directory seed names a whole crate: every `src/**/*.rs` of it at depth 0.
+    let seeds = resolve_seeds(&index, &root, &args.file)?;
 
     // File mode and `--unit` mode share one traversal; file mode only collapses
     // it to one row per file. A member seed therefore shows its files in file
@@ -1912,11 +1929,15 @@ fn deps(root: &Path, args: DepsArgs, context: &Context) -> Result<(), FilerError
             .collect();
 
         let diagnostics: Vec<_> = graph.diagnostics.iter().map(|d| d.to_json()).collect();
+        let seed_labels: Vec<String> = seeds.iter().map(|unit| unit_label(&index, unit)).collect();
         println!(
             "{}",
             serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
-                "seed": unit_label(&index, &seed),
+                "seed": seed_labels.first().cloned().unwrap_or_default(),
+                // A crate directory seed expands to many units; `seed` keeps the
+                // first for consumers that read one label.
+                "seeds": seed_labels,
                 "granularity": if args.unit { "unit" } else { "file" },
                 "deps": rows,
                 "edges": edges,
@@ -1939,9 +1960,7 @@ fn deps(root: &Path, args: DepsArgs, context: &Context) -> Result<(), FilerError
         println!("{}{}{}", "  ".repeat(*depth as usize), label, suffix);
     }
 
-    for diagnostic in &graph.diagnostics {
-        context.warn(diagnostic.to_line());
-    }
+    report_incomplete(&index, &graph.diagnostics, context, true);
 
     Ok(())
 }
@@ -1987,6 +2006,58 @@ fn resolve_unit(index: &Index, root: &Path, input: &str) -> Result<Unit, FilerEr
         Some(symbol) => seed_unit(index, position, symbol)
             .ok_or_else(|| FilerError::symbol_not_found(&index.files[position].rel, symbol)),
         None => Ok(Unit::File(position)),
+    }
+}
+
+/// A crate directory (`crates/hub`) seeds every indexed source of that crate at
+/// depth 0, `src/lib.rs` first: "how is this crate built" is a crate question,
+/// and one file of it is an arbitrary slice.
+fn crate_seed_units(index: &Index, dir: &str) -> Option<Vec<Unit>> {
+    let krate = index.workspace.crate_at_dir(dir)?;
+    let rels = index
+        .workspace
+        .files_of(krate, index.files.iter().map(|file| file.rel.as_str()));
+    let units: Vec<Unit> = rels
+        .iter()
+        .filter_map(|rel| index.by_rel.get(rel).copied().map(Unit::File))
+        .collect();
+    (!units.is_empty()).then_some(units)
+}
+
+/// One seed path may name a crate directory; anything with a symbol stays a
+/// single unit, so `crates/hub::Crate.method` keeps working.
+fn resolve_seeds(index: &Index, root: &Path, input: &str) -> Result<Vec<Unit>, FilerError> {
+    let (path, symbol) = split_symbol(input);
+    if symbol.is_none() {
+        if let Some(rel) = locate(index, root, path) {
+            if let Some(units) = crate_seed_units(index, rel.as_str()) {
+                return Ok(units);
+            }
+        }
+    }
+    Ok(vec![resolve_unit(index, root, input)?])
+}
+
+/// Reports an incomplete closure. The grouped line goes through `notice`, so
+/// `--quiet` still tells the caller the closure is partial; the per-import
+/// detail stays a warning, and `bundle` only prints the other kinds so its
+/// stderr does not repeat one line per third-party import.
+fn report_incomplete(
+    index: &Index,
+    diagnostics: &[Diagnostic],
+    context: &Context,
+    per_import: bool,
+) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    if let Some(line) = resolve::incomplete_summary(index, diagnostics) {
+        context.notice(line);
+    }
+    for diagnostic in diagnostics {
+        if per_import || diagnostic.kind != resolve::DiagnosticKind::UnresolvedImport {
+            context.warn(diagnostic.to_line(index));
+        }
     }
 }
 
