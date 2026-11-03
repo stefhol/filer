@@ -25,7 +25,12 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type, type TSchema } from "typebox";
 import type { FilerAdapter } from "../index";
 import { FilerToolError } from "./errors";
-import { capText, type Truncation } from "./format";
+import {
+  capText,
+  diagnosticsSummary,
+  type DiagnosticsSummary,
+  type Truncation,
+} from "./format";
 import type { FilerAvailability } from "./guidance";
 import {
   bundle,
@@ -49,6 +54,15 @@ export const VERSION_TIMEOUT_MS = 5_000;
 /** Shown when the binary is missing or unusable. */
 export const FILER_INSTALL_HINT =
   "filer not found — install with cargo install --path . or set FILER_BIN";
+
+/**
+ * Resolves the client for one call. Shared with the `read` nudge probe, so the
+ * nudge reads the same binary, root and flags as the tools (#68).
+ */
+export type ClientResolver = (
+  ctx: { cwd: string },
+  signal: AbortSignal | undefined,
+) => Promise<OperationContext>;
 
 const FILER_NAMESPACE: ToolNamespace = {
   name: "filer",
@@ -91,6 +105,8 @@ export interface FilerToolDetails {
   warnings: string[];
   /** Present only when the model-facing text was cut for size. */
   truncation?: Truncation;
+  /** Unresolved imports of the closure, grouped; absent when there are none. */
+  diagnostics?: DiagnosticsSummary;
   error?: {
     code: string;
     message: string;
@@ -106,7 +122,7 @@ export interface BundleToolDetails extends FilerToolDetails {
   branch?: string;
   budget: BundleEnvelope["budget"];
   omitted: BundleEnvelope["omitted"];
-  diagnostics: BundleEnvelope["diagnostics"];
+  diagnostics: DiagnosticsSummary;
   coverage: BundleEnvelope["coverage"];
 }
 
@@ -187,7 +203,8 @@ function success<D extends FilerToolDetails>(
 const BundleParams = Type.Object({
   seeds: Type.Array(
     Type.String({
-      description: "Path, `path::Symbol`, or `path::Class.method` to bundle",
+      description:
+        "Path, `path::Symbol`, `path::Class.method`, or a directory (`crates/hub`) to expand into its source files",
     }),
     { minItems: 1, description: "Seeds to bundle plus their import/call closure" },
   ),
@@ -225,7 +242,10 @@ const SearchParams = Type.Object({
 });
 
 const DepsParams = Type.Object({
-  seed: Type.String({ description: "Unit: `path`, `path::Symbol`, `path::Class.method`" }),
+  seed: Type.String({
+    description:
+      "Unit: `path`, `path::Symbol`, `path::Class.method`, or a crate directory (`crates/hub`)",
+  }),
   unit: Type.Optional(
     Type.Boolean({ description: "Return units instead of collapsing to files" }),
   ),
@@ -418,12 +438,15 @@ function registerTool<P extends TSchema, D extends FilerToolDetails>(
  * removes the `filer_*` tools from the active set, so calls fail fast instead
  * of once per turn (a `/reload` retries).
  */
-export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void {
+export function registerFilerTools(
+  pi: ExtensionAPI,
+  deps: FilerToolsDeps,
+): ClientResolver {
   const binFlag = deps.binFlag ?? "filer-bin";
   const rootFlag = deps.rootFlag ?? "filer-root";
 
   const resolveClient = async (
-    ctx: ExtensionToolContext,
+    ctx: { cwd: string },
     signal: AbortSignal | undefined,
   ): Promise<OperationContext> => {
     const flagBin = flagValue(pi.getFlag(binFlag));
@@ -450,7 +473,7 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
     name: "filer_bundle",
     label: "filer bundle",
     description:
-      "Bundle source files and their import/call closure into markdown. Seeds are `path`, `path::Symbol` or `path::Class.method`; `depth` follows imports (default 2). `persist` carries the previous bundle over from <root>/.filer/bundle.toml. Large bundles are truncated with a note; the details list units, budget, omitted units, diagnostics and coverage.",
+      "Bundle source files and their import/call closure into markdown. Seeds are `path`, `path::Symbol`, `path::Class.method` or a directory such as `crates/hub` (expanded to its source files, entry file first); `depth` follows imports (default 2). `persist` carries the previous bundle over from <root>/.filer/bundle.toml. Large bundles are truncated with a note; a partial closure ends with a `## Closure` section. The details list units, budget, omitted units, the grouped diagnostics and coverage.",
     parameters: BundleParams,
     namespace: FILER_NAMESPACE,
     annotations: BUNDLE_ANNOTATIONS,
@@ -482,7 +505,7 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
           ...(data.branch === undefined ? {} : { branch: data.branch }),
           budget: data.budget,
           omitted: data.omitted,
-          diagnostics: data.diagnostics,
+          diagnostics: diagnosticsSummary(data.diagnostics),
           coverage: data.coverage,
         };
         return success(result.text, details);
@@ -532,7 +555,7 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
           ...(data.branch === undefined ? {} : { branch: data.branch }),
           budget: data.budget,
           omitted: data.omitted,
-          diagnostics: data.diagnostics,
+          diagnostics: diagnosticsSummary(data.diagnostics),
           coverage: data.coverage,
         };
         return success(result.text, details);
@@ -612,7 +635,7 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
     name: "filer_deps",
     label: "filer deps",
     description:
-      "Print the import/call closure of one seed as deps rows plus the materialized edges and diagnostics. `unit: true` keeps units (`path::Symbol`, `path::Class.method`) instead of collapsing to files.",
+      "Print the import/call closure of one seed as deps rows plus the materialized edges and diagnostics. `unit: true` keeps units (`path::Symbol`, `path::Class.method`) instead of collapsing to files. A directory seed answers through the crate's `src/lib.rs` (or `src/main.rs`); an incomplete closure adds one `closure incomplete:` line.",
     parameters: DepsParams,
     namespace: FILER_NAMESPACE,
     annotations: READ_ONLY,
@@ -629,12 +652,14 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
             ...(params.depth === undefined ? {} : { depth: params.depth }),
           }),
         );
+        const diagnostics = diagnosticsSummary(result.data.diagnostics);
         return success(
           result.text,
           {
             summary: `filer deps: ${result.data.deps.length} units, ${result.data.edges.length} edges`,
             warnings: result.warnings,
             ...truncationDetails(result.truncation),
+            diagnostics,
           },
           result.data,
         );
@@ -865,4 +890,8 @@ export function registerFilerTools(pi: ExtensionAPI, deps: FilerToolsDeps): void
       pi.getActiveTools().filter((name) => !name.startsWith(FILER_TOOL_PREFIX)),
     );
   });
+
+  // Handed back so the `read` nudge can run the same one-shot `filer deps`
+  // probe through the same binary/root resolution (#68).
+  return resolveClient;
 }

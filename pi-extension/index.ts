@@ -22,7 +22,11 @@ import {
   type RootResolver,
 } from "./src/cli";
 import { registerFilerTools } from "./src/tools";
-import { createAvailability, registerFilerGuidance } from "./src/guidance";
+import {
+  createAvailability,
+  createClosureProbe,
+  registerFilerGuidance,
+} from "./src/guidance";
 import { registerFilerCommands } from "./src/commands";
 import {
   createSessionOverrides,
@@ -153,11 +157,16 @@ export default function filerExtension(
   // The tools own the `session_start` probe; it flips this flag, which the
   // guidance reads so a missing binary means an unchanged prompt (#61).
   const availability = createAvailability();
-  registerFilerTools(pi, {
+  const resolveContext = registerFilerTools(pi, {
     adapter,
     availability,
     binFlag: FILER_BIN_FLAG,
     rootFlag: FILER_ROOT_FLAG,
   });
-  registerFilerGuidance(pi, { availability });
+  registerFilerGuidance(pi, {
+    availability,
+    // #68: the nudge reports the closure, through the same binary and root
+    // resolution as the tools, memoized per path.
+    probe: createClosureProbe(resolveContext),
+  });
 }

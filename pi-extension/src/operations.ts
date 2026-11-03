@@ -36,7 +36,19 @@ import {
   assertSchemaVersion,
   assertSchemaVersionIfPresent,
 } from "./schema";
-import { capText, formatBundle, type Truncation } from "./format";
+import {
+  capText,
+  diagnosticsLine,
+  diagnosticsSummary,
+  formatBundle,
+  type Truncation,
+} from "./format";
+import {
+  createSeedFilesystem,
+  expandDepsSeed,
+  expandDirectorySeed,
+  type SeedFilesystem,
+} from "./seeds";
 
 // --- Wire types -----------------------------------------------------------
 // Only the fields the adapter reads are named. Everything else stays in `data`
@@ -258,6 +270,13 @@ export interface IndexEnvelope {
 export interface OperationContext {
   client: FilerClient;
   signal?: AbortSignal;
+  /** Directory-seed listing; defaults to the real filesystem. */
+  seedFilesystem?: SeedFilesystem;
+}
+
+/** The seed filesystem a context uses: the injected fake or the real one. */
+function seedFilesystem(context: OperationContext): SeedFilesystem {
+  return context.seedFilesystem ?? createSeedFilesystem();
 }
 
 export interface OperationResult<T> {
@@ -564,7 +583,20 @@ export async function bundle(
       hint: "pass a path or path::Symbol",
     });
   }
-  const executed = await execute(context, bundleArgs(context.client.root, options));
+  // A directory seed expands to its source files at depth 0 (#68); the `--`
+  // list is the only thing that changes, so the CLI resolves exactly the same
+  // closure as if the files had been passed explicitly.
+  const filesystem = seedFilesystem(context);
+  const seeds: string[] = [];
+  for (const seed of options.seeds) {
+    const expanded = await expandDirectorySeed(context.client.root, seed, filesystem);
+    if (expanded === null) seeds.push(seed);
+    else seeds.push(...expanded.seeds);
+  }
+  const executed = await execute(
+    context,
+    bundleArgs(context.client.root, { ...options, seeds }),
+  );
   if (executed.empty) return emptyBundle(context.client.root, options, executed);
   const data = asBundleEnvelope(parseObject(executed.stdout, "bundle"));
   const formatted = formatBundle(data);
@@ -621,11 +653,19 @@ export async function deps(
   context: OperationContext,
   options: DepsArgs,
 ): Promise<OperationResult<DepsEnvelope>> {
-  const executed = await execute(context, depsArgs(context.client.root, options));
+  const expanded = await expandDepsSeed(
+    context.client.root,
+    options.seed,
+    seedFilesystem(context),
+  );
+  const executed = await execute(
+    context,
+    depsArgs(context.client.root, { ...options, seed: expanded.seed }),
+  );
   if (executed.empty) {
     const data: DepsEnvelope = {
       schema_version: SUPPORTED_SCHEMA_VERSION,
-      seed: options.seed,
+      seed: expanded.seed,
       granularity: options.unit === true ? "unit" : "file",
       deps: [],
       edges: [],
@@ -634,12 +674,33 @@ export async function deps(
     return buildResult(data, executed.hint ?? "no dependencies", executed);
   }
   const data = asDepsEnvelope(parseObject(executed.stdout, "deps"));
-  const text =
+  const prefix = expanded.note === null ? "" : `seed ${expanded.note}\n`;
+  const rows =
     data.deps.length === 0
       ? executed.hint ?? "no dependencies"
       : data.deps.map(depsRowText).join("\n");
-  const capped = capText(text);
-  return buildResult(data, capped.text, executed, capped.truncation);
+  const capped = capText(`${prefix}${rows}`);
+  // Both lines stay outside the cap: a cut row list must still say what the
+  // closure is and that it is incomplete (#68).
+  const summary: string[] = [];
+  const size = depsSizeLine(data);
+  if (size !== null) summary.push(size);
+  const closure = diagnosticsLine(diagnosticsSummary(data.diagnostics));
+  if (closure !== null) summary.push(closure);
+  const text = summary.length === 0 ? capped.text : `${capped.text}\n\n${summary.join("\n")}`;
+  return buildResult(data, text, executed, capped.truncation);
+}
+
+/**
+ * `12 units from 1 seed, depth 3`: the closure's size in one line. Bytes are
+ * not reported because `deps --json` carries no per-unit sizes; only the unit
+ * count and depth are facts the envelope already has.
+ */
+function depsSizeLine(data: DepsEnvelope): string | null {
+  if (data.deps.length === 0) return null;
+  const depth = data.deps.reduce((deepest, row) => Math.max(deepest, row.depth), 0);
+  const units = data.deps.length === 1 ? "unit" : "units";
+  return `${data.deps.length} ${units} from 1 seed, depth ${depth}`;
 }
 
 export async function callers(
