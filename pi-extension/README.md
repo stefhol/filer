@@ -41,7 +41,7 @@ pi -e ./pi-extension
 | `src/operations.ts` | typed operations: run, classify the exit status, guard the version, return `{ data, text, warnings }` |
 | `src/commands.ts` | `/filer` subcommands, `M new` diff, why-chain text, status line |
 | `src/session.ts` | `filer-overrides` session state: save, restore, last branch entry wins |
-| `src/guidance.ts` | steering: the `tool_guidance` prompt section and the numbered `read` nudge, both gated on the usability flag; memoizes the closure probe per path |
+| `src/guidance.ts` | steering: the `tool_guidance` prompt section, the numbered `read` nudge and the declaration-search (`bash`) nudge, all gated on the usability flag; memoizes the closure probe per path and the symbol probe per name |
 | `src/seeds.ts` | directory seeds: expand a crate directory to its source files, with the root/`$HOME`/40-file refusals |
 | `src/source.ts` | which extensions filer parses, shared by the steering and the seed expansion |
 | `src/schema.ts` | `schema_version` 1 guard and the shared mismatch message |
@@ -51,6 +51,10 @@ pi -e ./pi-extension
 
 ## Rules
 
+- **Tool exposure is part of the contract.** `filer_bundle`, `filer_search`, `filer_deps`,
+  `filer_callers` and `filer_refs` are `direct`; `filer_show`, `filer_why` and `filer_state`
+  are `deferred` (`tool_search` reaches them). Steering must never point at a `deferred`
+  tool, because the model would not find it in its loadout (#71).
 - **`@earendil-works/pi-coding-agent` stays type-only.** It is imported with `import type`
   everywhere, `index.ts` included. The two host modules the tools need at runtime —
   `typebox` (tool schemas) and `@earendil-works/pi-tui` (result renderers, imported in

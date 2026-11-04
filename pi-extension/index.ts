@@ -25,6 +25,7 @@ import { registerFilerTools } from "./src/tools";
 import {
   createAvailability,
   createClosureProbe,
+  createSymbolProbe,
   registerFilerGuidance,
 } from "./src/guidance";
 import { registerFilerCommands } from "./src/commands";
@@ -168,5 +169,7 @@ export default function filerExtension(
     // #68: the nudge reports the closure, through the same binary and root
     // resolution as the tools, memoized per path.
     probe: createClosureProbe(resolveContext),
+    // #71: the bash nudge reports the units a declaration grep missed.
+    symbolProbe: createSymbolProbe(resolveContext),
   });
 }

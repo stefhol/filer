@@ -1185,8 +1185,11 @@ release is a mismatch error, not half-parsed data.
 
 ### Tools and commands
 
-The extension registers the eight `filer_*` tools (`bundle`, `show`, `search`, `deps`,
-`callers`, `why`, `refs`, `state`) and one `/filer` command with subcommands:
+The extension registers the eight `filer_*` tools and one `/filer` command with
+subcommands. Five are `direct`, i.e. declared to the model: `bundle`, `search`, `deps`,
+`callers`, `refs`. `show`, `why` and `state` are `deferred` — bundle bookkeeping rather than
+exploration — so they cost no choice in the default loadout and `tool_search` activates them
+when a saved bundle actually needs explaining (#71):
 
 | Command | Behavior |
 | --- | --- |
@@ -1222,15 +1225,16 @@ nothing to either.
 
 ### Steering
 
-The tools only help when the model reaches for them, so the extension steers two cases. Both
-are silent until `--version` succeeded, and neither blocks a call:
+The tools only help when the model reaches for them, so the extension steers three cases.
+All are silent until `--version` succeeded, and none blocks a call:
 
 - Before every run it adds a `tool_guidance` section to the system prompt: load a source file
 you need to understand with `filer_bundle` — the file *and* its import/call closure — instead
 of `read`, seed a workspace crate by its directory or `src/lib.rs` rather than one file, and
 answer "what does this function or class do" with `filer_deps`/`filer_callers` on the unit
-instead of grepping call sites. The `filer_bundle`, `filer_deps`, `filer_callers` and
-`filer_refs` tools carry matching `promptGuidelines`.
+instead of grepping call sites. The `filer_bundle`, `filer_search`, `filer_deps`,
+`filer_callers` and `filer_refs` tools carry matching `promptGuidelines`, so the routing is
+visible where the tool is described, not only in the shared section.
 - A full `read` of a file whose extension `src/lang.rs` parses gets one appended paragraph
 pointing at `filer_bundle` for that path — with numbers, because the tradeoff is otherwise
 invisible: the read's own size (`725 lines / 24 KB`, free from the result it already holds)
@@ -1238,6 +1242,20 @@ and, from one memoized `filer deps --depth 2 --json` probe per path, the closure
 unresolved-import count. A probe that fails or takes longer than 2 s is dropped from the
 sentence rather than guessed. Ranged reads (`offset`/`limit`), images, failed reads and
 unsupported files are left untouched, so quick peeks and `/skill` file loads keep working.
+That case is rare on purpose: a ranged read is a deliberate peek, and in 161 measured
+sessions 981 of 1,134 reads were ranged.
+- A `bash` command that greps for a declaration (`rg -n "fn to_toml"`, `grep -nE
+'^interface Subscribable'`, `grep -rn "class Foo"`) gets one appended paragraph with the units
+`filer_search` resolves for that name — FQN, kind, line and token size, from one memoized
+`filer search` probe per project and name, dropped on failure or after 2 s. Only
+declaration-shaped patterns count (`fn`, `struct`, `enum`, `trait`, `impl`, `class`,
+`interface`, `def`, `func`, `fun`, `type`), and a search that finds nothing stays silent, so
+log, config and plain text greps are never annotated. This is the case that actually happens:
+the same 161 sessions held 432 declaration searches, and the `bash` event was where filer was
+never suggested.
+
+No nudge points at a `deferred` tool: the paragraphs name `filer_bundle`, `filer_search`,
+`filer_callers` and `filer_refs`, all of which are declared.
 
 Without a usable binary — missing, not `filer`, or timing out — the prompt and every tool
 result are exactly what they are without the extension.
