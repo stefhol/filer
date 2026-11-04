@@ -15,11 +15,13 @@ return {
       "FilerBundle",
       "FilerDepth",
       "FilerShow",
+      "FilerSession",
       "FilerReset",
       "FilerResetAll",
     },
     keys = {
       { "<leader>fc", function() require("filer").search() end, desc = "filer: bundle for chat" },
+      { "<leader>fs", "<cmd>FilerSession<cr>", desc = "filer: switch session" },
       { "<leader>fh", function() require("filer").here() end, desc = "filer: bundle current file" },
       { "<leader>fH", "<cmd>FilerHere!<cr>", desc = "filer: bundle current file (ask depth)" },
       { "<leader>fd", "<cmd>FilerDepth<cr>", desc = "filer: show import depth" },
@@ -51,7 +53,8 @@ return {
       -- the picker. Reset with :FilerReset. Branch changes reset it
       -- automatically.
       state = true,
-      -- State file path. nil = <root>/.filer/bundle.toml
+      -- State file path. nil = <root>/.filer/bundle.toml. Setting it opts out
+      -- of sessions.
       state_file = nil,
     },
   },

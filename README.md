@@ -206,10 +206,11 @@ cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
 {
   "stefhol/filer",
   name = "filer",
-  cmd = { "FilerSearch", "FilerHere", "FilerBundle", "FilerDepth" },
+  cmd = { "FilerSearch", "FilerHere", "FilerBundle", "FilerDepth", "FilerSession" },
   keys = {
     { "<leader>fd", "<cmd>FilerDepth<cr>", desc = "filer: show depth" },
     { "<leader>fc", function() require("filer").search() end, desc = "filer: bundle for chat" },
+    { "<leader>fs", "<cmd>FilerSession<cr>", desc = "filer: switch session" },
     { "<leader>fh", function() require("filer").here() end, desc = "filer: bundle current file" },
     { "<leader>fC", function() require("filer").bundle({ vim.api.nvim_buf_get_name(0) }, { depth = 0 }) end, desc = "filer: bundle current file only" },
   },
@@ -222,13 +223,14 @@ cp examples/lazyvim.lua ~/.config/nvim/lua/custom/plugins/filer.lua
     split = "vsplit",     -- or "split", "tabnew"
     copy = false,         -- true = also copy the bundle to the system clipboard
     state = true,         -- remember the bundle and mark it in the picker
-    state_file = nil,     -- nil = <root>/.filer/bundle.toml
+    state_file = nil,     -- nil = <root>/.filer/bundle.toml; opts out of sessions
   },
 }
 ```
 
 The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) for
-`:FilerSearch`. `:FilerHere` and `:FilerBundle` have no dependencies.
+`:FilerSearch` and for the full session browser (`:FilerSession` falls back to
+`vim.ui.select`). `:FilerHere` and `:FilerBundle` have no dependencies.
 
 ## Commands
 
@@ -238,9 +240,33 @@ The plugin needs [telescope.nvim](https://github.com/nvim-telescope/telescope.nv
 | `:FilerHere` | Bundles the current buffer with its closure. The declaration under the cursor is the seed — the enclosing method or class, or the whole file when nothing more specific applies. `:FilerHere!` asks for a depth first. |
 | `:FilerBundle {files}` | Bundles the given files (relative to root or absolute) or excerpts (`path::Symbol`). `:FilerBundle! …` asks for a depth first. |
 | `:FilerDepth [n]` | With no argument, shows the current depth; with `n`, uses it for every following bundle; `:FilerDepth reset` restores the `setup` value. |
+| `:FilerSession [name]` | Picks a session to bundle into — the default per-branch state or one of `.filer/sessions/<name>.toml` — and re-renders its saved bundle. `<C-n>` creates a session, `<C-d>` deletes one. With `name`, switches directly; `:FilerSession default` goes back to the shared state. See [Sessions in the editor](#sessions-in-the-editor). |
 | `:FilerShow [branch]` | Re-renders the saved bundle (current file contents) without re-resolving. |
 | `:FilerReset` | Forgets this branch's bundle; the next bundle starts empty. |
 | `:FilerResetAll` | Forgets every branch's bundle. |
+
+### Sessions in the editor
+
+By default the bundle lives in `<root>/.filer/bundle.toml`, shared by every agent, chat and
+editor window on that checkout. [Sessions](#sessions-one-state-file-per-agent) give each of
+them its own state file, and the plugin can switch between them:
+
+- `:FilerSession` lists the default state and every session of the project, with entry count,
+branch and state file; `*` marks the one in use. `<CR>` switches and re-renders that session's
+saved bundle, `<C-n>` creates a session, `<C-d>` deletes one (through
+`filer context clear`).
+- `:FilerSession <name>` switches directly, `:FilerSession default` returns to the shared
+per-branch state, and Tab completes both.
+- A session is named by its id — letters, digits, `.`, `-`, `_` — and lives in
+`.filer/sessions/<name>.toml`, so the editor and `filer --session <name>` share one bundle.
+- The choice is remembered per project in `.filer/session` (gitignored with the rest of
+`.filer`), so the next Neovim starts on the same session. Switching to a session that has
+nothing bundled yet says so in the bundle buffer instead of leaving the previous bundle up.
+- `:FilerShow`, `:FilerReset` and `:FilerResetAll` follow the active session, and
+`:FilerSearch` / `:FilerHere` write into it.
+
+Without telescope.nvim, `:FilerSession` falls back to `vim.ui.select`: switching and creating
+work, deleting does not. Setting `opts.state_file` opts out of sessions entirely.
 
 ### Depth
 
@@ -635,6 +661,8 @@ FILER_SESSION=s1 filer --root ~/code/demo bundle --depth 2 app/Service.java   # 
 - Branches still work inside a session: the file holds one bundle per git branch, like the
   default state. `--from-state` refreshes a session's seeds the same way.
 - `filer state` keeps working unchanged for the default file — sessions are additive.
+- In Neovim, `:FilerSession` lists, switches, creates and deletes them — see
+  [Sessions in the editor](#sessions-in-the-editor).
 
 ### `context list` / `context clear`
 

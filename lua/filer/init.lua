@@ -1,6 +1,13 @@
 --- filer.nvim — bundle sources (plus their imports) for a chat.
 local M = {}
 
+-- Neovim 0.9 exposes these as `vim.loop`.
+local uv = vim.uv or vim.loop
+
+--- Active session per project root; read from `.filer/session` on first use.
+M._sessions = {}
+M._sessions_loaded = {}
+
 M.config = {
   -- Path to the `filer` binary. nil = $PATH, then a local checkout's target/.
   bin = nil,
@@ -33,6 +40,14 @@ local bin_cache = nil
 local function notify(message, level)
   local text = vim.trim(message or ""):gsub("^filer:%s*", "")
   vim.notify("filer: " .. (text ~= "" and text or "failed"), level or vim.log.levels.INFO)
+end
+
+--- Runs the binary and returns (stdout, stderr, code).
+local function run(args, root)
+  local command = { M.bin() }
+  vim.list_extend(command, args)
+  local result = vim.system(command, { text = true, cwd = root }):wait()
+  return result.stdout or "", result.stderr or "", result.code
 end
 
 local function config_root()
@@ -76,12 +91,384 @@ function M.root()
   return vim.fs.root(0, markers) or M._last_root or vim.fn.getcwd()
 end
 
---- Where the bundle state lives for `root`.
+--- Where the bundle state lives for `root`: the active session when one is
+--- chosen, otherwise the per-branch `.filer/bundle.toml`.
 function M.state_path(root)
   if M.config.state_file then
     return (M.config.state_file:gsub("^~", vim.env.HOME or "~"))
   end
-  return (root or M.root()) .. "/.filer/bundle.toml"
+  root = root or M.root()
+  local id = M.session(root)
+  if id then
+    return M.session_state_path(root, id)
+  end
+  return root .. "/.filer/bundle.toml"
+end
+
+-- Sessions -------------------------------------------------------------------
+-- The binary keeps one bundle per session in `.filer/sessions/<id>.toml`
+-- (`--session <id>`, or `$FILER_SESSION`); the plugin remembers which one this
+-- project bundles into in `.filer/session`. The id is the name: letters, digits,
+-- `.`, `-` and `_`.
+
+--- `<root>/.filer/sessions`: one TOML file per session.
+function M.sessions_dir(root)
+  return (root or M.root()) .. "/.filer/sessions"
+end
+
+--- The state file `--session <id>` reads and writes.
+function M.session_state_path(root, id)
+  return M.sessions_dir(root) .. "/" .. id .. ".toml"
+end
+
+--- Where this project's active session id is remembered.
+function M.session_file(root)
+  return (root or M.root()) .. "/.filer/session"
+end
+
+--- Session ids become file names, so they follow the binary's rule: letters,
+--- digits, `.`, `-`, `_` only, at most 128 characters, never `.` or `..`.
+function M.valid_session(id)
+  return type(id) == "string"
+    and #id > 0
+    and #id <= 128
+    and id ~= "."
+    and id ~= ".."
+    and id:match("^[%w._-]+$") ~= nil
+end
+
+--- Session ids saved for `root`, sorted. Read from disk, so it also finds the
+--- ones another editor, an agent or a `filer` run created.
+function M.session_ids(root)
+  local ids = {}
+  local handle = uv.fs_scandir(M.sessions_dir(root))
+  while handle do
+    local name = uv.fs_scandir_next(handle)
+    if not name then
+      break
+    end
+    local id = name:match("^(.+)%.toml$")
+    if id and M.valid_session(id) then
+      table.insert(ids, id)
+    end
+  end
+  table.sort(ids)
+  return ids
+end
+
+--- The session `root` bundles into; nil means the default per-branch state.
+function M.session(root)
+  root = root or M.root()
+  if not M._sessions_loaded[root] then
+    M._sessions_loaded[root] = true
+    local ok, lines = pcall(vim.fn.readfile, M.session_file(root))
+    if ok and type(lines) == "table" and type(lines[1]) == "string" then
+      local id = vim.trim(lines[1])
+      if id ~= "" and id ~= "default" and M.valid_session(id) then
+        M._sessions[root] = id
+      end
+    end
+  end
+  return M._sessions[root]
+end
+
+--- Remembers `id` (nil = default state) in `.filer/session`. The `*` ignore
+--- file is the same trick the binary uses to keep `.filer` out of `git status`.
+local function remember_session(root, id)
+  local path = M.session_file(root)
+  if id == nil then
+    pcall(vim.fn.delete, path)
+    return
+  end
+  local ok, err = pcall(function()
+    local dir = vim.fn.fnamemodify(path, ":h")
+    vim.fn.mkdir(dir, "p")
+    local ignore = dir .. "/.gitignore"
+    if uv.fs_stat(ignore) == nil then
+      vim.fn.writefile({ "*" }, ignore)
+    end
+    vim.fn.writefile({ id }, path)
+  end)
+  if not ok then
+    notify(("could not remember the session in %s: %s"):format(path, err), vim.log.levels.WARN)
+  end
+end
+
+--- Switches `root` to session `id` (`nil` or `"default"` = the per-branch
+--- state), remembers it for the next Neovim and re-renders its saved bundle
+--- (`opts.show = false` skips the re-render). Returns the session in effect, or
+--- nil when the name was rejected or sessions do not apply to this setup.
+function M.set_session(id, opts)
+  opts = opts or {}
+  local root = opts.root or M.root()
+  if id == "" or id == "default" then
+    id = nil
+  end
+  if id ~= nil and not M.valid_session(id) then
+    notify(
+      ("invalid session name %q: letters, digits, '.', '-' and '_' only"):format(tostring(id)),
+      vim.log.levels.ERROR
+    )
+    return nil
+  end
+  if M.config.state_file then
+    notify("opts.state_file is set, so sessions are not used", vim.log.levels.WARN)
+    return nil
+  end
+  if not M.config.state then
+    notify("sessions need opts.state = true", vim.log.levels.WARN)
+    return nil
+  end
+  M._sessions[root] = id
+  M._sessions_loaded[root] = true
+  remember_session(root, id)
+  notify(id and ("session: " .. id) or "session: default (per branch)")
+  if opts.show ~= false then
+    M.show({ root = root, quiet_empty = true })
+  end
+  return id
+end
+
+--- Asks for a session name (the id *is* the name) and switches to it.
+function M.session_create(opts)
+  opts = opts or {}
+  local root = opts.root or M.root()
+  vim.ui.input({ prompt = "filer: new session name: " }, function(input)
+    if input == nil then
+      return
+    end
+    input = vim.trim(input)
+    if input == "" then
+      return
+    end
+    if not M.valid_session(input) then
+      notify(
+        ("invalid session name %q: letters, digits, '.', '-' and '_' only"):format(input),
+        vim.log.levels.ERROR
+      )
+      return
+    end
+    if uv.fs_stat(M.session_state_path(root, input)) ~= nil then
+      notify(("session %q already exists — switching to it"):format(input))
+    end
+    M.set_session(input, { root = root })
+  end)
+end
+
+--- Deletes one session through `filer context clear` and leaves the default
+--- state alone. Falls back to the default session when the deleted one was
+--- active. Returns true when something was removed.
+function M.session_delete(id, opts)
+  opts = opts or {}
+  local root = opts.root or M.root()
+  if id == nil or id == "default" then
+    notify("the default state is not a session — :FilerReset clears it", vim.log.levels.WARN)
+    return false
+  end
+  if not M.valid_session(id) then
+    notify(("invalid session name %q"):format(tostring(id)), vim.log.levels.ERROR)
+    return false
+  end
+  if not opts.force then
+    local answer = vim.fn.confirm(("filer: delete session %q?"):format(id), "&Yes\n&No", 2)
+    if answer ~= 1 then
+      return false
+    end
+  end
+  local stdout, stderr, code = run({ "context", "clear", id, "--root", root }, root)
+  if code ~= 0 then
+    notify(stderr ~= "" and stderr or "delete failed", vim.log.levels.ERROR)
+    return false
+  end
+  if M.session(root) == id then
+    M.set_session(nil, { root = root, show = false })
+  end
+  notify(stdout ~= "" and stdout or ("session %q deleted"):format(id))
+  return true
+end
+
+--- One row per session for the browser: the default state, every saved session,
+--- the active one when it has no state file yet (a fresh session), then the
+--- "new" row. Counts come from `filer context list --json`, so they match the
+--- binary.
+function M.sessions(root)
+  root = root or M.root()
+  local rows = {}
+  local listed = {}
+  local active = M.session(root)
+  -- `run` raises when the binary is missing or unusable, so a failed listing
+  -- degrades to the session files on disk instead of an error.
+  local ok, stdout, _, code = pcall(run, { "context", "list", "--root", root, "--json" }, root)
+  local data
+  if ok and code == 0 and stdout ~= "" then
+    local decoded_ok, decoded = pcall(vim.json.decode, stdout)
+    if decoded_ok and type(decoded) == "table" then
+      data = decoded
+    end
+  end
+  local branch = data and type(data.label) == "string" and data.label or ""
+
+  local function add(id, value)
+    if listed[id] then
+      return
+    end
+    listed[id] = true
+    local entries = value and tonumber(value.entries) or 0
+    local modified = value and tonumber(value.modified) or 0
+    local path = value and type(value.path) == "string" and value.path or nil
+    local parts = { ("%d entries"):format(entries) }
+    if branch ~= "" then
+      table.insert(parts, branch)
+    end
+    table.insert(parts, path or "(not saved yet)")
+    if modified > 0 then
+      table.insert(parts, os.date("%Y-%m-%d %H:%M", modified))
+    end
+    local current = (active or "default") == id
+    table.insert(rows, {
+      id = id,
+      entries = entries,
+      path = path,
+      current = current,
+      ordinal = (current and "current " or "") .. id .. " " .. table.concat(parts, " "),
+      display = ("%s %-18s %s"):format(current and "*" or " ", id, table.concat(parts, " · ")),
+    })
+  end
+
+  add("default", data and data.default)
+  local saved = data and type(data.sessions) == "table" and data.sessions or nil
+  if saved then
+    for _, value in ipairs(saved) do
+      if type(value) == "table" and type(value.id) == "string" then
+        add(value.id, value)
+      end
+    end
+  else
+    for _, id in ipairs(M.session_ids(root)) do
+      add(id, nil)
+    end
+  end
+  -- A freshly created session has no state file yet: keep it visible instead of
+  -- looking like the switch did nothing.
+  if active then
+    add(active, nil)
+  end
+  table.insert(rows, {
+    id = nil,
+    create = true,
+    ordinal = "new session",
+    display = "  + new session…",
+  })
+  return rows
+end
+
+--- Session browser without Telescope: switching and creating work, deleting
+--- does not (`<C-d>` needs the Telescope picker).
+function M.session_select(opts)
+  opts = opts or {}
+  local root = opts.root or M.root()
+  vim.ui.select(M.sessions(root), {
+    prompt = "filer: session",
+    format_item = function(row)
+      return row.display
+    end,
+  }, function(row)
+    if row == nil then
+      return
+    end
+    if row.create then
+      M.session_create({ root = root })
+      return
+    end
+    M.set_session(row.id, { root = root })
+  end)
+end
+
+--- Session browser: Telescope when it is installed, `vim.ui.select` otherwise.
+--- `<CR>` switches, `<C-n>` creates, `<C-d>` deletes.
+function M.session_picker(opts)
+  opts = opts or {}
+  local root = opts.root or M.root()
+  local has_telescope = pcall(require, "telescope.pickers")
+  if not has_telescope then
+    return M.session_select({ root = root })
+  end
+  local pickers = require("telescope.pickers")
+  local finders = require("telescope.finders")
+  local conf = require("telescope.config").values
+  local actions = require("telescope.actions")
+  local action_state = require("telescope.actions.state")
+
+  local rows = M.sessions(root)
+  local previewable = false
+  for _, row in ipairs(rows) do
+    if row.path and uv.fs_stat(root .. "/" .. row.path) ~= nil then
+      previewable = true
+      break
+    end
+  end
+
+  local function entry_maker(row)
+    local file = row.path and (root .. "/" .. row.path) or nil
+    if file and uv.fs_stat(file) == nil then
+      file = nil
+    end
+    return {
+      value = row,
+      display = row.display,
+      ordinal = row.ordinal or row.display,
+      filename = file,
+    }
+  end
+
+  local picker = pickers.new({}, {
+    prompt_title = "filer: sessions (" .. vim.fn.fnamemodify(root, ":t") .. ")",
+    results_title = "<CR> switch · <C-n> new · <C-d> delete",
+    finder = finders.new_table({ results = rows, entry_maker = entry_maker }),
+    previewer = previewable and conf.file_previewer({}) or conf.noop_previewer,
+    sorter = conf.generic_sorter({}),
+    attach_mappings = function(prompt_bufnr, map)
+      actions.select_default:replace(function()
+        local entry = action_state.get_selected_entry()
+        actions.close(prompt_bufnr)
+        if not entry then
+          return
+        end
+        local row = entry.value
+        if row.create then
+          M.session_create({ root = root })
+          return
+        end
+        M.set_session(row.id, { root = root })
+      end)
+      local function create()
+        actions.close(prompt_bufnr)
+        M.session_create({ root = root })
+      end
+      local function delete()
+        local entry = action_state.get_selected_entry()
+        if not entry then
+          return
+        end
+        local row = entry.value
+        actions.close(prompt_bufnr)
+        if row.create then
+          notify("the + row is not a session", vim.log.levels.WARN)
+          return
+        end
+        -- Reopen either way: the browser stays open for another pick, and the
+        -- confirmation is answered outside the (already closed) picker.
+        M.session_delete(row.id, { root = root })
+        M.session_picker({ root = root })
+      end
+      for _, mode in ipairs({ "i", "n" }) do
+        map(mode, "<C-n>", create)
+        map(mode, "<C-d>", delete)
+      end
+      return true
+    end,
+  })
+  picker:find()
 end
 
 --- Absolute path (or bare command) of the filer binary.
@@ -145,14 +532,6 @@ function M.set_depth(depth)
   M.config.depth = math.floor(number)
   notify(("depth set to %d"):format(M.config.depth))
   return M.config.depth
-end
-
---- Runs the binary and returns (stdout, stderr, code).
-local function run(args, root)
-  local command = { M.bin() }
-  vim.list_extend(command, args)
-  local result = vim.system(command, { text = true, cwd = root }):wait()
-  return result.stdout or "", result.stderr or "", result.code
 end
 
 --- Fuzzy-pick types and bundle them (plus imports) into a split.
@@ -398,6 +777,21 @@ function M.show(opts)
 
   local stdout, stderr, code = run(args, root)
   if code ~= 0 then
+    if opts.quiet_empty then
+      -- Switching to a session that has nothing bundled yet: say so in the
+      -- bundle buffer itself, and only when one is already open.
+      if M.find_bundle_buffer() then
+        local id = M.session(root)
+        M.open(
+          ("# filer: %s\n\nNothing bundled yet on this branch. "
+            .. "`:FilerHere` or `:FilerSearch` starts the bundle.\n"):format(
+            id and ("session %q"):format(id) or "the default state"
+          ),
+          { root = root }
+        )
+      end
+      return
+    end
     notify(stderr ~= "" and stderr or "nothing bundled yet", vim.log.levels.WARN)
     return
   end
