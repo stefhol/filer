@@ -57,6 +57,8 @@ PR requirements:
 - Body links the issue (`Closes #<N>` when the PR completes it).
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   `cargo test --all-targets` pass locally before pushing — CI runs exactly these.
+- Lua changes also run `nvim --headless -l tests/nvim/session.lua` (Neovim 0.9+).
+  That check is not wired into CI yet.
 - Behavior changes update `README.md` (commands table, flags, JSON surface).
 - New user-visible output or JSON fields respect `schema_version` in
   `src/schema.rs`; bump it for breaking shape changes.
@@ -71,6 +73,7 @@ cargo build --release          # binary at target/release/filer
 cargo test --all-targets       # unit + integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+nvim --headless -l tests/nvim/session.lua   # plugin session state; no binary needed
 cd pi-extension && bun install # once; the tools import typebox and pi-tui
 cd pi-extension && bun test    # extension tests; spawns target/release/filer
 ```

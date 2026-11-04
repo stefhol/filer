@@ -56,6 +56,25 @@ vim.api.nvim_create_user_command("FilerShow", function(args)
   filer().show({ branch = branch })
 end, { nargs = "?", desc = "filer: reopen the saved bundle (optionally for another branch)" })
 
+vim.api.nvim_create_user_command("FilerSession", function(args)
+  local name = vim.trim(args.args)
+  if name == "" then
+    filer().session_picker()
+    return
+  end
+  filer().set_session(name)
+end, {
+  nargs = "?",
+  desc = "filer: browse, switch, create or delete bundle sessions (default = the per-branch state)",
+  complete = function(arg_lead)
+    local names = { "default" }
+    vim.list_extend(names, filer().session_ids())
+    return vim.tbl_filter(function(name)
+      return vim.startswith(name, arg_lead)
+    end, names)
+  end,
+})
+
 vim.api.nvim_create_user_command("FilerReset", function()
   filer().reset()
 end, { desc = "filer: forget this branch's bundle" })
