@@ -311,6 +311,7 @@ mod tests {
             uses: Vec::new(),
             symbols: Vec::new(),
             preamble_end: 0,
+            step_defs: Vec::new(),
             size: 0,
             end_line: 0,
         }

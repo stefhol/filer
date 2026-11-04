@@ -532,8 +532,12 @@ pub fn scope_rank(scope: Selection) -> u8 {
 pub fn reason_rank(reason: Reason) -> u8 {
     match reason {
         Reason::Seed => 0,
-        Reason::Call => 1,
-        Reason::Import | Reason::StaticImport | Reason::WildcardImport | Reason::ModuleImport => 2,
+        Reason::Call | Reason::StepDefinition => 1,
+        Reason::Import
+        | Reason::StaticImport
+        | Reason::WildcardImport
+        | Reason::ModuleImport
+        | Reason::PathImport => 2,
         Reason::SamePackage | Reason::Usage => 3,
         Reason::Package => 4,
         Reason::Config => 5,

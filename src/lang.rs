@@ -34,12 +34,17 @@ pub enum Language {
     Rust,
     /// Python (`.py`, `.pyi`).
     Python,
+    /// Cucumber scenarios (`.feature`).
+    Gherkin,
+    /// Robot Framework suites and resource files (`.robot`, `.resource`).
+    Robot,
 }
 
 /// How finely a language can be bundled and picked.
 ///
-/// Every language has whole files (except Formula Engine, where one file can
-/// hold thousands of functions). Only languages with a call graph expose
+/// Every language has whole files (except the declaration-only formats: one
+/// Formula Engine module, one feature file or one Robot suite can hold
+/// thousands of declarations). Only languages with a call graph expose
 /// methods, and only Java does in this cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Granularity {
@@ -85,11 +90,17 @@ pub enum Family {
     /// Dotted module paths resolved against the package directory
     /// (`import a.b`, `from . import x`).
     Python,
+    /// No imports at all: steps resolve to step definitions through the
+    /// repository-wide step registry, not through a name lookup.
+    Gherkin,
+    /// Resource files imported by relative path; keywords resolve within the
+    /// suite and the resources it reaches.
+    Robot,
 }
 
 impl Language {
     /// Every language the index understands, for stats and docs.
-    pub const ALL: [Language; 11] = [
+    pub const ALL: [Language; 13] = [
         Language::Java,
         Language::Scala,
         Language::Kotlin,
@@ -101,6 +112,8 @@ impl Language {
         Language::Fe,
         Language::Rust,
         Language::Python,
+        Language::Gherkin,
+        Language::Robot,
     ];
 
     /// Language for a source file, or `None` when the extension is not indexed.
@@ -120,6 +133,8 @@ impl Language {
             "fe" => Some(Language::Fe),
             "rs" => Some(Language::Rust),
             "py" | "pyi" => Some(Language::Python),
+            "feature" => Some(Language::Gherkin),
+            "robot" | "resource" => Some(Language::Robot),
             _ => None,
         }
     }
@@ -136,6 +151,7 @@ impl Language {
             Language::TypeScript | Language::JavaScript | Language::Rust | Language::Python => {
                 Granularity::Member
             }
+            Language::Gherkin | Language::Robot => Granularity::Function,
             Language::Vue => Granularity::File,
         }
     }
@@ -147,6 +163,8 @@ impl Language {
             Language::Fe => Family::Fe,
             Language::Rust => Family::Rust,
             Language::Python => Family::Python,
+            Language::Gherkin => Family::Gherkin,
+            Language::Robot => Family::Robot,
             _ => Family::Jvm,
         }
     }
@@ -165,6 +183,8 @@ impl Language {
             Language::Fe => "fe",
             Language::Rust => "rust",
             Language::Python => "python",
+            Language::Gherkin => "gherkin",
+            Language::Robot => "robotframework",
         }
     }
 
@@ -191,6 +211,8 @@ impl Language {
             Language::Fe => "fe",
             Language::Rust => "rust",
             Language::Python => "python",
+            Language::Gherkin => "gherkin",
+            Language::Robot => "robotframework",
         }
     }
 }
@@ -207,6 +229,11 @@ pub enum ImportKind {
     Wildcard,
     /// A TypeScript/JavaScript module specifier (`./x`, `../y.js`, `react`).
     Module,
+    /// A filesystem path relative to the importing file (Robot's `Variables`
+    /// and `Library` settings).
+    Path,
+    /// A Robot `Resource` setting: a relative path whose keywords enter scope.
+    Resource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +298,31 @@ pub struct Call {
     /// it), cached so reverse edges and `why` chains need no file reads.
     #[serde(default)]
     pub line: usize,
+}
+
+/// One Cucumber step definition found in a source file.
+///
+/// Gherkin has no imports: a `.feature` step names a pattern declared by an
+/// annotation/decorator in some other language. The index collects these from
+/// every file and matches step text against them, so a scenario pulls in the
+/// code that implements it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepDefinition {
+    /// The pattern as written, with the string delimiters and escapes removed.
+    pub pattern: String,
+    /// Whether `pattern` is a regular expression (an anchored pattern or a
+    /// `/.../` literal) rather than a cucumber expression or plain literal.
+    #[serde(default)]
+    pub regex: bool,
+    /// 1-based line the annotation/decorator sits on.
+    #[serde(default)]
+    pub line: usize,
+    /// Enclosing top-level symbol, when the definition sits inside one.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    /// Enclosing method, for languages whose step definitions are methods.
+    #[serde(default)]
+    pub member: Option<String>,
 }
 
 /// A prunable member of a top-level type (currently Java methods/constructors).
@@ -371,6 +423,10 @@ pub struct Source {
     /// start. Repeated in front of each symbol excerpt so it stands alone.
     #[serde(default)]
     pub preamble_end: usize,
+    /// Cucumber step definitions declared by this file, with their enclosing
+    /// symbol/member attributed. Empty for languages without Cucumber glue.
+    #[serde(default)]
+    pub step_defs: Vec<StepDefinition>,
 }
 
 /// Assigns each `(name, byte offset)` use to the symbol that contains it.
@@ -508,6 +564,11 @@ impl SourceParser {
     /// relative to the project root: Python derives its module name from it.
     pub fn parse(&mut self, language: Language, src: &str, rel: &str) -> Option<Source> {
         match language {
+            // Neither format needs a tree-sitter grammar: they are line
+            // oriented, and the robot scanner needs the relative path for its
+            // `Resource` settings.
+            Language::Gherkin => crate::gherkin::parse(src),
+            Language::Robot => crate::robot::parse(rel, src),
             Language::Java => self.java.parse(src),
             Language::Scala => self.scala.parse(src),
             Language::Kotlin => self.kotlin.parse(src),

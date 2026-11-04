@@ -28,14 +28,15 @@ being pasted to.
 ## What it does
 
 Supported languages: Python, Java, Scala, Kotlin, Groovy, C#, Rust, TypeScript, JavaScript,
-Vue and `.fe`. Parsing is tree-sitter based (no LSP, no classpath, no compiler). Three tiers
-of support:
+Vue, `.fe`, Cucumber `.feature` and Robot Framework `.robot`/`.resource`. Parsing is
+tree-sitter based (no LSP, no classpath, no compiler) except for the two line-oriented test
+formats, which are scanned directly. Three tiers of support:
 
 | Tier | Languages | What you get |
 | --- | --- | --- |
 | Full | Python, Java, Scala, Kotlin, Groovy, C#, Rust, TS/JS | import/`use`/module resolution, type-usage edges, call graph, `[file]`/`[class]`/`[method]` scopes |
 | Whole-file | Vue | `<script>` blocks parsed as TS/JS; never sliced |
-| Function-level | `.fe` | one project-wide namespace; calls resolved by name; function seeds |
+| Function-level | `.fe`, Gherkin, Robot Framework | one row per declaration; calls resolved by their own scoping rules; function seeds |
 
 - Resolves package-style imports against the files that actually exist in your repo:
   Java `import a.b.C;` / `import static ...` / `import a.b.*;`, Scala 2 and 3 (selector
@@ -317,10 +318,11 @@ filer --root ~/code/demo bundle --at-line 120 app/Service.java         # scope o
 `--at-line` picks the scope of the line: a method inside a method, the class on a field,
 constructor or header, and the whole file on a package/import/blank line before the class.
 
-Function-level languages deliberately have **no `[file]` row**: one file can hold thousands
-of functions, so a whole-file row would drown the picker (the CLI still accepts a file path).
-Vue files and files without parsed symbols are whole-file. Everything else gains a `[file]`
-row, so the whole file is always selectable explicitly.
+Function-level languages (`.fe`, `.feature`, `.robot`/`.resource`) deliberately have **no
+`[file]` row**: one file can hold thousands of functions, scenarios or test cases, so a
+whole-file row would drown the picker (the CLI still accepts a file path). Vue files and files
+without parsed symbols are whole-file. Everything else gains a `[file]` row, so the whole
+file is always selectable explicitly.
 
 ### Member scopes: class shell + call path
 
@@ -406,6 +408,47 @@ symbols (and every other language) keeps the import/type closure.
   in the bundle through the import, and the call edge is reported as an unknown receiver.
 - Vue is never sliced: its script offsets are relative to the extracted `<script>` block, so
   it is always bundled whole.
+
+### Cucumber and Robot Framework
+
+Both formats are declaration-only: filer indexes them, gives every declaration its own
+picker row, and follows the references their formats actually have.
+
+`*.feature` (Gherkin, line scanner; English keywords plus the `*` step marker):
+
+- One `[function]` row per `Scenario:` / `Scenario Outline:` (inside a `Rule` too). The
+  `Feature:` header is repeated as the preamble, and a `Background` is attributed to every
+  scenario in its scope, because that is how it runs.
+- Steps are matched against the step definitions indexed from the rest of the repository:
+  Cucumber-JVM annotations (`@Given("^…$")`, Kotlin/Scala/Groovy included, plus the Java 8
+  lambda DSL), C# attributes (`[Given(@"…")]`), cucumber-js (`Given(/…/, …)`,
+  `defineStep`, `Step`), pytest-bdd decorators (`@given`, `@when`, `@then`, `@step`) and
+  cucumber-rs attributes (`#[given(...)]`). Patterns are matched as regular expressions,
+  as cucumber expressions (`{int}`, `{float}`, `{word}`, `{string}`, `{any}`) or as plain
+  literals, in that order. `Scenario Outline` placeholders are expanded per example row
+  before matching.
+- A matching definition is a `step-definition` edge, so `bundle features/login.feature`
+  pulls in the class and methods (or the file, for a free function) that implement the
+  steps, and `callers` on a step definition points back at the scenario that exercises it.
+
+`*.robot` and `*.resource` (Robot Framework, line scanner):
+
+- One `[function]` row per test case/task and per user keyword; the `*** Settings ***`
+  section is the preamble.
+- `Resource`, `Variables` and `Library` settings are imports, resolved relative to the suite
+  with `.resource`/`.robot`/`.py`/`.yaml`/`.yml`/`.json` probed when the extension is
+  omitted. They are reported as `path-import`. A `Library` name that no file provides stays
+  unresolved — third-party, like a Maven artifact — and is listed with the other unresolved
+  imports.
+- Keyword calls in test and keyword bodies (and `[Setup]`, `[Teardown]`, `[Template]`)
+  resolve Robot-style: the suite first, then the suites reachable through its `Resource`
+  imports, transitively, case-, space- and underscore-insensitively, so
+  `type_credentials` calls `Type Credentials`.
+- Not modelled: suite/test-level `Suite Setup`/`Suite Teardown`/`Test Setup` settings are not
+  attributed to a test, settings that embed variables (`${CURDIR}/x.resource`) are left
+  unresolved, and keywords provided by imported libraries do not exist in the index.
+  `Run Keyword If`-style indirection is a call to `Run Keyword If`, not to the keyword it
+  names.
 
 ### TypeScript config aliases
 
@@ -535,9 +578,11 @@ What that buys you:
   (The `.filer/bundle.toml` sidecar keeps its one-line comment; that file never goes to
   the chat.)
 - `reason` is one of `seed`, `import`, `static-import`, `wildcard-import`, `module-import`,
-  `same-package`, `usage`, `package`, `config`, `external`. `same-package` is JVM
-  vocabulary (a sibling in the same Java/Scala/Kotlin package needs no import); Rust has no
-  packages, so a Rust name-driven hit is always `usage`.
+  `path-import`, `step-definition`, `same-package`, `usage`, `package`, `config`, `external`.
+  `path-import` is a Robot `Resource`/`Variables`/`Library` setting, `step-definition` is a
+  `.feature` step matching a step definition. `same-package` is JVM vocabulary (a sibling
+  in the same Java/Scala/Kotlin package needs no import); Rust has no packages, so a Rust
+  name-driven hit is always `usage`.
 
 Cleaning up:
 
@@ -603,9 +648,9 @@ The bundle has one documented order, and it is the same order the budget truncat
    method scopes (`methods`). Complete files are the most useful thing in a slice, so they
    survive a tight budget longest.
 3. **Ascending depth** within a scope, so a shallower dependency beats a deeper one.
-4. **Reason**: `seed` before `call` before the import reasons (`import`, `static-import`,
-   `wildcard-import`, `module-import`), then `same-package`/`usage`, then `package`,
-   `config`, `external`.
+4. **Reason**: `seed` before `call`/`step-definition` before the import reasons (`import`,
+   `static-import`, `wildcard-import`, `module-import`, `path-import`), then
+   `same-package`/`usage`, then `package`, `config`, `external`.
 5. **Path**, then **span** start, as the final tie-breakers.
 
 Nothing depends on discovery order, so reordering imports in a seed file cannot reorder the
@@ -1327,7 +1372,7 @@ result are exactly what they are without the extension.
 an `ImportKind`, `uses`, `symbols` with byte spans, `preamble_end`), the `Language` →
 extension map, and the `Language::family` grouping that keeps resolution between compatible
 languages only. Each per-language module (`java`, `scala`, `kotlin`, `groovy`, `csharp`,
-`rust`, `python`, `web`) only translates its grammar into that struct.
+`rust`, `python`, `web`, `gherkin`, `robot`) only translates its grammar into that struct.
 
 To add another package+import language:
 
@@ -1337,8 +1382,10 @@ To add another package+import language:
 
 Indexing, closure, state and rendering need no changes. A language with a different import
 model (TS/JS module paths, Rust's `crate`/`self`/`super` paths, Python's dotted modules and
-relative dots) needs its own resolver branch in `src/resolve.rs` — that is where
-`ImportKind::Module`, `Family::Rust` and `Family::Python` are handled. A parser that derives
+relative dots, Robot's relative file paths) needs its own resolver branch in
+`src/resolve.rs` — that is where `ImportKind::Module`, `ImportKind::Path`,
+`Family::Rust`, `Family::Python` and the `Family::Gherkin`/`Family::Robot` neighbours are
+handled. A parser that derives
 something from the file itself (Python's package is its directory) gets the file's relative
 path as `SourceParser::parse`'s last argument.
 
