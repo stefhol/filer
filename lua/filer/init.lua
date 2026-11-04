@@ -384,6 +384,53 @@ function M.session_select(opts)
   end)
 end
 
+--- Telescope entry for one browser row. `filename` is the row's state file
+--- when it exists; rows without one (a fresh active session, the "+ new
+--- session…" row) keep it nil. Telescope's previewer falls back from a nil
+--- `filename` to `entry.value` and would call `path_expand` on the row table,
+--- which is what the session browser's own previewer avoids.
+function M.session_entry(row, root)
+  local file = row.path and (root .. "/" .. row.path) or nil
+  if file and uv.fs_stat(file) == nil then
+    file = nil
+  end
+  return {
+    value = row,
+    display = row.display,
+    ordinal = row.ordinal or row.display,
+    filename = file,
+  }
+end
+
+--- File the session previewer shows for `entry`: the state file when it exists,
+--- nil when there is nothing to preview. It never returns `entry.value`, the row
+--- table Telescope would otherwise try to expand as a path.
+function M.session_preview_target(entry)
+  local file = entry.filename
+  if file and uv.fs_stat(file) ~= nil then
+    return file
+  end
+  return nil
+end
+
+--- Preview text for rows that have no state file to show yet.
+local function session_preview(row)
+  if row.create then
+    return {
+      "New session",
+      "",
+      "<CR> or <C-n> asks for a name and switches to it.",
+      "Letters, digits, '.', '-' and '_' are allowed.",
+      "The state lives in .filer/sessions/<name>.toml.",
+    }
+  end
+  return {
+    "Session: " .. tostring(row.id),
+    "",
+    "No state file yet: the first bundle in this session writes one.",
+  }
+end
+
 --- Session browser: Telescope when it is installed, `vim.ui.select` otherwise.
 --- `<CR>` switches, `<C-n>` creates, `<C-d>` deletes.
 function M.session_picker(opts)
@@ -395,37 +442,44 @@ function M.session_picker(opts)
   end
   local pickers = require("telescope.pickers")
   local finders = require("telescope.finders")
+  local previewers = require("telescope.previewers")
   local conf = require("telescope.config").values
   local actions = require("telescope.actions")
   local action_state = require("telescope.actions.state")
 
   local rows = M.sessions(root)
-  local previewable = false
-  for _, row in ipairs(rows) do
-    if row.path and uv.fs_stat(root .. "/" .. row.path) ~= nil then
-      previewable = true
-      break
-    end
-  end
 
-  local function entry_maker(row)
-    local file = row.path and (root .. "/" .. row.path) or nil
-    if file and uv.fs_stat(file) == nil then
-      file = nil
-    end
-    return {
-      value = row,
-      display = row.display,
-      ordinal = row.ordinal or row.display,
-      filename = file,
-    }
-  end
+  -- Saved sessions preview their state file through the configured file
+  -- previewer; rows without one get a short summary instead. Delegating to
+  -- `conf.file_previewer` directly is not possible here: it would call
+  -- `from_entry.path`, whose fallback to `entry.value` (a table) is the crash.
+  local previewer = conf.file_previewer({})
+    and previewers.new_buffer_previewer({
+      title = "filer: session",
+      define_preview = function(self, entry)
+        local file = M.session_preview_target(entry)
+        if file then
+          conf.buffer_previewer_maker(file, self.state.bufnr, {
+            bufname = self.state.bufname,
+            winid = self.state.winid,
+          })
+          return
+        end
+        vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, session_preview(entry.value or {}))
+        vim.bo[self.state.bufnr].filetype = "markdown"
+      end,
+    }) or conf.noop_previewer
 
   local picker = pickers.new({}, {
     prompt_title = "filer: sessions (" .. vim.fn.fnamemodify(root, ":t") .. ")",
     results_title = "<CR> switch · <C-n> new · <C-d> delete",
-    finder = finders.new_table({ results = rows, entry_maker = entry_maker }),
-    previewer = previewable and conf.file_previewer({}) or conf.noop_previewer,
+    finder = finders.new_table({
+      results = rows,
+      entry_maker = function(row)
+        return M.session_entry(row, root)
+      end,
+    }),
+    previewer = previewer,
     sorter = conf.generic_sorter({}),
     attach_mappings = function(prompt_bufnr, map)
       actions.select_default:replace(function()
