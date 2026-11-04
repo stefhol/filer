@@ -108,6 +108,41 @@ local active_row = rows[#rows - 1]
 check(active_row.current, "the active session is marked")
 equal(active_row.path, nil, "an unsaved session has no path yet")
 
+-- Telescope entries must never carry a table as `path`/`filename`: a nil
+-- filename makes Telescope's previewer fall back to `entry.value`, which is the
+-- row table, and `path_expand` errors on it (the "+ new session…" crash).
+for _, row in ipairs(rows) do
+  local entry = filer.session_entry(row, root)
+  check(entry.value == row, "the entry keeps its row for the mappings")
+  check(entry.path == nil or type(entry.path) == "string", "the entry path is a string or nil")
+  check(entry.filename == nil or type(entry.filename) == "string", "the entry filename is a string or nil")
+  -- The previewer must resolve the file itself: Telescope's `from_entry.path`
+  -- would fall back to `entry.value` (the row table) and crash.
+  local target = filer.session_preview_target(entry)
+  check(target == nil or type(target) == "string", "the preview target is a string or nil")
+end
+local create_entry = filer.session_entry(rows[#rows], root)
+check(create_entry.value.create, "the + row keeps its create flag")
+equal(create_entry.filename, nil, "the + row has no state file to preview")
+equal(filer.session_preview_target(create_entry), nil, "the + row previews no file")
+local unsaved_entry = filer.session_entry(active_row, root)
+equal(unsaved_entry.filename, nil, "an unsaved session has nothing to preview")
+equal(filer.session_preview_target(unsaved_entry), nil, "an unsaved session previews no file")
+local saved_entry = filer.session_entry({ id = "s1", path = ".filer/sessions/s1.toml" }, root)
+equal(
+  saved_entry.filename,
+  root .. "/.filer/sessions/s1.toml",
+  "a saved session previews its state file"
+)
+equal(
+  filer.session_preview_target(saved_entry),
+  root .. "/.filer/sessions/s1.toml",
+  "the saved session previews the existing state file"
+)
+local stale_entry = filer.session_entry({ id = "gone", path = ".filer/sessions/gone.toml" }, root)
+equal(stale_entry.filename, nil, "a missing state file is not previewed")
+equal(filer.session_preview_target(stale_entry), nil, "a missing state file has no preview target")
+
 -- Creating prompts for the name; the prompt is the name.
 local prompted
 vim.ui.input = function(_, callback)
