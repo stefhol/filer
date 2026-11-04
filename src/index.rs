@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::atomic;
 use crate::cargo::{self, Workspace};
 use crate::filter::Filter;
-use crate::lang::{end_line_of, Import, Language, Member, SourceParser, Symbol};
+use crate::lang::{end_line_of, Import, Language, Member, SourceParser, StepDefinition, Symbol};
+use crate::steps::{self, StepIndex};
 use crate::tsconfig::{self, TsConfig};
 
 /// Build output and tool caches, skipped even with `--no-ignore`: they are never
@@ -39,7 +40,7 @@ pub const SKIP_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-const CACHE_VERSION: u32 = 17;
+const CACHE_VERSION: u32 = 18;
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -60,6 +61,9 @@ pub struct FileEntry {
     /// End of the file header (license, package, imports): the first symbol's
     /// start. Prepended to each symbol excerpt so it stands alone.
     pub preamble_end: usize,
+    /// Cucumber step definitions declared by this file, attributed to the
+    /// symbol/member that holds them.
+    pub step_defs: Vec<StepDefinition>,
     /// File size in bytes, cached so `search` can budget without a read.
     pub size: u64,
     /// 1-based line of the last byte, cached so `search` can budget without a
@@ -138,6 +142,9 @@ pub struct Index {
     /// Crate map of the repository's Cargo workspace (empty for projects
     /// without a readable `Cargo.toml`). See [`crate::cargo`].
     pub workspace: Workspace,
+    /// Compiled step definitions, so matching a `.feature` step never compiles
+    /// a pattern twice. Built from `files` after the walk.
+    pub steps: StepIndex,
     /// Number of files re-parsed on this run (for `filer index` stats).
     pub parsed_count: usize,
     pub reused_count: usize,
@@ -218,6 +225,7 @@ impl Index {
             }
         }
 
+        index.steps = StepIndex::build(&index.files);
         Cache::store(&root, &index, &stale);
         index
     }
@@ -295,11 +303,12 @@ impl Index {
             }
         }
 
-        let index = Index {
+        let mut index = Index {
             root: root.clone(),
             files,
             ..Default::default()
         };
+        index.steps = StepIndex::build(&index.files);
         stats.entries = Cache::store(&root, &index, &stale);
         (stats, warnings)
     }
@@ -451,6 +460,7 @@ fn load_one(
                     uses: cached.uses.clone(),
                     symbols: cached.symbols.clone(),
                     preamble_end: cached.preamble_end,
+                    step_defs: cached.step_defs.clone(),
                     size: cached.size,
                     end_line: cached.end_line,
                 },
@@ -461,7 +471,8 @@ fn load_one(
     let language = Language::from_path(path)?;
     let bytes = fs::read(path).ok()?;
     let source = String::from_utf8_lossy(&bytes);
-    let parsed = parser.parse(language, &source, &rel)?;
+    let mut parsed = parser.parse(language, &source, &rel)?;
+    parsed.step_defs = steps::scan(language, &source, &parsed.symbols);
     Some((
         false,
         FileEntry {
@@ -473,6 +484,7 @@ fn load_one(
             uses: parsed.uses,
             symbols: parsed.symbols,
             preamble_end: parsed.preamble_end,
+            step_defs: parsed.step_defs,
             size,
             end_line: end_line_of(&source, 0, source.len()),
         },
@@ -517,6 +529,8 @@ struct CacheEntry {
     symbols: Vec<Symbol>,
     #[serde(default)]
     preamble_end: usize,
+    #[serde(default)]
+    step_defs: Vec<StepDefinition>,
     #[serde(default)]
     end_line: usize,
 }
@@ -589,6 +603,7 @@ impl Cache {
                     uses: file.uses.clone(),
                     symbols: file.symbols.clone(),
                     preamble_end: file.preamble_end,
+                    step_defs: file.step_defs.clone(),
                     end_line: file.end_line,
                 })
             })
@@ -672,6 +687,9 @@ mod tests {
             ("J.rs", "pub struct J;"),
             ("K.py", "class K:\n    pass\n"),
             ("L.pyi", "class L: ...\n"),
+            ("M.feature", "Feature: M\n  Scenario: m\n    Given m\n"),
+            ("N.robot", "*** Test Cases ***\nN\n    Log    n\n"),
+            ("O.resource", "*** Keywords ***\nOpen O\n    Log    o\n"),
         ];
         for (name, source) in files {
             fs::write(root.join(name), source).unwrap();

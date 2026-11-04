@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::{FileEntry, Index};
 use crate::lang::{
-    Family, Granularity, Import, ImportKind, Language, Member, MemberKind, Receiver, Symbol,
+    Call, Family, Granularity, Import, ImportKind, Language, Member, MemberKind, Receiver,
+    StepDefinition, Symbol,
 };
 use crate::tsconfig::TsConfig;
 
@@ -27,6 +28,11 @@ pub enum Reason {
     WildcardImport,
     /// A relative TypeScript/JavaScript module specifier.
     ModuleImport,
+    /// A Robot `Resource`/`Variables`/`Library` setting: a path relative to
+    /// the importing suite.
+    PathImport,
+    /// A `.feature` step resolved to the step definition implementing it.
+    StepDefinition,
     /// Referenced by name without an import, in the same package.
     SamePackage,
     /// Referenced by name and unique in the repo.
@@ -49,6 +55,8 @@ impl Reason {
             Reason::StaticImport => "static-import",
             Reason::WildcardImport => "wildcard-import",
             Reason::ModuleImport => "module-import",
+            Reason::PathImport => "path-import",
+            Reason::StepDefinition => "step-definition",
             Reason::SamePackage => "same-package",
             Reason::Usage => "usage",
             Reason::Call => "call",
@@ -65,6 +73,8 @@ impl Reason {
             "static-import" => Reason::StaticImport,
             "wildcard-import" => Reason::WildcardImport,
             "module-import" => Reason::ModuleImport,
+            "path-import" => Reason::PathImport,
+            "step-definition" => Reason::StepDefinition,
             "same-package" => Reason::SamePackage,
             "call" => Reason::Call,
             "package" => Reason::Package,
@@ -142,6 +152,12 @@ fn package_files(index: &Index, package: &str, family: Option<Family>) -> Vec<us
 /// (`./x`, `../y.js`, `@/model/user`) go through [`resolve_module`].
 pub fn resolve_import(index: &Index, file: &FileEntry, import: &Import) -> Vec<usize> {
     let family = family_of(file);
+
+    // Robot settings are plain relative paths, independent of the language
+    // family: a `Variables` file is usually Python.
+    if matches!(import.kind, ImportKind::Path | ImportKind::Resource) {
+        return resolve_path_import(index, &file.rel, &import.path);
+    }
 
     if family == Some(Family::Python) {
         return resolve_python_import(index, file, import);
@@ -322,6 +338,38 @@ fn normalize_module(from_rel: &str, specifier: &str) -> Option<String> {
         }
     }
     Some(parts.join("/"))
+}
+
+/// Extensions a Robot `Resource`/`Variables`/`Library` path may omit.
+const PATH_EXTENSIONS: &[&str] = &["resource", "robot", "py", "yaml", "yml", "json"];
+
+/// Resolves a path relative to the importing file. Robot omits the extension
+/// in `Resource  common`, so every supported extension is probed when the
+/// setting has none; an explicit extension is used as written.
+fn resolve_path_import(index: &Index, from_rel: &str, specifier: &str) -> Vec<usize> {
+    if specifier.is_empty()
+        || specifier.starts_with('/')
+        || specifier.starts_with('\\')
+        || specifier.contains('\\')
+    {
+        return Vec::new();
+    }
+    let Some(base) = normalize_module(from_rel, specifier) else {
+        return Vec::new();
+    };
+    let mut candidates = vec![base.clone()];
+    if Path::new(&base).extension().is_none() {
+        candidates.extend(
+            PATH_EXTENSIONS
+                .iter()
+                .map(|extension| format!("{base}.{extension}")),
+        );
+    }
+    candidates
+        .into_iter()
+        .filter_map(|candidate| index.by_rel.get(&candidate).copied())
+        .take(1)
+        .collect()
 }
 
 /// Resolves a Rust `use` path or `mod` declaration against the filesystem
@@ -768,7 +816,12 @@ pub fn resolve_uses(index: &Index, file: &FileEntry) -> Vec<(usize, Reason)> {
     let imported: HashSet<&str> = file
         .imports
         .iter()
-        .filter(|import| import.kind != ImportKind::Module)
+        .filter(|import| {
+            matches!(
+                import.kind,
+                ImportKind::Type | ImportKind::Static | ImportKind::Wildcard
+            )
+        })
         .filter(|import| !import.is_wildcard())
         .filter_map(|import| import.path.rsplit('.').next())
         .collect();
@@ -1357,7 +1410,7 @@ pub fn callers(index: &Index, target: &Unit, max_depth: u32) -> Vec<Caller> {
         };
         let mut edges: Vec<&Edge> = edges
             .iter()
-            .filter(|edge| edge.reason == Reason::Call)
+            .filter(|edge| matches!(edge.reason, Reason::Call | Reason::StepDefinition))
             .collect();
         sort_edges(index, &mut edges);
         for edge in edges {
@@ -1519,6 +1572,7 @@ fn import_reason(kind: ImportKind) -> Reason {
         ImportKind::Static => Reason::StaticImport,
         ImportKind::Wildcard => Reason::WildcardImport,
         ImportKind::Module => Reason::ModuleImport,
+        ImportKind::Path | ImportKind::Resource => Reason::PathImport,
     }
 }
 
@@ -1574,7 +1628,10 @@ fn file_symbols(index: &Index, position: usize) -> Vec<Unit> {
 
 /// Simple name of an import target (`a.b.C` -> `C`, `a.b.*` -> none).
 fn import_leaf(import: &Import) -> Option<&str> {
-    if import.is_wildcard() || import.kind == ImportKind::Module {
+    if !matches!(
+        import.kind,
+        ImportKind::Type | ImportKind::Static | ImportKind::Wildcard
+    ) {
         return None;
     }
     import
@@ -1628,7 +1685,12 @@ fn symbol_neighbours(
     let imported: HashSet<&str> = file
         .imports
         .iter()
-        .filter(|import| import.kind != ImportKind::Module)
+        .filter(|import| {
+            matches!(
+                import.kind,
+                ImportKind::Type | ImportKind::Static | ImportKind::Wildcard
+            )
+        })
         .filter(|import| !import.is_wildcard())
         .filter_map(|import| import.path.rsplit('.').next())
         .collect();
@@ -2207,6 +2269,163 @@ fn with_line(units: Vec<(Unit, Reason)>, line: u32) -> Vec<Edge> {
         .collect()
 }
 
+/// Gherkin and Robot are the two declaration formats: their calls do not go
+/// through package/name lookup, they use their own scoping rules.
+///
+/// - A `.feature` step resolves against every step definition in the index,
+///   wherever it lives (the Cucumber contract is textual, not a path).
+/// - A Robot keyword resolves inside the suite first, then through the
+///   `Resource` files it imports, case- and space/underscore-insensitively.
+fn feature_neighbours(index: &Index, unit: &Unit) -> Vec<Edge> {
+    let position = unit.file();
+    let Some(file) = index.files.get(position) else {
+        return Vec::new();
+    };
+    let family = family_of(file);
+    let symbols: Vec<&Symbol> = match unit.symbol().and_then(|name| file.symbol(name)) {
+        Some(symbol) => vec![symbol],
+        None => file.symbols.iter().collect(),
+    };
+
+    let mut edges: Vec<Edge> = Vec::new();
+    for import in &file.imports {
+        for target in resolve_import(index, file, import) {
+            edges.push(Edge {
+                to: Unit::File(target),
+                reason: import_reason(import.kind),
+                line: 0,
+            });
+        }
+    }
+    for call in symbols.iter().flat_map(|symbol| symbol.calls.iter()) {
+        match family {
+            Some(Family::Gherkin) => edges.extend(step_edges(index, call)),
+            Some(Family::Robot) => edges.extend(robot_call_edges(index, position, call)),
+            _ => {}
+        }
+    }
+    edges.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.reason.cmp(&right.reason))
+            .then_with(|| unit_sort_key(index, &left.to).cmp(&unit_sort_key(index, &right.to)))
+    });
+    edges.dedup();
+    edges
+}
+
+/// One step of a feature -> the step definitions whose pattern matches it.
+fn step_edges(index: &Index, call: &Call) -> Vec<Edge> {
+    index
+        .steps
+        .matching(&call.name)
+        .into_iter()
+        .map(|(position, definition)| Edge {
+            to: step_unit(index, position, definition),
+            reason: Reason::StepDefinition,
+            line: call.line as u32,
+        })
+        .collect()
+}
+
+/// The unit a step definition is rendered as: its method when it has one, its
+/// enclosing symbol otherwise, and the whole file when it is a free function.
+fn step_unit(index: &Index, position: usize, definition: &StepDefinition) -> Unit {
+    match (&definition.symbol, &definition.member) {
+        (Some(symbol), Some(member)) => Unit::Member {
+            file: position,
+            class: symbol.clone(),
+            member: member.clone(),
+        },
+        (Some(symbol), None)
+            if index
+                .files
+                .get(position)
+                .is_some_and(|file| file.symbol(symbol).is_some()) =>
+        {
+            Unit::Symbol {
+                file: position,
+                symbol: symbol.clone(),
+            }
+        }
+        _ => Unit::File(position),
+    }
+}
+
+fn robot_call_edges(index: &Index, position: usize, call: &Call) -> Vec<Edge> {
+    robot_keywords(index, position, &call.name)
+        .into_iter()
+        .map(|to| Edge {
+            to,
+            reason: Reason::Call,
+            line: call.line as u32,
+        })
+        .collect()
+}
+
+/// Robot keywords are case-, space- and underscore-insensitive, and a call may
+/// carry a library prefix (`BuiltIn.Log`), so both forms are tried.
+fn robot_keywords(index: &Index, position: usize, name: &str) -> Vec<Unit> {
+    let short = name.rsplit('.').next().unwrap_or(name);
+    let wanted = [robot_normalize(name), robot_normalize(short)];
+    let mut out: Vec<Unit> = Vec::new();
+    for file_position in std::iter::once(position).chain(robot_resource_scope(index, position)) {
+        let Some(file) = index.files.get(file_position) else {
+            continue;
+        };
+        for symbol in &file.symbols {
+            let candidate = robot_normalize(&symbol.name);
+            if !wanted.contains(&candidate) {
+                continue;
+            }
+            let unit = Unit::Symbol {
+                file: file_position,
+                symbol: symbol.name.clone(),
+            };
+            if !out.contains(&unit) {
+                out.push(unit);
+            }
+        }
+    }
+    out
+}
+
+fn robot_normalize(name: &str) -> String {
+    name.chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '_' | '\\'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Resource files reachable from a suite, breadth first. Keywords stay in
+/// scope through nested resources, so this follows the whole chain.
+fn robot_resource_scope(index: &Index, position: usize) -> Vec<usize> {
+    const MAX_RESOURCES: usize = 64;
+    let mut seen: HashSet<usize> = HashSet::from([position]);
+    let mut order = Vec::new();
+    let mut queue = VecDeque::from([position]);
+    while let Some(current) = queue.pop_front() {
+        let Some(file) = index.files.get(current) else {
+            continue;
+        };
+        for import in &file.imports {
+            if import.kind != ImportKind::Resource {
+                continue;
+            }
+            for target in resolve_import(index, file, import) {
+                if seen.insert(target) {
+                    order.push(target);
+                    queue.push_back(target);
+                    if order.len() >= MAX_RESOURCES {
+                        return order;
+                    }
+                }
+            }
+        }
+    }
+    order
+}
+
 /// Neighbours of one unit. Every edge carries a line: the call site for call
 /// edges, the source unit's line for import/type edges.
 fn unit_neighbours(
@@ -2215,6 +2434,14 @@ fn unit_neighbours(
     options: ResolveOptions,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<Edge> {
+    // Gherkin and Robot resolve through their own scopes, not through the
+    // package/name graph below.
+    if matches!(
+        index.files.get(unit.file()).and_then(family_of),
+        Some(Family::Gherkin | Family::Robot)
+    ) {
+        return feature_neighbours(index, unit);
+    }
     match unit {
         Unit::File(position) if options.minimal => call_graph_seed(index, *position, diagnostics)
             .unwrap_or_else(|| with_line(file_neighbours(index, *position, options), 0)),
@@ -2539,6 +2766,7 @@ mod tests {
             uses: Vec::new(),
             symbols: Vec::new(),
             preamble_end: 0,
+            step_defs: Vec::new(),
             size: 0,
             end_line: 0,
         }
@@ -2557,6 +2785,7 @@ mod tests {
             files,
             ..Default::default()
         };
+        index.steps = crate::steps::StepIndex::build(&index.files);
         for (position, file) in index.files.iter().enumerate() {
             index.by_rel.insert(file.rel.clone(), position);
             if let Some(package) = &file.package {
@@ -3963,6 +4192,7 @@ mod tests {
             uses: vec!["Unused".to_string(), "String".to_string()],
             symbols: Vec::new(),
             preamble_end: 0,
+            step_defs: Vec::new(),
             size: 0,
             end_line: 0,
         });
